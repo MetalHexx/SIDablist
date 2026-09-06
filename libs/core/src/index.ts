@@ -33,14 +33,6 @@ export {
   VOICE_COUNT,
 } from './registers/sid-constants.js';
 export { clamp, MICROSECONDS_PER_SECOND, framesToSeconds } from './common/math.js';
-export { describeError } from './common/errors.js';
-export {
-  sanitizePositiveFrame,
-  sanitizeStartFrame,
-  type DetectedLoopFrames,
-  positionBasisFor,
-  timelineBasisFor,
-} from './common/length.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';

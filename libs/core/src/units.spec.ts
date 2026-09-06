@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cycles, frames, milliseconds, microseconds } from './units.js';
+import { cycles, frames, milliseconds, microseconds, type Frames } from './units.js';
 
 describe('branded unit types', () => {
   it('frames constructor creates a Frames value', () => {
@@ -23,11 +23,9 @@ describe('branded unit types', () => {
   });
 
   it('brand types provide type-level safety (nominal typing at compile time)', () => {
-    const f = frames(100);
-    const ms = milliseconds(100);
-    const us = microseconds(100);
-
-    expect(f).toBe(ms);
-    expect(ms).toBe(us);
+    // Compile-time assertion: assigning Milliseconds where Frames is expected fails typechecking
+    const expectFrames = (f: Frames) => f;
+    // @ts-expect-error Milliseconds is not assignable to Frames
+    expectFrames(milliseconds(100));
   });
 });
