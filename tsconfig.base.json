@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"], // no "DOM" - a browser global must not typecheck in core
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext", // this is what makes a missing .js extension an error
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": false, // deliberate: the register path indexes typed arrays constantly
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "isolatedModules": true,
+    "skipLibCheck": true
+  }
+}
