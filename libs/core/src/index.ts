@@ -71,3 +71,6 @@ export {
   type AdvanceResult,
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
+export { type SidPlayer } from './player/sid-player.js';
+export { type PlayerSnapshot, type PlayerStats } from './player/snapshot.js';
+export { type PlayerSnapshotStore, createPlayerSnapshotStore } from './player/store.js';
