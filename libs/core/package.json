@@ -10,6 +10,19 @@
     "./conformance": {
       "types": "./dist/conformance/index.d.ts",
       "import": "./dist/conformance/index.js"
+    },
+    "./smoke.worker": {
+      "types": "./dist/smoke/smoke.worker.d.ts",
+      "import": "./dist/smoke/smoke.worker.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "smoke.worker": [
+        "./dist/smoke/smoke.worker.d.ts"
+      ]
     }
   },
   "files": [
