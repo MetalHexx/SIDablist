@@ -209,7 +209,9 @@ export class TuneSession {
     return true;
   }
 
-  private selectSubtune(song: number): void {
+  /** Moves to `song`, clamped to the tune's range. A no-op when it is already the current one, so a
+   *  caller can hand it whatever the operator asked for without checking first. */
+  selectSubtune(song: number): void {
     if (this._machine === null) {
       return;
     }
@@ -252,14 +254,14 @@ export class TuneSession {
 
   /**
    * The shared silent-replay primitive: hands the rebuild to the replay runner and returns at once,
-   * so the frame clock keeps ticking and a packet still goes out on every tick while the replay
+   * so the frame clock keeps ticking and a frame still goes out on every tick while the replay
    * runs. The landing happens later, in `awaitJump`.
    *
    * Only the newest request may land. The id stamped here is recorded as the outstanding one, and a
-   * response carrying any other id is dropped — a second scrub supersedes the first rather than
+   * response carrying any other id is dropped — a second jump supersedes the first rather than
    * queueing behind it.
    */
-  private jumpToFrame(targetFrame: Frames): Promise<void> {
+  jumpToFrame(targetFrame: Frames): Promise<void> {
     const file = this._file;
     if (file === null || this._machine === null || this._frame === null) return Promise.resolve();
 
