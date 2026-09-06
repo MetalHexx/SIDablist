@@ -3,8 +3,13 @@ import tseslint from 'typescript-eslint';
 import importX from 'eslint-plugin-import-x';
 
 // Vendored trees keep upstream style; only stylistic preference rules are waived there.
+// `tseslint.configs.stylistic` is itself an array of config objects (its own base config plus
+// the eslint-recommended overrides it depends on) - reading only the last one misses stylistic
+// rules those earlier objects turn on, such as `prefer-const`.
 const stylisticRulesOff = Object.fromEntries(
-  Object.keys(tseslint.configs.stylistic.at(-1).rules).map((rule) => [rule, 'off']),
+  tseslint.configs.stylistic
+    .flatMap((config) => Object.keys(config.rules ?? {}))
+    .map((rule) => [rule, 'off']),
 );
 
 export default tseslint.config(
@@ -23,7 +28,6 @@ export default tseslint.config(
   },
   {
     files: ['libs/core/**/*.ts'],
-    ignores: ['libs/core/src/vendor/**'],
     rules: {
       'no-restricted-globals': [
         'error',
