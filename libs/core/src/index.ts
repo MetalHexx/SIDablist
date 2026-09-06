@@ -36,4 +36,17 @@ export { clamp, MICROSECONDS_PER_SECOND, framesToSeconds } from './common/math.j
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';
+export { FrameAccumulator, MAX_CATCH_UP_US } from './clock/frame-accumulator.js';
+export { ClockStats, LATE_CALLBACK_FACTOR } from './clock/clock-stats.js';
+export {
+  type PlayRate,
+  type TimingMode,
+  DEFAULT_TIMING_MODE,
+  playRateFor,
+  asRounded,
+  playCallIntervalUs,
+  msToPlayCalls,
+  playCallsToSeconds,
+  playCallsPerSecond,
+} from './clock/play-rate.js';
 export { FakeSink, type DeliveredFrame, FakeTransport, FakeClock } from './testing/index.js';
