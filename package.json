@@ -7,15 +7,17 @@
     "build": "pnpm -r run build",
     "test": "pnpm -r run test",
     "test:ui": "pnpm -r run test:ui",
-    "lint": "pnpm -r run lint",
+    "lint": "eslint .",
     "typecheck": "pnpm -r run typecheck",
     "format": "pnpm -r run format",
-    "format:check": "pnpm -r run format:check"
+    "format:check": "pnpm -r run format:check",
+    "prepare": "husky"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
     "@vitest/ui": "^5.0.0",
     "eslint": "^10.10.0",
+    "eslint-plugin-import-x": "^4.17.1",
     "husky": "^9.1.7",
     "lint-staged": "^17.5.0",
     "prettier": "^3.9.6",
