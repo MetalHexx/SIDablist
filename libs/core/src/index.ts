@@ -8,3 +8,22 @@ export {
   type MachineSnapshot,
   type SidWriteSink,
 } from './cpu/c64-machine.js';
+export {
+  type Cycles,
+  type Frames,
+  type Milliseconds,
+  type Microseconds,
+  cycles,
+  frames,
+  milliseconds,
+  microseconds,
+} from './units.js';
+export { clamp, MICROSECONDS_PER_SECOND, framesToSeconds } from './common/math.js';
+export { describeError } from './common/errors.js';
+export {
+  sanitizePositiveFrame,
+  sanitizeStartFrame,
+  type DetectedLoopFrames,
+  positionBasisFor,
+  timelineBasisFor,
+} from './common/length.js';
