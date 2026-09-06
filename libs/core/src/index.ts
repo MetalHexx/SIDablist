@@ -74,3 +74,4 @@ export {
 export { type SidPlayer } from './player/sid-player.js';
 export { type PlayerSnapshot, type PlayerStats } from './player/snapshot.js';
 export { type PlayerSnapshotStore, createPlayerSnapshotStore } from './player/store.js';
+export { JUMP_CEILING_SECONDS, TuneSession, type TuneSessionHost } from './player/tune-session.js';
