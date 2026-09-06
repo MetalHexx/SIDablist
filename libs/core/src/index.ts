@@ -1,4 +1,3 @@
-export { CORE_BUILD_ID, runSmokeJob } from './smoke/smoke.js';
 export { parseSidFile } from './sid/sid-file.parser.js';
 export { type SidClock, type SidFile, type SidModel, SidParseError } from './sid/sid-file.model.js';
 export {
@@ -33,6 +32,7 @@ export {
   VOICE_COUNT,
 } from './registers/sid-constants.js';
 export { clamp, MICROSECONDS_PER_SECOND, framesToSeconds } from './common/math.js';
+export { describeError } from './common/errors.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';
@@ -50,3 +50,11 @@ export {
   playCallsPerSecond,
 } from './clock/play-rate.js';
 export { FakeSink, type DeliveredFrame, FakeTransport, FakeClock } from './testing/index.js';
+export {
+  type ReplayRequest,
+  type ReplayResponse,
+  type ReplayRunner,
+} from './replay/replay-runner.js';
+export { type ReplayResult, replayToFrame } from './replay/replay-to-frame.js';
+export { FrameBudgetExceededError, runFramesTo } from './replay/run-frames.js';
+export { WorkerReplayRunner } from './replay/worker-replay-runner.js';

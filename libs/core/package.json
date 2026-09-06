@@ -11,17 +11,17 @@
       "types": "./dist/conformance/index.d.ts",
       "import": "./dist/conformance/index.js"
     },
-    "./smoke.worker": {
-      "types": "./dist/smoke/smoke.worker.d.ts",
-      "import": "./dist/smoke/smoke.worker.js"
+    "./replay.worker": {
+      "types": "./dist/replay/replay.worker.d.ts",
+      "import": "./dist/replay/replay.worker.js"
     }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "typesVersions": {
     "*": {
-      "smoke.worker": [
-        "./dist/smoke/smoke.worker.d.ts"
+      "replay.worker": [
+        "./dist/replay/replay.worker.d.ts"
       ]
     }
   },
