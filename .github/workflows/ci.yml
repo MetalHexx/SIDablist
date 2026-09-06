@@ -1,0 +1,93 @@
+# CI. Two required checks gate every pull request:
+#   - verify: install, lint, typecheck, test, build, then publint and attw --pack per package.
+#   - core-isolated: builds and tests libs/core from a copy outside the workspace, with npm and
+#     nothing else installed — the executable form of core's zero-runtime-dependency rule.
+#
+# Branch protection requiring both "verify" and "core-isolated" before merge is a GitHub
+# repository setting (Settings > Branches > branch protection rules), not something this file can
+# express. It has to be turned on by hand; nothing here enforces it if that setting is off.
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Lint package publish contents (publint)
+        run: pnpm -r exec publint run .
+
+      - name: Check published types (attw)
+        # esm-only: these packages are ESM-only by design, so the CJS-facing checks
+        # (node10, node16-from-CJS) that "strict" applies are not relevant here.
+        run: pnpm -r exec attw --pack . --profile esm-only
+
+  core-isolated:
+    name: core (isolated)
+    runs-on: ubuntu-latest
+    env:
+      CORE_DIR: ${{ runner.temp }}/core-isolated
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Copy core outside the workspace
+        # The copy is the point: staying inside the repo lets Node's module resolution walk up
+        # into the workspace node_modules and quietly satisfy an import core was never supposed
+        # to have, which would make this job pass without proving anything.
+        #
+        # tsconfig.lib.json extends "../../tsconfig.base.json", so the copy keeps that same
+        # two-level nesting (a bare tsconfig.base.json, not a package.json/workspace) rather than
+        # flattening libs/core straight into $CORE_DIR — otherwise the extends path resolves to
+        # nothing and the job fails before it ever exercises the zero-dependency check.
+        run: |
+          rm -rf "$CORE_DIR"
+          mkdir -p "$CORE_DIR/libs"
+          cp -R libs/core "$CORE_DIR/libs/core"
+          rm -rf "$CORE_DIR/libs/core/node_modules" "$CORE_DIR/libs/core/dist"
+          cp tsconfig.base.json "$CORE_DIR/tsconfig.base.json"
+
+      - name: Install with npm, no workspace above it
+        working-directory: ${{ env.CORE_DIR }}/libs/core
+        run: npm install
+
+      - name: Build and test with nothing else installed
+        working-directory: ${{ env.CORE_DIR }}/libs/core
+        run: npm run build && npm test
