@@ -14,9 +14,10 @@ export class FrameBudgetExceededError extends Error {
  * Runs `machine` forward one frame at a time from `frame` up to (but not including)
  * `targetFrame`, calling `onFrame` once after each frame that completes inside its cycle budget.
  *
- * The "run frames forward, checking the budget, until the target" loop a silent replay, a marker
- * nudge and a loop audition all need — extracted here so the three share one implementation
- * instead of drifting apart. A thrown error from `machine.runFrame()` propagates to the caller
+ * The "run frames forward, checking the budget, until the target" loop a silent replay and a seek
+ * from an anchor both need — the only one in the package, so the two cannot drift apart. Every
+ * gesture that lands on a frame goes through one of them. A thrown error from `machine.runFrame()`
+ * propagates to the caller
  * untouched; a frame that exceeds its cycle budget is a return value rather than an exception, so
  * it is reported by throwing `FrameBudgetExceededError` instead.
  */

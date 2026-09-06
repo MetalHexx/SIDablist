@@ -58,3 +58,5 @@ export {
 export { type ReplayResult, replayToFrame } from './replay/replay-to-frame.js';
 export { FrameBudgetExceededError, runFramesTo } from './replay/run-frames.js';
 export { WorkerReplayRunner } from './replay/worker-replay-runner.js';
+export { type AnchorRing, type PositionAnchor, createAnchorRing } from './timeline/anchor-ring.js';
+export { seekToFrame } from './timeline/seek.js';
