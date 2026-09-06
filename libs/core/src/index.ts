@@ -41,3 +41,7 @@ export {
   positionBasisFor,
   timelineBasisFor,
 } from './common/length.js';
+export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
+export { type Transport } from './ports/transport.js';
+export { type FrameClock, type FrameClockStats } from './ports/clock.js';
+export { FakeSink, type DeliveredFrame, FakeTransport, FakeClock } from './testing/index.js';
