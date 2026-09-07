@@ -62,6 +62,17 @@ const SEEK_REACH_MS = milliseconds(1000);
 /** Microseconds in a millisecond — the lag measurements below read a µs interval as one. */
 const MICROSECONDS_PER_MILLISECOND = 1000;
 
+/**
+ * Loop entry images kept at once. Each is a 64 KB machine image plus a register shadow, so this is
+ * the same memory-against-replay-distance trade `AnchorRing`'s own size is, and it is held at the
+ * same number for the same reason.
+ *
+ * More than one because a performer alternates: a set of two or three loops triggered against each
+ * other is the ordinary gesture, and a cache of one would have every hand-off away from a loop
+ * throw away the image the hand-off back to it is about to need.
+ */
+const LOOP_ENTRY_CACHE_SIZE = 4;
+
 /** What a player is built around: the far end it streams to, the cadence it rides, and the thread a
  *  jump replays on. Every one of them is injected — core constructs none of them. */
 export interface SidPlayerCollaborators {
@@ -145,6 +156,16 @@ class SidPlayerCoordinator implements SidPlayer {
    *  the tracker so a performer's loop can take the entry image away and give it back without a
    *  fresh replay. */
   private trackLoopEntry: PositionAnchor | null = null;
+
+  /** Every entry image captured for this machine, by the frame it was taken at, oldest first — what
+   *  a loop being armed, or a jump landing on one's own start, is served from instead of a replay.
+   *  Emptied wholesale by anything that replaces the machine the images describe. */
+  private readonly loopEntries = new Map<number, PositionAnchor>();
+
+  /** The start frames a capture is in flight for. A loop re-armed while its own image is still on
+   *  its way — a trigger pressed twice, an end nudged repeatedly — would otherwise queue a second
+   *  identical replay ahead of the jump that is about to want it. */
+  private readonly capturesInFlight = new Set<number>();
 
   private scheduledFrames = 0;
   private lateFrames = 0;
@@ -332,7 +353,12 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
-  /** Stops the clock and gates every voice off, so a pause leaves silence rather than a held note. */
+  /**
+   * Stops the clock and gates every voice off, so a pause leaves silence rather than a held note.
+   *
+   * The active loop deliberately survives it: a pause is a hold on a passage, not a get-out from it,
+   * so `play()` resumes into the same lap. `stop()` is the one that drops it.
+   */
   pause(): void {
     if (this.transport !== 'playing') {
       return;
@@ -346,13 +372,24 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
-  /** Stops the clock, closes the far end, and re-initialises the machine. */
+  /**
+   * Stops the clock, closes the far end, re-initialises the machine and disarms whatever loop was
+   * running.
+   *
+   * Dropping the loop is what makes this the hard stop `pause()` is not: the re-init puts the
+   * machine back at the top of the subtune, and a loop left armed across that would have the very
+   * next play run into a lap the performer had already stopped — and, in an application that infers
+   * a wrap from the playhead moving backward, read the restart itself as one.
+   */
   stop(): void {
     this.haltPlayback();
     // Landing a jump still in flight would restart playback at a position nobody asked for, and the
     // re-init below invalidates whatever it was carrying anyway.
     this.session.discardOutstandingJump();
     this.transport = 'stopped';
+    // After the transport, so the one snapshot this publishes already reads as stopped rather than
+    // announcing a deck that is still playing with its loop taken away.
+    this.setActiveLoop(null);
     if (this.session.file !== null) {
       this.sink.end();
       this.session.initSubtune(this.session.currentSubtune);
@@ -361,14 +398,37 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /**
-   * Asks for `frame`, which the replay reaches off this thread — the returned promise resolves once
-   * the request has settled (landed, failed, or been superseded), not when it was issued.
+   * Asks for `frame`.
+   *
+   * A target landing exactly on the frame the active loop's entry image was taken at is applied from
+   * that image here and now — the same restore a lap re-entry takes, no replay and no thread to
+   * cross — and the returned promise is already resolved. That is what makes triggering, auditioning
+   * or handing off to an armed loop cost the same whether it sits at the top of the tune or two
+   * minutes into it; without it, every deliberate jump to a loop's own start paid the replay the
+   * image exists to avoid, because a loop that only ever revisits its own narrow range never keeps a
+   * usable anchor on the ring and falls back to the frame-0 seed.
+   *
+   * The match is exact by design. An image describes one frame, so applying it at any other would
+   * land a position nobody asked for — a scrub is held to the same rule and takes the generic path
+   * for every target but that one frame.
+   *
+   * Anything else replays off this thread, and the promise resolves once that request has settled
+   * (landed, failed, or been superseded), not when it was issued.
    *
    * A target before the start of the tune resolves to frame 0 rather than erroring: a scrub dragged
    * off the left end of the bar is a gesture, not a fault.
    */
   seek(frame: Frames): Promise<void> {
-    return this.session.jumpToFrame(frames(Math.max(0, Math.round(frame))));
+    const target = frames(Math.max(0, Math.round(frame)));
+    const entry = this.activeLoop.entryImage();
+    if (entry !== null && entry.frame === target) {
+      // A replay still in flight would land a moment later and move the playhead off what this has
+      // just placed — the same supersession `jumpToFrame` gets from claiming the outstanding id.
+      this.session.discardOutstandingJump();
+      this.session.restoreState(entry.machine, entry.registers, entry.frame);
+      return Promise.resolve();
+    }
+    return this.session.jumpToFrame(target);
   }
 
   selectSubtune(song: number): void {
@@ -379,7 +439,7 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     // Every entry image describes a machine the re-init has just replaced — the track's own and
     // whichever loop is presently active alike.
-    this.dropTrackLoopEntry();
+    this.dropEntryImages();
     void this.captureTrackLoopEntry();
     const activeLoop = this.activeLoop.get();
     if (activeLoop !== null) {
@@ -399,12 +459,14 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setActiveLoop(loop: ActiveLoop): void {
     this.activeLoop.set(loop);
-    // Null reverts to the track's own loop's cached entry, exactly as before this loop was armed. A
-    // newly armed loop starts with none of its own — `captureActiveLoopEntry` below pays the same
-    // one-time off-thread cost `captureTrackLoopEntry` already pays for the track's own loop, so
-    // every lap after the first re-enters through a restore rather than a replay along the ring.
-    this.activeLoop.setEntryImage(loop === null ? this.trackLoopEntry : null);
-    if (loop !== null) {
+    // A loop already captured for this machine is armed with its image straight away, so the seek a
+    // trigger, an audition or a queued hand-off makes right after this one lands instantly rather
+    // than replaying — and so does its first wrap. Only a loop this machine has never held an image
+    // for pays the one-time off-thread capture `captureTrackLoopEntry` already pays for the track's
+    // own loop.
+    const cached = this.entryImageFor(loop);
+    this.activeLoop.setEntryImage(cached);
+    if (loop !== null && cached === null) {
       // Not awaited: nothing on this path needs the image, and a lap cannot reach this loop's own
       // end for a whole pass yet.
       void this.captureActiveLoopEntry(loop);
@@ -417,7 +479,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // The track's end is the tune's measured length: what the playhead is drawn against, unless
     // detection answered nothing and the fixed ceiling stands in.
     this.session.setIndexedLengthFrames(this.track.trackEndFrame());
-    this.dropTrackLoopEntry();
+    this.dropEntryImages();
     this.markDirty();
     // Not awaited: nothing on this path needs the image, and playback cannot reach the loop's end
     // for a whole lap yet.
@@ -739,6 +801,7 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.track.loopStartFrame() !== startFrame) return;
 
     this.trackLoopEntry = result;
+    this.rememberEntryImage(result);
     if (this.activeLoop.get() === null || this.activeLoop.get()?.startFrame === startFrame) {
       this.activeLoop.setEntryImage(result);
     }
@@ -756,30 +819,57 @@ class SidPlayerCoordinator implements SidPlayer {
    * active loop — a subtune change, a fresh track-structure detection — rather than leaving that
    * loop to pay a slow lap before the performer happens to re-arm it.
    *
-   * Re-checked against the presently active loop on the way back, on top of `captureEntryImage`'s
-   * own file and subtune guard: a performer can swap loops, or clear one, while this is in flight.
+   * The image is cached whatever the performer did to the loop while it was in flight — it describes
+   * a frame of this file and subtune, which `captureEntryImage` has already checked, and nothing
+   * about the loop's bounds changes what it is an image *of*. Only handing it to the tracker is
+   * re-checked, and against the start frame alone: a loop whose end moved mid-capture still enters
+   * through this very image.
    */
   private async captureActiveLoopEntry(loop: ActiveLoop): Promise<void> {
-    if (loop === null) return;
-    const result = await this.captureEntryImage(loop.startFrame);
+    if (loop === null || this.capturesInFlight.has(loop.startFrame)) return;
+    this.capturesInFlight.add(loop.startFrame);
+    let result: PositionAnchor | null = null;
+    try {
+      result = await this.captureEntryImage(loop.startFrame);
+    } finally {
+      this.capturesInFlight.delete(loop.startFrame);
+    }
     if (result === null) return;
 
-    const current = this.activeLoop.get();
-    if (
-      current === null ||
-      current.startFrame !== loop.startFrame ||
-      current.endFrame !== loop.endFrame
-    ) {
-      return;
-    }
+    this.rememberEntryImage(result);
+    if (this.activeLoop.get()?.startFrame !== loop.startFrame) return;
     this.activeLoop.setEntryImage(result);
   }
 
-  /** Drops the track's own loop's cached entry along with whatever image the tracker presently
-   *  holds — the same call whether that image came from the track's own loop or a marker's, since
-   *  both describe a machine a subtune re-init or a fresh detection has just invalidated. */
-  private dropTrackLoopEntry(): void {
+  /** Whichever image already stands at `loop`'s own start frame, or the track's own loop's entry
+   *  when nothing is looping — what `setActiveLoop` arms a loop with in place of a fresh capture. */
+  private entryImageFor(loop: ActiveLoop): PositionAnchor | null {
+    if (loop === null) return this.trackLoopEntry;
+    return this.loopEntries.get(loop.startFrame) ?? null;
+  }
+
+  /** Files `entry` under the frame it was taken at, evicting the oldest once the cache is full.
+   *  Re-inserted rather than overwritten in place, so a loop being armed again counts as the newest
+   *  and a set of loops played against each other keeps every one of their images. */
+  private rememberEntryImage(entry: PositionAnchor): void {
+    this.loopEntries.delete(entry.frame);
+    this.loopEntries.set(entry.frame, entry);
+    if (this.loopEntries.size > LOOP_ENTRY_CACHE_SIZE) {
+      const oldest = this.loopEntries.keys().next();
+      if (!oldest.done) this.loopEntries.delete(oldest.value);
+    }
+  }
+
+  /** Drops every cached entry image along with whatever the tracker presently holds — the same call
+   *  whether an image came from the track's own loop or a marker's, since all of them describe a
+   *  machine a subtune re-init or a fresh detection has just invalidated. */
+  private dropEntryImages(): void {
     this.trackLoopEntry = null;
+    this.loopEntries.clear();
+    // Whatever is in flight is about to come back describing the replaced machine and be dropped by
+    // `captureEntryImage`'s own guard, so it must not stand in the way of the recapture that
+    // follows.
+    this.capturesInFlight.clear();
     this.activeLoop.setEntryImage(null);
   }
 

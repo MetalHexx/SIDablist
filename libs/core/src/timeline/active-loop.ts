@@ -42,6 +42,10 @@ export interface ActiveLoopTracker {
    * changes — this tracker only ever holds the one image it was handed, never fetches its own.
    */
   setEntryImage(entry: PositionAnchor | null): void;
+  /** The image presently held, or null. Read so a caller can take the same instant way in that a
+   *  lap takes — a deliberate jump to the frame this was taken at is the very restore `advance`
+   *  would do, and paying a replay for it instead is the cost this image exists to avoid. */
+  entryImage(): PositionAnchor | null;
   /**
    * Enforces whatever is running against `framesRendered`: the active loop if one is set, else the
    * track's own end.
@@ -99,6 +103,8 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
     setEntryImage(entry: PositionAnchor | null): void {
       entryImage = entry;
     },
+
+    entryImage: (): PositionAnchor | null => entryImage,
 
     advance(machine, frame, ring, track, framesRendered): AdvanceResult {
       if (loop !== null) {

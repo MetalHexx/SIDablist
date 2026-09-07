@@ -493,6 +493,110 @@ describe('createSidPlayer', () => {
       expect(runFrameSpy).toHaveBeenCalledTimes(50);
       expect(player.getPosition()).toBe(500);
     });
+
+    it('re-enters a loop it already holds an image for without replaying, and still owes the stream its gate-off and resync', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+      run(clock, 3); // a few frames into the lap, so the jump back is a real move
+
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      await player.seek(frames(deepStart));
+
+      // A trigger, a start audition and a queued hand-off all resolve to exactly this jump. Nothing
+      // is emulated for it: the generic path would have replayed from the frame-0 seed, since a loop
+      // that only ever revisits its own range keeps no usable anchor on the ring.
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart);
+
+      run(clock, 1);
+      expect(lastDelivered(sink).count).toBe(VOICE_CONTROL_REGISTERS.length);
+      run(clock, 1);
+      expect(lastDelivered(sink).count).toBe(25);
+    });
+
+    it('hands over to a loop engaged earlier without replaying, rather than keeping only the newest image', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const first = { startFrame: frames(400), endFrame: frames(410) };
+      const second = { startFrame: frames(600), endFrame: frames(610) };
+      run(clock, 700);
+      player.setActiveLoop(first);
+      await flushEntryImageCapture();
+      player.setActiveLoop(second);
+      await flushEntryImageCapture();
+
+      // Arming a loop and jumping to its own start is what a lap-boundary hand-off does; the loop
+      // handed back to here is the one whose image a single-image cache would have thrown away.
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      player.setActiveLoop(first);
+      await player.seek(first.startFrame);
+
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(400);
+    });
+
+    it('leaves a target that is not the image’s own frame on the generic path', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      // A scrub landing anywhere but that one frame — applying the image here would put the playhead
+      // ten frames from where it was asked for.
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      await player.seek(frames(deepStart + 10));
+
+      expect(runFrameSpy).toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart + 10);
+    });
+  });
+
+  describe('what a transport halt does to the loop', () => {
+    it('disarms the loop on stop, so a fresh play runs past where the lap used to wrap', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      run(clock, 5);
+
+      player.stop();
+
+      expect(player.getSnapshot().loop).toBeNull();
+
+      await player.play();
+      run(clock, 25);
+
+      expect(player.getPosition()).toBe(25);
+    });
+
+    it('keeps the loop armed across a pause, so a resume plays back into the same lap', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setActiveLoop({ startFrame: frames(2), endFrame: frames(6) });
+      run(clock, 3);
+
+      player.pause();
+
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 2, endFrame: 6 });
+
+      await player.play();
+      run(clock, 3); // reaches the loop's end and re-enters its start
+
+      expect(player.getPosition()).toBe(2);
+    });
   });
 
   describe("the sink's control path", () => {
