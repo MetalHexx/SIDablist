@@ -474,6 +474,27 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
+  /**
+   * Snapshots the live machine and register frame at the current position straight into the
+   * entry-image cache `entryImageFor`/`rememberEntryImage` already serve `setActiveLoop` and `seek`
+   * from — no replay, since the live machine is already at this exact frame.
+   *
+   * Meant to be called by a caller marking the current position as a loop's future start: arming
+   * that loop afterwards through `setActiveLoop` finds this image already cached and never falls
+   * back to `captureActiveLoopEntry`'s off-thread replay, so even that loop's very first trigger is
+   * instant rather than paying a cost proportional to how deep it sits in the tune.
+   */
+  capturePosition(): void {
+    const machine = this.session.machine;
+    const frame = this.session.frame;
+    if (machine === null || frame === null) return;
+    this.rememberEntryImage({
+      frame: this.session.framesRendered,
+      machine: machine.snapshot(),
+      registers: frame.snapshotValues(),
+    });
+  }
+
   setTrackStructure(loop: DetectedLoopFrames | null): void {
     this.track.setTrackStructure(loop);
     // The track's end is the tune's measured length: what the playhead is drawn against, unless

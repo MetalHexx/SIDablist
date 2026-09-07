@@ -39,6 +39,15 @@ export interface SidPlayer {
   /** Selects the previous subtune, clamped to the tune's range. A no-op at the first subtune. */
   previousSubtune(): void;
   setActiveLoop(loop: { startFrame: Frames; endFrame: Frames } | null): void;
+  /**
+   * Snapshots the live machine and register frame at the current position into the entry-image
+   * cache `setActiveLoop` and `seek` already read from, for the cost of a memory copy — the machine
+   * is already sitting here, so nothing replays. Meant to be called at the moment a caller marks
+   * this exact frame as a loop's future start: arming that loop later finds the image already
+   * cached and skips the off-thread replay `setActiveLoop` otherwise falls back to, so even that
+   * loop's very first trigger is instant. A no-op with nothing loaded.
+   */
+  capturePosition(): void;
   /** What detection found about this tune: its loop, its end, its measured length. The
    *  application supplies it; core turns it into the position basis and the end behaviour. */
   setTrackStructure(loop: DetectedLoopFrames | null): void;

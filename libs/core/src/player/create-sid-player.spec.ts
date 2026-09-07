@@ -445,6 +445,29 @@ describe('createSidPlayer', () => {
       expect(player.getPosition()).toBe(deepStart);
     });
 
+    it("costs nothing on a loop's very first trigger when capturePosition seeded its entry image before the loop was ever armed", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500; // far enough in that a replay from frame 0 would run hundreds of frames
+      run(clock, deepStart);
+      // The performer is already sitting here — capturing it is a memory copy, not a replay — and
+      // this loop has never been armed before, so there is no prior activity to have warmed the
+      // cache any other way.
+      player.capturePosition();
+
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await player.seek(frames(deepStart));
+
+      // Arming and seeking straight back to a loop's own start is exactly what a trigger does. With
+      // no eager capture this would fall back to `captureActiveLoopEntry`'s off-thread replay; with
+      // it, `setActiveLoop` finds the image already cached and `seek` restores from it directly.
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
     it('keeps re-entering instantly on every later lap, not only the first', async () => {
       const { player, clock } = harness();
       player.loadTune(counterTune());
