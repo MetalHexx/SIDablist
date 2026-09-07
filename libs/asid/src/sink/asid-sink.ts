@@ -116,10 +116,18 @@ class AsidSinkImpl implements AsidSink {
     this.sendControl(buildStopPacket());
   }
 
-  /** `frameNumber` and the contract's `catchUpClamped` are core's to know for delivery-against-
-   *  due-time measurement (P05-T05, at the `deliver()` call site) — scheduling has no use for
-   *  either, so `catchUpClamped` is not declared here at all. */
-  deliver(frame: SidFrame, frameNumber: Frames, dueAtMs: Milliseconds): void {
+  /** `frameNumber` and `catchUpClamped` are core's to know for delivery-against-due-time
+   *  measurement (P05-T05, at the `deliver()` call site). Scheduling has no use for either, but
+   *  the interface requires them: `frameNumber` identifies what was consumed if read back from a
+   *  port that can report it, and `catchUpClamped` flags a frame that was stalled and is reporting
+   *  a due time later than truth. ASID is one-way, so we acknowledge them without using them. */
+  deliver(
+    frame: SidFrame,
+    frameNumber: Frames,
+    dueAtMs: Milliseconds,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    catchUpClamped: boolean,
+  ): void {
     const packet = buildSidDataPacket(frame);
     const scheduledAtMs = milliseconds(dueAtMs + this.effectiveScheduleAheadMs());
     this.port.send(packet, scheduledAtMs);
