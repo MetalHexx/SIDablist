@@ -1,5 +1,6 @@
 import type { SidWriteSink } from '../cpu/c64-machine.js';
 import { clamp } from '../common/math.js';
+import { clockRatio } from './clock-ratio.js';
 import type { SidFrame } from './sid-frame.js';
 import {
   REGISTERS_PER_VOICE,
@@ -34,10 +35,13 @@ export interface RegisterValuesSnapshot {
 }
 
 /**
- * The register groups a deck's controls scale on the way out. `volume` is the deck-gain path this
- * mechanism was generalized from.
+ * The register groups a deck's controls scale on the way out, by one coefficient each. `volume` is
+ * the deck-gain path this mechanism was generalized from.
+ *
+ * Frequency is deliberately absent: it carries a coefficient per voice rather than one shared, so
+ * it is driven by `setTargetClock` and `setVoicePitch` instead.
  */
-export type ScaledRegisterGroup = 'volume' | 'cutoff' | 'resonance' | 'pulseWidth' | 'frequency';
+export type ScaledRegisterGroup = 'volume' | 'cutoff' | 'resonance' | 'pulseWidth';
 
 /** Bits 4-6 of `$D418`. `null` is not a mode — it means the tune's own bits pass through. */
 export type SidFilterMode = 'lowPass' | 'bandPass' | 'highPass' | 'off';
@@ -58,7 +62,6 @@ const SCALED_REGISTER_GROUPS: readonly ScaledRegisterGroup[] = [
   'cutoff',
   'resonance',
   'pulseWidth',
-  'frequency',
 ];
 
 const FILTER_MODE_BITS: Readonly<Record<SidFilterMode, number>> = {
@@ -79,7 +82,6 @@ const REGISTERS_FOR_GROUP: Readonly<Record<ScaledRegisterGroup, readonly number[
   cutoff: [SID_FILTER_CUTOFF_LOW_REGISTER, SID_FILTER_CUTOFF_HIGH_REGISTER],
   resonance: [SID_FILTER_RESONANCE_REGISTER],
   pulseWidth: voiceRegisters(VOICE_PULSE_WIDTH_LOW_OFFSET, VOICE_PULSE_WIDTH_HIGH_OFFSET),
-  frequency: voiceRegisters(VOICE_FREQUENCY_LOW_OFFSET, VOICE_FREQUENCY_HIGH_OFFSET),
 };
 
 function voiceRegisters(lowOffset: number, highOffset: number): readonly number[] {
@@ -145,7 +147,6 @@ export class RegisterFrame implements SidWriteSink {
     cutoff: 1,
     resonance: 1,
     pulseWidth: 1,
-    frequency: 1,
   };
   /** One-shot per group: the standing off-home check stops covering a group's registers the instant
    *  its coefficient returns to exactly 1, so this is what forces one more write on that
@@ -156,8 +157,17 @@ export class RegisterFrame implements SidWriteSink {
     cutoff: false,
     resonance: false,
     pulseWidth: false,
-    frequency: false,
   };
+
+  /** The clock correction: derived, session-lifetime and invisible to the performer. Held apart from
+   *  `voicePitch` so moving a pitch control can never disturb it, and so an interface can report how
+   *  much correction is in force whatever a fader is doing. */
+  private clockRatio = 1;
+  /** The live, user-driven half of the frequency coefficient — one per voice. Any ganging is the
+   *  application's; this accepts three independent values. */
+  private readonly voicePitch = new Float64Array(VOICE_COUNT).fill(1);
+  /** `restoreOnNextSnapshot`, per voice, for the frequency pair. */
+  private readonly restoreFrequencyOnNextSnapshot = new Uint8Array(VOICE_COUNT);
 
   private forcedFilterMode: SidFilterMode | null = null;
   private restoreFilterModeOnNextSnapshot = false;
@@ -203,8 +213,8 @@ export class RegisterFrame implements SidWriteSink {
    * branch in the write path.
    *
    * A coefficient of exactly 1 is home, not a multiplication by one: the group's raw bytes pass
-   * through untouched. `pulseWidth` and `frequency` hold one coefficient shared by all three voices,
-   * so scaling them preserves the tune's internal balance between its voices.
+   * through untouched. `pulseWidth` holds one coefficient shared by all three voices, so scaling it
+   * preserves the tune's internal balance between them.
    *
    * A no-op call (the coefficient already held) leaves the one-shot restore untouched, so repeatedly
    * setting the same value can never manufacture a spurious extra write.
@@ -215,6 +225,58 @@ export class RegisterFrame implements SidWriteSink {
       this.restoreOnNextSnapshot[group] = true;
     }
     this.coefficients[group] = coefficient;
+  }
+
+  /**
+   * The pitch correction for a tune written for a machine clocked at `sourceHz` and played on one
+   * clocked at `targetHz` — the frequency registers alone, since the filter is analog, duty cycle is
+   * a fraction of the accumulator period and an envelope rate is a lookup index.
+   *
+   * The machine clock, not the chip model — 6581 versus 8580 is a separate value the sink forwards
+   * in its own packet.
+   *
+   * Tempo is not in this equation. The oscillator is a free-running phase accumulator inside the
+   * chip, so how often the play routine runs moves the tune's sequencer and nothing else; that half
+   * belongs to the play rate.
+   *
+   * A pair that is not two usable clock frequencies is ignored rather than allowed to become a
+   * coefficient.
+   */
+  setTargetClock(sourceHz: number, targetHz: number): void {
+    const ratio = clockRatio(sourceHz, targetHz);
+    if (ratio === null || ratio === this.clockRatio) return;
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      this.armFrequencyRestore(voice, ratio * this.voicePitch[voice]);
+    }
+    this.clockRatio = ratio;
+  }
+
+  /**
+   * Voice 0/1/2's own pitch coefficient, which multiplies the clock correction rather than replacing
+   * it: the two compose, and neither can move the other. Ganging voices together is the
+   * application's decision — this accepts three independent values.
+   *
+   * A non-finite coefficient is ignored: it would scale every frequency to silence while never
+   * comparing equal to itself, so nothing could ever set it back.
+   */
+  setVoicePitch(voice: number, coefficient: number): void {
+    if (voice < 0 || voice >= VOICE_COUNT) return;
+    if (!Number.isFinite(coefficient) || coefficient === this.voicePitch[voice]) return;
+    this.armFrequencyRestore(voice, this.clockRatio * coefficient);
+    this.voicePitch[voice] = coefficient;
+  }
+
+  /** What the two multipliers compose to for one voice. Exactly 1 is home, as it is for a group. */
+  private frequencyCoefficient(voice: number): number {
+    return this.clockRatio * this.voicePitch[voice];
+  }
+
+  /** Arms the one-shot restore when `next` — the coefficient about to take effect, the current one
+   *  still being held — brings a voice home from off it. */
+  private armFrequencyRestore(voice: number, next: number): void {
+    if (next === 1 && this.frequencyCoefficient(voice) !== 1) {
+      this.restoreFrequencyOnNextSnapshot[voice] = 1;
+    }
   }
 
   /**
@@ -342,14 +404,26 @@ export class RegisterFrame implements SidWriteSink {
     return this.overrideApplies[register] ? this.overrideValues[register] : this.values[register];
   }
 
-  /** Self-emission: every register of every off-home group, plus the volume register while a filter
-   *  mode is held, and one further frame for whichever of them has just come home. */
+  /** Self-emission: every register of every off-home group, the frequency pair of every voice off
+   *  its own home coefficient, plus the volume register while a filter mode is held, and one further
+   *  frame for whichever of them has just come home. */
   private forceScaledGroups(): void {
     for (const group of SCALED_REGISTER_GROUPS) {
       if (this.coefficients[group] !== 1 || this.restoreOnNextSnapshot[group]) {
         this.forceGroup(group);
       }
       this.restoreOnNextSnapshot[group] = false;
+    }
+
+    // Per voice rather than per group: frequency carries a coefficient of each voice's own, so a
+    // voice at home would otherwise pay for a neighbour's scaling with a write of its own.
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      if (this.frequencyCoefficient(voice) !== 1 || this.restoreFrequencyOnNextSnapshot[voice]) {
+        const base = voice * REGISTERS_PER_VOICE;
+        this.forcedRegisters[base + VOICE_FREQUENCY_LOW_OFFSET] = 1;
+        this.forcedRegisters[base + VOICE_FREQUENCY_HIGH_OFFSET] = 1;
+      }
+      this.restoreFrequencyOnNextSnapshot[voice] = 0;
     }
 
     if (this.forcedFilterMode !== null || this.restoreFilterModeOnNextSnapshot) {
@@ -375,7 +449,7 @@ export class RegisterFrame implements SidWriteSink {
     this.scaleResonance(this.coefficients.resonance);
     for (let voice = 0; voice < VOICE_COUNT; voice++) {
       this.scaleVoicePulseWidth(voice, this.coefficients.pulseWidth);
-      this.scaleVoiceFrequency(voice, this.coefficients.frequency);
+      this.scaleVoiceFrequency(voice, this.frequencyCoefficient(voice));
     }
   }
 
@@ -433,7 +507,14 @@ export class RegisterFrame implements SidWriteSink {
     this.setOverride(highRegister, (rawHigh & 0xf0) | ((scaled >> 8) & 0x0f));
   }
 
-  /** A full 16 bits across the voice's register pair — no shared fields to preserve. */
+  /**
+   * A full 16 bits across the voice's register pair — no shared fields to preserve.
+   *
+   * The whole value is recombined from both shadow bytes and rounded once, which is what makes
+   * scaling change the *high* byte of a value the tune only wrote the low byte of. The forcing above
+   * is the other half of that: while a voice is off home both its registers go out every frame, so
+   * the moved high byte reaches the chip rather than being left behind at the tune's own.
+   */
   private scaleVoiceFrequency(voice: number, coefficient: number): void {
     if (coefficient === 1) return;
 

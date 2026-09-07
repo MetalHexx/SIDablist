@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { FrameClock, FrameClockStats } from '../ports/clock.js';
+import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import { PAL_FRAME_INTERVAL_US, VOICE_CONTROL_REGISTERS } from '../registers/sid-constants.js';
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
@@ -176,6 +177,18 @@ function gateTune(): SidFile {
     blocks: [
       { at: 0x1000, bytes: [RTS] },
       { at: 0x1010, bytes: [0xa9, 0x41, 0x8d, 0x04, 0xd4, RTS] }, // LDA #$41; STA $D404; RTS
+    ],
+  });
+}
+
+/** play writes voice 0's frequency pair every call, so the bytes the correction rewrites are
+ *  readable off the delivered frame. */
+function frequencyTune(low: number, high: number): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      // LDA #low; STA $D400; LDA #high; STA $D401; RTS
+      { at: 0x1010, bytes: [0xa9, low, 0x8d, 0x00, 0xd4, 0xa9, high, 0x8d, 0x01, 0xd4, RTS] },
     ],
   });
 }
@@ -632,6 +645,82 @@ describe('createSidPlayer', () => {
         { muted: false, held: false },
         { muted: false, held: false },
       ]);
+    });
+  });
+
+  describe('pitch correction', () => {
+    it('carries a target clock through to the register shadow', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x89); // 0x1189
+      expect(valueOf(frame, 1)).toBe(0x11);
+    });
+
+    it('survives a tune load, which starts a register shadow at home', async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setVoicePitch(0, 2);
+
+      player.loadTune(frequencyTune(0x34, 0x12));
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x12); // 0x2312
+      expect(valueOf(frame, 1)).toBe(0x23);
+    });
+
+    it('composes a voice pitch with the correction without either disturbing the other', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      await player.play();
+
+      player.setVoicePitch(0, 2);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x23);
+
+      // The pitch comes home; the correction it never touched is still in force.
+      player.setVoicePitch(0, 1);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x11);
+    });
+
+    it('leaves the tunes own bytes alone with the clocks matched and the pitch at 1', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setVoicePitch(0, 1);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it('ignores a clock pair it cannot divide and a voice outside the chip', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+
+      player.setTargetClock(0, NTSC_PHI2_HZ);
+      player.setTargetClock(PAL_PHI2_HZ, Number.NaN);
+      player.setVoicePitch(3, 0.5);
+      player.setVoicePitch(0, 0);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
     });
   });
 

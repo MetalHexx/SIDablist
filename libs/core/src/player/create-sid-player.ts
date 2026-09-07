@@ -9,6 +9,7 @@ import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
 import type { SidSink } from '../ports/sink.js';
+import { clockRatio } from '../registers/clock-ratio.js';
 import { RegisterFrame } from '../registers/register-frame.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
 import type { SidFrame } from '../registers/sid-frame.js';
@@ -112,7 +113,10 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly registerScales = new Map<ScaledRegisterGroup, number>();
   private filterMode: SidFilterMode | null = null;
 
-  private clockRatio = 1;
+  /** The clock pair rather than the ratio it derives, because a fresh `RegisterFrame` is handed the
+   *  pair. Null until the application — the only thing that knows what machine is on the far end —
+   *  names one. */
+  private clockCorrection: { readonly sourceHz: number; readonly targetHz: number } | null = null;
   private readonly voicePitch = [1, 1, 1];
 
   /** The one step a landed jump still owes the stream: a gate-off frame the next tick releases,
@@ -207,16 +211,16 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.discardOutstandingJump();
     this.session.load(file);
 
-    // A fresh frame starts at full gain, every group at home and the tune's own filter bits, so
-    // every held control is re-applied here, before this load can emit a packet at the wrong
-    // setting.
+    // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
+    // and the tune's own filter bits, so every held control is re-applied here, before this load can
+    // emit a packet at the wrong setting.
     const frame = this.session.frame;
     frame?.setOutputGain(this.outputGain);
     for (const [group, coefficient] of this.registerScales) {
-      if (group !== 'frequency') frame?.setRegisterScale(group, coefficient);
+      frame?.setRegisterScale(group, coefficient);
     }
     frame?.setFilterMode(this.filterMode);
-    this.applyFrequencyScale();
+    this.applyPitch();
 
     this.mutedVoices.fill(false);
     // A fresh frame starts fully unmuted, so a held button must not survive into a tune it was never
@@ -429,12 +433,6 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void {
     this.registerScales.set(group, coefficient);
-    // Frequency is shared with the clock correction and the voice pitches, so it goes out composed
-    // rather than on its own.
-    if (group === 'frequency') {
-      this.applyFrequencyScale();
-      return;
-    }
     this.session.frame?.setRegisterScale(group, coefficient);
   }
 
@@ -444,27 +442,22 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /**
-   * The pitch correction for a tune written for one chip clock and played on another: every voice
-   * moves by the same ratio, which is exactly what the frame's shared frequency coefficient
-   * expresses.
+   * The pitch correction for a tune written for a machine clocked at `sourceHz` and played on one
+   * clocked at `targetHz`. Only the application knows what is on the far end, so this is the route
+   * by which it tells the register shadow — and it is held, so the next tune loaded inherits it.
    */
   setTargetClock(sourceHz: number, targetHz: number): void {
-    if (
-      !Number.isFinite(sourceHz) ||
-      !Number.isFinite(targetHz) ||
-      sourceHz <= 0 ||
-      targetHz <= 0
-    ) {
+    if (clockRatio(sourceHz, targetHz) === null) {
       console.warn(`SID player: ignoring a clock correction of ${sourceHz} Hz to ${targetHz} Hz.`);
       return;
     }
-    this.clockRatio = targetHz / sourceHz;
-    this.applyFrequencyScale();
+    this.clockCorrection = { sourceHz, targetHz };
+    this.session.frame?.setTargetClock(sourceHz, targetHz);
   }
 
   /**
-   * Voice `voice`'s own pitch coefficient, which composes with the clock ratio and never disturbs
-   * it — see `applyFrequencyScale` for what the frame can express of that composition today.
+   * Voice `voice`'s own pitch coefficient, which composes with the clock correction and never
+   * disturbs it. The three are independent; ganging them is this player's caller's business.
    */
   setVoicePitch(voice: number, coefficient: number): void {
     if (voice < 0 || voice >= VOICE_COUNT) return;
@@ -473,7 +466,7 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
     this.voicePitch[voice] = coefficient;
-    this.applyFrequencyScale();
+    this.session.frame?.setVoicePitch(voice, coefficient);
   }
 
   /**
@@ -758,22 +751,18 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
-  /**
-   * Sends the frequency group out as the product of the three things that move it: the coefficient
-   * a performer set through `setRegisterScale`, the clock correction, and the voice pitch.
-   *
-   * The frame scales frequency across all three voices from one coefficient, which composes a pitch
-   * every voice shares exactly and cannot express one that differs between them. A divergent pitch
-   * therefore leaves the group at home rather than detuning the two voices nobody moved — the
-   * coefficients are still held, for the per-voice frequency scale to apply.
-   */
-  private applyFrequencyScale(): void {
-    const shared = this.voicePitch.every((pitch) => pitch === this.voicePitch[0]);
-    const held = this.registerScales.get('frequency') ?? 1;
-    this.session.frame?.setRegisterScale(
-      'frequency',
-      held * this.clockRatio * (shared ? this.voicePitch[0] : 1),
-    );
+  /** Re-applies the correction and the three pitches to whichever register shadow is current. A
+   *  fresh one starts at home, so without this a load would emit its first frames at the source
+   *  machine's pitch. */
+  private applyPitch(): void {
+    const frame = this.session.frame;
+    if (frame === null) return;
+    if (this.clockCorrection !== null) {
+      frame.setTargetClock(this.clockCorrection.sourceHz, this.clockCorrection.targetHz);
+    }
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      frame.setVoicePitch(voice, this.voicePitch[voice]);
+    }
   }
 
   private markDirty(): void {

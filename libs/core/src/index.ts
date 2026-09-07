@@ -24,6 +24,7 @@ export {
   type ScaledRegisterGroup,
   type SidFilterMode,
 } from './registers/register-frame.js';
+export { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from './registers/clock-ratio.js';
 export {
   NTSC_FRAME_INTERVAL_US,
   PAL_FRAME_INTERVAL_US,

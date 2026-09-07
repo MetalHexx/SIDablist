@@ -56,8 +56,8 @@ export interface SidPlayer {
   setOutputGain(gain: number): void;
   setFilterMode(mode: SidFilterMode | null): void;
   setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void;
-  /** Pitch correction, added in P07-T01. Derived and session-lifetime, not a performance
-   *  control. */
+  /** The φ2 clocks a tune was written for and is playing on. Derived and session-lifetime, not a
+   *  performance control — and the application's to supply, since core cannot know the far end. */
   setTargetClock(sourceHz: number, targetHz: number): void;
   /** Live, per voice, user-driven. Composes with the clock ratio and never disturbs it. */
   setVoicePitch(voice: number, coefficient: number): void;

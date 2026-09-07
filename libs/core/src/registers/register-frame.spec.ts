@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from './clock-ratio.js';
 import { RegisterFrame } from './register-frame.js';
-import type { SidFilterMode } from './register-frame.js';
+import type { ScaledRegisterGroup, SidFilterMode } from './register-frame.js';
 import type { SidFrame } from './sid-frame.js';
 import { SID_REGISTER_COUNT } from './sid-constants.js';
 import { clamp } from '../common/math.js';
@@ -15,6 +16,20 @@ interface Write {
 }
 
 const ALL_REGISTERS = Array.from({ length: SID_REGISTER_COUNT }, (_, register) => register);
+
+const SCALED_GROUPS: readonly ScaledRegisterGroup[] = [
+  'volume',
+  'cutoff',
+  'resonance',
+  'pulseWidth',
+];
+
+/** [low, high] frequency register pairs per voice. */
+const FREQUENCY_REGISTERS = [
+  [0, 1],
+  [7, 8],
+  [14, 15],
+];
 
 describe('RegisterFrame', () => {
   it('emits a write naming the register the tune wrote, for every register', () => {
@@ -461,11 +476,6 @@ describe('RegisterFrame', () => {
       [9, 10],
       [16, 17],
     ];
-    const FREQUENCY_REGISTERS = [
-      [0, 1],
-      [7, 8],
-      [14, 15],
-    ];
 
     it('passes every register through byte-for-byte with every control at home', () => {
       const frame = new RegisterFrame();
@@ -646,7 +656,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(snapshot, 3)).toBe(0xff);
     });
 
-    it('applies one frequency coefficient identically to all three voices', () => {
+    it('applies a pitch coefficient to each voices whole 16-bit frequency value', () => {
       const frame = new RegisterFrame();
       const raw = [
         [0x34, 0x12],
@@ -661,9 +671,9 @@ describe('RegisterFrame', () => {
       FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
         frame.onSidWrite(low, raw[voice][0]);
         frame.onSidWrite(high, raw[voice][1]);
+        frame.setVoicePitch(voice, 0.5);
       });
 
-      frame.setRegisterScale('frequency', 0.5);
       const snapshot = frame.takeSnapshot();
 
       FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
@@ -677,7 +687,7 @@ describe('RegisterFrame', () => {
       frame.onSidWrite(0, 0x00);
       frame.onSidWrite(1, 0x80); // 0x8000
 
-      frame.setRegisterScale('frequency', 3); // 98304, wrapping would give 32768
+      frame.setVoicePitch(0, 3); // 98304, wrapping would give 32768
       const snapshot = frame.takeSnapshot();
 
       expect(emittedValue(snapshot, 0)).toBe(0xff);
@@ -686,11 +696,11 @@ describe('RegisterFrame', () => {
 
     it('emits all six frequency registers every frame while off home, then restores them once', () => {
       const frame = new RegisterFrame();
-      FREQUENCY_REGISTERS.forEach(([low, high]) => {
+      FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
         frame.onSidWrite(low, 0x40);
         frame.onSidWrite(high, 0x20);
+        frame.setVoicePitch(voice, 0.5);
       });
-      frame.setRegisterScale('frequency', 0.5);
       frame.takeSnapshot();
 
       const held = frame.takeSnapshot();
@@ -699,7 +709,7 @@ describe('RegisterFrame', () => {
         expect(emittedValue(held, high)).toBe(0x10);
       }
 
-      frame.setRegisterScale('frequency', 1);
+      FREQUENCY_REGISTERS.forEach((_pair, voice) => frame.setVoicePitch(voice, 1));
       const restore = writesOf(frame.takeSnapshot());
       const settled = frame.takeSnapshot();
       for (const [low, high] of FREQUENCY_REGISTERS) {
@@ -725,9 +735,11 @@ describe('RegisterFrame', () => {
       for (const [register, value] of raw) {
         frame.onSidWrite(register, value);
       }
-      for (const group of ['volume', 'cutoff', 'resonance', 'pulseWidth', 'frequency'] as const) {
+      for (const group of SCALED_GROUPS) {
         frame.setRegisterScale(group, 0.5);
       }
+      frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      frame.setVoicePitch(0, 0.5);
       frame.setFilterMode('highPass');
 
       const { values } = frame.snapshotValues();
@@ -781,6 +793,229 @@ describe('RegisterFrame', () => {
     });
   });
 
+  describe('the target clock and the per-voice pitch', () => {
+    it('scales a PAL tune down to hold its pitch on an NTSC machine', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x34);
+      frame.onSidWrite(1, 0x12); // 0x1234
+
+      frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      const snapshot = frame.takeSnapshot();
+
+      // 4660 onto a clock 3.804% faster is 4489.
+      expect(emittedValue(snapshot, 0)).toBe(0x89);
+      expect(emittedValue(snapshot, 1)).toBe(0x11);
+    });
+
+    it('emits the high byte the scaling moved, in a frame where the tune wrote only the low one', () => {
+      const frame = new RegisterFrame();
+      frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      frame.onSidWrite(0, 0x40);
+      frame.onSidWrite(1, 0x02); // 0x0240 -> 0x022b
+      frame.takeSnapshot();
+
+      frame.onSidWrite(0, 0x00); // 0x0200 -> 0x01ed: the high byte falls, unwritten
+      const snapshot = frame.takeSnapshot();
+
+      expect(emittedValue(snapshot, 0)).toBe(0xed);
+      expect(emittedValue(snapshot, 1)).toBe(0x01);
+    });
+
+    it('rounds the scaled value rather than truncating it', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x01);
+      frame.onSidWrite(1, 0x01); // 0x0101 = 257
+
+      frame.setVoicePitch(0, 0.5); // 128.5 — truncating would land on 128
+      const snapshot = frame.takeSnapshot();
+
+      expect(emittedValue(snapshot, 0)).toBe(0x81);
+      expect(emittedValue(snapshot, 1)).toBe(0x00);
+    });
+
+    it('clamps at the 16-bit ceiling when the two multipliers together overrun it', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x00);
+      frame.onSidWrite(1, 0xfc); // 0xfc00
+
+      frame.setTargetClock(NTSC_PHI2_HZ, PAL_PHI2_HZ);
+      frame.setVoicePitch(0, 1.5); // ~98000, wrapping would give 0x7f00
+      const snapshot = frame.takeSnapshot();
+
+      expect(emittedValue(snapshot, 0)).toBe(0xff);
+      expect(emittedValue(snapshot, 1)).toBe(0xff);
+    });
+
+    it('reaches the same bytes whichever order the correction and the pitch arrive in', () => {
+      const clockFirst = new RegisterFrame();
+      clockFirst.onSidWrite(1, 0x40); // 0x4000
+      clockFirst.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      clockFirst.setVoicePitch(0, 1.5);
+
+      const pitchFirst = new RegisterFrame();
+      pitchFirst.onSidWrite(1, 0x40);
+      pitchFirst.setVoicePitch(0, 1.5);
+      pitchFirst.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+
+      const composed = writesOf(clockFirst.takeSnapshot());
+      expect(composed).toEqual(writesOf(pitchFirst.takeSnapshot()));
+      expect(valueFor(composed, 0)).toBe(0x7b); // 0x4000 -> 0x5c7b
+      expect(valueFor(composed, 1)).toBe(0x5c);
+    });
+
+    it('holds the correction across a pitch move, and the pitch across a correction', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(1, 0x40); // 0x4000
+      frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      frame.setVoicePitch(0, 1.5);
+      frame.takeSnapshot();
+
+      frame.setVoicePitch(0, 1);
+      const correctionOnly = frame.takeSnapshot();
+      expect(emittedValue(correctionOnly, 0)).toBe(0xa8); // 0x3da8
+      expect(emittedValue(correctionOnly, 1)).toBe(0x3d);
+
+      frame.setVoicePitch(0, 1.5);
+      frame.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      const pitchOnly = frame.takeSnapshot();
+      expect(emittedValue(pitchOnly, 0)).toBe(0x00); // 0x6000
+      expect(emittedValue(pitchOnly, 1)).toBe(0x60);
+    });
+
+    it('scales three voices by three coefficients of their own', () => {
+      const frame = new RegisterFrame();
+      FREQUENCY_REGISTERS.forEach(([low, high]) => {
+        frame.onSidWrite(low, 0x34);
+        frame.onSidWrite(high, 0x12); // 0x1234 on every voice
+      });
+
+      frame.setVoicePitch(0, 0.5);
+      frame.setVoicePitch(1, 2);
+      // Voice 2 stays at 1, with the clocks matched — its bytes must survive bit-for-bit.
+      const snapshot = frame.takeSnapshot();
+
+      expect(emittedValue(snapshot, 0)).toBe(0x1a); // 0x091a
+      expect(emittedValue(snapshot, 1)).toBe(0x09);
+      expect(emittedValue(snapshot, 7)).toBe(0x68); // 0x2468
+      expect(emittedValue(snapshot, 8)).toBe(0x24);
+      expect(emittedValue(snapshot, 14)).toBe(0x34);
+      expect(emittedValue(snapshot, 15)).toBe(0x12);
+    });
+
+    it('leaves a voice at home out of the frame while a neighbour is scaled', () => {
+      const frame = new RegisterFrame();
+      FREQUENCY_REGISTERS.forEach(([low, high]) => {
+        frame.onSidWrite(low, 0x34);
+        frame.onSidWrite(high, 0x12);
+      });
+      frame.setVoicePitch(0, 0.5);
+      frame.takeSnapshot(); // the frame the tune's own writes rode out in
+
+      expect(registersOf(frame.takeSnapshot())).toEqual([0, 1]);
+    });
+
+    it('emits exactly what the tune wrote with the clocks matched and every pitch at 1', () => {
+      const frame = new RegisterFrame();
+      frame.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
+        frame.setVoicePitch(voice, 1);
+        frame.onSidWrite(low, 0x11 * (voice + 1));
+        frame.onSidWrite(high, 0x22 * (voice + 1));
+      });
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 0, value: 0x11 },
+        { register: 1, value: 0x22 },
+        { register: 7, value: 0x22 },
+        { register: 8, value: 0x44 },
+        { register: 14, value: 0x33 },
+        { register: 15, value: 0x66 },
+      ]);
+    });
+
+    it('restores the raw frequency bytes for exactly one frame when the correction comes home', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x34);
+      frame.onSidWrite(1, 0x12);
+      frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      frame.takeSnapshot();
+
+      frame.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      const restore = frame.takeSnapshot();
+      expect(emittedValue(restore, 0)).toBe(0x34);
+      expect(emittedValue(restore, 1)).toBe(0x12);
+
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('leaves every register but the frequency pairs byte-identical across a target-clock change', () => {
+      const corrected = new RegisterFrame();
+      const uncorrected = new RegisterFrame();
+      corrected.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      for (const register of ALL_REGISTERS) {
+        corrected.onSidWrite(register, byteFor(register));
+        uncorrected.onSidWrite(register, byteFor(register));
+      }
+
+      const withCorrection = writesOf(corrected.takeSnapshot());
+      const without = writesOf(uncorrected.takeSnapshot());
+      const frequencyRegisters = FREQUENCY_REGISTERS.flat();
+
+      for (const register of ALL_REGISTERS) {
+        if (frequencyRegisters.includes(register)) continue;
+        expect(valueFor(withCorrection, register)).toBe(valueFor(without, register));
+      }
+      // Guards the sweep above against passing on a correction that moved nothing at all.
+      expect(
+        frequencyRegisters.filter(
+          (register) => valueFor(withCorrection, register) !== valueFor(without, register),
+        ).length,
+      ).toBeGreaterThan(0);
+    });
+
+    it('ignores an unusable clock pair, a voice outside the chip and a non-finite coefficient', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x34);
+      frame.onSidWrite(1, 0x12);
+
+      frame.setTargetClock(0, NTSC_PHI2_HZ);
+      frame.setTargetClock(PAL_PHI2_HZ, Number.NaN);
+      frame.setVoicePitch(3, 0.5);
+      frame.setVoicePitch(-1, 0.5);
+      frame.setVoicePitch(0, Number.NaN);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 0, value: 0x34 },
+        { register: 1, value: 0x12 },
+      ]);
+    });
+
+    it('addresses no register outside the shadows own range, whatever the writes and coefficients', () => {
+      const frame = new RegisterFrame();
+      frame.setTargetClock(NTSC_PHI2_HZ, PAL_PHI2_HZ);
+      frame.setVoicePitch(0, 1e6);
+      frame.setVoicePitch(1, 1e-6);
+      frame.setVoicePitch(2, 0);
+
+      const emitted = new Set<number>();
+      let seed = 1;
+      for (let index = 0; index < 2000; index++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        // Deliberately reaches past the register file as well as into it: bounding a malformed
+        // file's writes is what stops one becoming an arbitrary write to attached hardware.
+        frame.onSidWrite(seed % 64, (seed >> 8) & 0xff);
+        if (index % 7 === 0) {
+          for (const write of writesOf(frame.takeSnapshot())) emitted.add(write.register);
+        }
+      }
+
+      expect(emitted.size).toBeGreaterThan(0);
+      expect(
+        [...emitted].filter((register) => register < 0 || register >= SID_REGISTER_COUNT),
+      ).toEqual([]);
+    });
+  });
+
   describe('the generalized scaling against a real register stream (InSID3 Out)', () => {
     interface TuneRun {
       readonly frames: Write[][];
@@ -825,8 +1060,12 @@ describe('RegisterFrame', () => {
     it('leaves the whole register stream write-for-write identical with every control parked at home', () => {
       const home = runTune(FRAMES, (frame, index) => {
         if (index > 0) return;
-        for (const group of ['volume', 'cutoff', 'resonance', 'pulseWidth', 'frequency'] as const) {
+        for (const group of SCALED_GROUPS) {
           frame.setRegisterScale(group, 1);
+        }
+        frame.setTargetClock(PAL_PHI2_HZ, PAL_PHI2_HZ);
+        for (let voice = 0; voice < 3; voice++) {
+          frame.setVoicePitch(voice, 1);
         }
         frame.setFilterMode(null);
       });
@@ -879,7 +1118,10 @@ describe('RegisterFrame', () => {
         frame.setRegisterScale('cutoff', 0.25 + t);
         frame.setRegisterScale('resonance', 1.5 - t);
         frame.setRegisterScale('pulseWidth', 0.5 + t);
-        frame.setRegisterScale('frequency', 0.9 + t * 0.2);
+        frame.setTargetClock(PAL_PHI2_HZ, PAL_PHI2_HZ + t * (NTSC_PHI2_HZ - PAL_PHI2_HZ));
+        for (let voice = 0; voice < 3; voice++) {
+          frame.setVoicePitch(voice, 0.9 + t * 0.2 + voice * 0.05);
+        }
         frame.setFilterMode(FILTER_MODE_SWEEP[index % FILTER_MODE_SWEEP.length]);
       });
 
