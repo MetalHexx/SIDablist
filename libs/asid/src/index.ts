@@ -18,3 +18,6 @@ export {
   buildDisplayCharsPacket,
   buildSidTypePacket,
 } from './wire/encoder.js';
+export { createAsidSink, type AsidSink } from './sink/asid-sink.js';
+export { type MidiOutputPort } from './sink/midi-output-port.js';
+export { type DeliveryStats } from './sink/delivery-stats.js';
