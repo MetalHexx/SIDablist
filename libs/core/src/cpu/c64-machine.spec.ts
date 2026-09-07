@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { C64Machine, type SidWriteSink, UnplayableTuneError } from './c64-machine.js';
+import { createC64Machine, type SidWriteSink, UnplayableTuneError } from './c64-machine.js';
 import {
   NTSC_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_FRAME,
@@ -87,7 +87,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
 
     const result = machine.initSubtune(1);
 
@@ -110,7 +110,7 @@ describe('C64Machine', () => {
     });
     const sink = new RecordingSink();
 
-    new C64Machine(file, sink).initSubtune(1);
+    createC64Machine(file, sink).initSubtune(1);
 
     expect(sink.writes).toEqual([{ register: 0, value: 0x2a }]);
   });
@@ -128,7 +128,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
 
     machine.initSubtune(1);
     machine.runFrame();
@@ -149,7 +149,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
     machine.initSubtune(1);
 
     const results = [machine.runFrame(), machine.runFrame(), machine.runFrame()];
@@ -164,7 +164,7 @@ describe('C64Machine', () => {
       playAddress: 0x1001,
       blocks: [{ at: 0x1000, bytes: [0x60, 0x4c, 0x01, 0x10] }],
     });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
     machine.initSubtune(1);
 
     const result = machine.runFrame();
@@ -189,7 +189,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
     machine.initSubtune(1);
 
     expect(machine.runFrame().completed).toBe(true);
@@ -205,7 +205,7 @@ describe('C64Machine', () => {
         { at: 0x100b, bytes: [0x60] },
       ],
     });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
 
     machine.initSubtune(1);
 
@@ -224,7 +224,7 @@ describe('C64Machine', () => {
         { at: 0x100b, bytes: [0x60] },
       ],
     });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
 
     machine.initSubtune(1);
 
@@ -236,11 +236,11 @@ describe('C64Machine', () => {
   });
 
   it("reports the frame cycle budget against the tune's own clock, PAL or NTSC", () => {
-    const palMachine = new C64Machine(
+    const palMachine = createC64Machine(
       tune({ clock: 'pal', blocks: [{ at: 0x1000, bytes: [0x60] }] }),
       new RecordingSink(),
     );
-    const ntscMachine = new C64Machine(
+    const ntscMachine = createC64Machine(
       tune({ clock: 'ntsc', blocks: [{ at: 0x1000, bytes: [0x60] }] }),
       new RecordingSink(),
     );
@@ -252,7 +252,7 @@ describe('C64Machine', () => {
 
   it('reports one call per frame for a tune that never programs the timer', () => {
     const file = tune({ playAddress: 0x1001, blocks: [{ at: 0x1000, bytes: [0x60, 0x60] }] });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
 
     machine.initSubtune(1);
 
@@ -271,7 +271,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
 
     machine.initSubtune(1);
 
@@ -282,7 +282,7 @@ describe('C64Machine', () => {
 
   it('refuses a tune that installs no interrupt vector rather than calling address 0', () => {
     const file = tune({ format: 'RSID', playAddress: 0, blocks: [{ at: 0x1000, bytes: [0x60] }] });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
 
     expect(() => machine.initSubtune(1)).toThrow(UnplayableTuneError);
   });
@@ -293,7 +293,7 @@ describe('C64Machine', () => {
       songs: 2,
       blocks: [{ at: 0x1000, bytes: [0x60, 0x60] }],
     });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
 
     expect(() => machine.initSubtune(3)).toThrow(RangeError);
     expect(() => machine.initSubtune(0)).toThrow(RangeError);
@@ -311,7 +311,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
 
     const result = machine.initSubtune(1);
 
@@ -326,7 +326,7 @@ describe('C64Machine', () => {
       playAddress: 0x1001,
       blocks: [{ at: 0x1000, bytes: [0x60, 0x1a, 0x02, 0x60] }],
     });
-    const machine = new C64Machine(file, new RecordingSink());
+    const machine = createC64Machine(file, new RecordingSink());
     machine.initSubtune(1);
 
     expect(machine.illegalOpcodeCount).toBe(0);
@@ -345,7 +345,7 @@ describe('C64Machine', () => {
       ],
     });
     const sink = new RecordingSink();
-    const machine = new C64Machine(file, sink);
+    const machine = createC64Machine(file, sink);
 
     machine.initSubtune(1);
     machine.initSubtune(3);
@@ -366,7 +366,7 @@ describe('C64Machine on the bundled tunes', () => {
 
   it('plays fifty frames of Still Time, writing across many SID registers', () => {
     const sink = new RecordingSink();
-    const machine = new C64Machine(bundled('still-time'), sink);
+    const machine = createC64Machine(bundled('still-time'), sink);
 
     expect(machine.initSubtune(1).completed).toBe(true);
     const frames = Array.from({ length: 50 }, () => machine.runFrame());
@@ -376,7 +376,7 @@ describe('C64Machine on the bundled tunes', () => {
   }, 20_000);
 
   it('reports a CIA-timed play rate for InSID3 Out', () => {
-    const machine = new C64Machine(bundled('insid3-out'), new RecordingSink());
+    const machine = createC64Machine(bundled('insid3-out'), new RecordingSink());
 
     expect(machine.initSubtune(1).completed).toBe(true);
 
@@ -393,7 +393,7 @@ describe('C64Machine on the bundled tunes', () => {
      */
     it('replays byte-for-byte identically after a restore', () => {
       const sink = new RecordingSink();
-      const machine = new C64Machine(bundled('still-time'), sink);
+      const machine = createC64Machine(bundled('still-time'), sink);
       machine.initSubtune(1);
       for (let i = 0; i < 20; i++) machine.runFrame();
 
@@ -411,7 +411,7 @@ describe('C64Machine on the bundled tunes', () => {
     }, 20_000);
 
     it('detaches the snapshot from the machine, so later frames cannot alter it', () => {
-      const machine = new C64Machine(bundled('still-time'), new RecordingSink());
+      const machine = createC64Machine(bundled('still-time'), new RecordingSink());
       machine.initSubtune(1);
       machine.runFrame();
 
@@ -424,7 +424,7 @@ describe('C64Machine on the bundled tunes', () => {
 
     it('rewinds an advanced machine to an earlier capture', () => {
       const sink = new RecordingSink();
-      const machine = new C64Machine(bundled('still-time'), sink);
+      const machine = createC64Machine(bundled('still-time'), sink);
       machine.initSubtune(1);
       machine.runFrame();
 

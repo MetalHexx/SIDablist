@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { PAL_FRAME_INTERVAL_US } from '../registers/sid-constants.js';
-import { C64Machine } from '../cpu/c64-machine.js';
-import { RegisterFrame } from '../registers/register-frame.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
+import type { C64Machine } from '../cpu/c64-machine.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { milliseconds } from '../units.js';
 import {
@@ -59,7 +60,7 @@ function multispeedMachine(): C64Machine {
     { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
     { at: 0x1010, bytes: [RTS] },
   ]);
-  const machine = new C64Machine(file, new RegisterFrame());
+  const machine = createC64Machine(file, createRegisterFrame());
   machine.initSubtune(1);
   return machine;
 }
@@ -70,7 +71,7 @@ function unitRateMachine(): C64Machine {
     { at: 0x1000, bytes: [RTS] },
     { at: 0x1010, bytes: [RTS] },
   ]);
-  const machine = new C64Machine(file, new RegisterFrame());
+  const machine = createC64Machine(file, createRegisterFrame());
   machine.initSubtune(1);
   return machine;
 }

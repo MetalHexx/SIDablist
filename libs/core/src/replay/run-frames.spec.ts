@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { C64Machine, UnplayableTuneError } from '../cpu/c64-machine.js';
-import { RegisterFrame } from '../registers/register-frame.js';
+import { createC64Machine, UnplayableTuneError } from '../cpu/c64-machine.js';
+import type { C64Machine } from '../cpu/c64-machine.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames } from '../units.js';
 import { FrameBudgetExceededError, runFramesTo } from './run-frames.js';
@@ -60,7 +61,7 @@ function runawayTune(): SidFile {
 }
 
 function initializedMachine(file: SidFile): C64Machine {
-  const machine = new C64Machine(file, new RegisterFrame());
+  const machine = createC64Machine(file, createRegisterFrame());
   machine.initSubtune(1);
   return machine;
 }
@@ -112,7 +113,7 @@ describe('runFramesTo', () => {
   });
 
   it('lets a thrown emulation error propagate untouched', () => {
-    const machine = new C64Machine(counterTune(), new RegisterFrame()); // never initialised
+    const machine = createC64Machine(counterTune(), createRegisterFrame()); // never initialised
 
     expect(() => runFramesTo(machine, frames(0), frames(1), () => undefined)).toThrow(
       UnplayableTuneError,

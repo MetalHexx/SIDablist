@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { RegisterFrame } from '@sidablist/core';
+import { createRegisterFrame } from '@sidablist/core';
 import type { SidFrame } from '@sidablist/core';
 import {
   buildDisplayCharsPacket,
@@ -67,7 +67,7 @@ describe('buildSidDataPacket', () => {
   });
 
   it('produces a 15-byte packet for writes to registers 0, 1 and 24, in ascending slot order', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x11);
     frame.onSidWrite(1, 0x22);
     frame.onSidWrite(24, 0x33);
@@ -85,7 +85,7 @@ describe('buildSidDataPacket', () => {
   });
 
   it('sets the MSB mask bit and sends the low 7 bits for a value >= 0x80', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0xff);
 
     const packet = buildSidDataPacket(frame.takeSnapshot());
@@ -96,7 +96,7 @@ describe('buildSidDataPacket', () => {
   });
 
   it('carries both writes to register 4 in one frame, in slots 22 and 25', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(4, 0x01);
     frame.onSidWrite(4, 0x02);
 
@@ -111,7 +111,7 @@ describe('buildSidDataPacket', () => {
     // Registers 0, 1 and 24 written once each, plus a gate retrigger on register 4 — the same
     // write sequence the pre-extraction RegisterFrame/asid-encoder pair in teensyrom-web produced
     // this exact packet for.
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x11);
     frame.onSidWrite(1, 0x22);
     frame.onSidWrite(24, 0x33);

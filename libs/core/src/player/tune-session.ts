@@ -1,7 +1,7 @@
-import { C64Machine } from '../cpu/c64-machine.js';
-import type { MachineSnapshot } from '../cpu/c64-machine.js';
-import { RegisterFrame } from '../registers/register-frame.js';
-import type { RegisterValuesSnapshot } from '../registers/register-frame.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
+import type { C64Machine, MachineSnapshot } from '../cpu/c64-machine.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
+import type { RegisterFrame, RegisterValuesSnapshot } from '../registers/register-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import type { ReplayResult } from '../replay/replay-to-frame.js';
@@ -239,8 +239,8 @@ class TuneSessionImpl implements TuneSession {
 
   load(file: SidFile): void {
     this._file = file;
-    this._frame = new RegisterFrame();
-    this._machine = new C64Machine(file, this._frame);
+    this._frame = createRegisterFrame();
+    this._machine = createC64Machine(file, this._frame);
     this._subtuneCount = Math.max(1, file.songs);
     // The outgoing tune's rate must not survive into this one — initSubtune() re-syncs it once the
     // incoming tune's own init has run.

@@ -1,6 +1,6 @@
-import { RegisterFrame } from '../registers/register-frame.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
 import type { RegisterValuesSnapshot } from '../registers/register-frame.js';
-import { C64Machine } from '../cpu/c64-machine.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
 import type { MachineSnapshot } from '../cpu/c64-machine.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { describeError } from '../common/errors.js';
@@ -38,9 +38,9 @@ export function replayToFrame(
 ): ReplayResult {
   const target = frames(Math.max(0, Math.round(targetFrame)));
 
-  const frame = new RegisterFrame();
+  const frame = createRegisterFrame();
   mutes.forEach((muted, voice) => frame.setVoiceMuted(voice, muted));
-  const machine = new C64Machine(file, frame);
+  const machine = createC64Machine(file, frame);
 
   try {
     machine.initSubtune(subtune);

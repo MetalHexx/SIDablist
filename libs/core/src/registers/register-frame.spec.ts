@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from './clock-ratio.js';
-import { RegisterFrame } from './register-frame.js';
-import type { ScaledRegisterGroup, SidFilterMode } from './register-frame.js';
+import { createRegisterFrame } from './register-frame.js';
+import type { RegisterFrame, ScaledRegisterGroup, SidFilterMode } from './register-frame.js';
 import type { SidFrame } from './sid-frame.js';
 import { SID_REGISTER_COUNT, VOICE_CONTROL_REGISTERS } from './sid-constants.js';
 import { clamp } from '../common/math.js';
-import { C64Machine } from '../cpu/c64-machine.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { parseSidFile } from '../sid/sid-file.parser.js';
 import { BUNDLED_TUNES, decodeBundledTune } from '../sid/__fixtures__/index.js';
@@ -43,7 +43,7 @@ const FREQUENCY_REGISTERS = [
 describe('RegisterFrame', () => {
   it('emits a write naming the register the tune wrote, for every register', () => {
     for (const register of ALL_REGISTERS) {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(register, 0x33);
 
       expect(writesOf(frame.takeSnapshot())).toEqual([{ register, value: 0x33 }]);
@@ -51,14 +51,14 @@ describe('RegisterFrame', () => {
   });
 
   it('carries the whole byte for a value at or above 0x80', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(2, 0xab);
 
     expect(writesOf(frame.takeSnapshot())).toEqual([{ register: 2, value: 0xab }]);
   });
 
   it("keeps the tune's own write order rather than register order", () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     for (const register of [24, 0, 13, 7, 1]) {
       frame.onSidWrite(register, register);
     }
@@ -67,7 +67,7 @@ describe('RegisterFrame', () => {
   });
 
   it('refills one frame object rather than building a new one per call', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x10);
     const first = frame.takeSnapshot();
     frame.onSidWrite(1, 0x20);
@@ -83,7 +83,7 @@ describe('RegisterFrame', () => {
   it.each([4, 11, 18])(
     'carries both writes to gate register %d in one frame, as two ordered writes',
     (register) => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(register, 0x10);
       frame.onSidWrite(register, 0x20);
 
@@ -96,7 +96,7 @@ describe('RegisterFrame', () => {
   );
 
   it('leaves a gate retrigger where the tune put it, between the writes around it', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x01);
     frame.onSidWrite(4, 0x10);
     frame.onSidWrite(1, 0x02);
@@ -111,7 +111,7 @@ describe('RegisterFrame', () => {
   });
 
   it('folds a third write to a gate register into the retrigger already carried', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(4, 0x10);
     frame.onSidWrite(4, 0x20);
     frame.onSidWrite(4, 0x30);
@@ -123,7 +123,7 @@ describe('RegisterFrame', () => {
   });
 
   it('overwrites a non-gate register in place on a second write, and counts it', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(5, 0x01);
     frame.onSidWrite(0, 0x10);
     frame.onSidWrite(0, 0x20);
@@ -136,7 +136,7 @@ describe('RegisterFrame', () => {
   });
 
   it('accumulates the suppressed-write count across frames instead of resetting it on snapshot', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x10);
     frame.onSidWrite(0, 0x20);
     frame.takeSnapshot();
@@ -148,13 +148,13 @@ describe('RegisterFrame', () => {
   });
 
   it('produces an empty frame for a frame with no writes', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
 
     expect(frame.takeSnapshot().count).toBe(0);
   });
 
   it('clears dirty state on snapshot so an untouched next frame is empty again', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x10);
     frame.takeSnapshot();
 
@@ -162,7 +162,7 @@ describe('RegisterFrame', () => {
   });
 
   it('resets per-frame second-write tracking on snapshot, so the next frame is not suppressed', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(0, 0x10);
     frame.onSidWrite(0, 0x20);
     frame.takeSnapshot();
@@ -174,7 +174,7 @@ describe('RegisterFrame', () => {
   });
 
   it('resyncs all 25 registers, once each, in ascending order', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
 
     frame.markAllDirty();
     const snapshot = frame.takeSnapshot();
@@ -184,7 +184,7 @@ describe('RegisterFrame', () => {
   });
 
   it('reflects a register value already written before a resync', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.onSidWrite(24, 0x42);
     frame.takeSnapshot();
 
@@ -194,7 +194,7 @@ describe('RegisterFrame', () => {
   });
 
   it("puts a resync's forced writes after the tune's own, skipping what the tune already wrote", () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.markAllDirty();
     frame.onSidWrite(20, 0x77);
     frame.onSidWrite(3, 0x66);
@@ -208,7 +208,7 @@ describe('RegisterFrame', () => {
   });
 
   it('fits a full resync alongside a retrigger of all three gate registers', () => {
-    const frame = new RegisterFrame();
+    const frame = createRegisterFrame();
     frame.markAllDirty();
     for (const register of [4, 11, 18]) {
       frame.onSidWrite(register, 0x01);
@@ -226,7 +226,7 @@ describe('RegisterFrame', () => {
 
   describe('voice mute', () => {
     it('forces the control register to 0 in the very next frame on mute-engage', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
 
@@ -234,7 +234,7 @@ describe('RegisterFrame', () => {
     });
 
     it('suppresses further writes to a muted voice control register but not its sibling registers', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
       frame.takeSnapshot();
@@ -246,7 +246,7 @@ describe('RegisterFrame', () => {
     });
 
     it('drops a retrigger to a muted voice as readily as the first write', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
       frame.takeSnapshot();
@@ -258,7 +258,7 @@ describe('RegisterFrame', () => {
     });
 
     it('lets a subsequent write through unmodified after unmuting', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
       frame.takeSnapshot();
@@ -270,7 +270,7 @@ describe('RegisterFrame', () => {
     });
 
     it('unmuting forces no extra write of its own', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
       frame.takeSnapshot();
@@ -280,7 +280,7 @@ describe('RegisterFrame', () => {
     });
 
     it('muting an already-muted voice is a no-op', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, true);
       frame.takeSnapshot();
@@ -290,7 +290,7 @@ describe('RegisterFrame', () => {
     });
 
     it('unmuting an already-unmuted voice is a no-op', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
 
       frame.setVoiceMuted(1, false);
 
@@ -300,13 +300,13 @@ describe('RegisterFrame', () => {
 
   describe('the register values snapshot', () => {
     it('round-trips all 25 registers through a snapshot and a restore', () => {
-      const source = new RegisterFrame();
+      const source = createRegisterFrame();
       for (const register of ALL_REGISTERS) {
         source.onSidWrite(register, byteFor(register));
       }
       const cue = source.snapshotValues();
 
-      const target = new RegisterFrame();
+      const target = createRegisterFrame();
       target.restoreValues(cue);
       target.markAllDirty();
       const snapshot = target.takeSnapshot();
@@ -318,11 +318,11 @@ describe('RegisterFrame', () => {
     });
 
     it('holds the voices muted now through a restore, whatever the cue captured', () => {
-      const source = new RegisterFrame();
+      const source = createRegisterFrame();
       source.onSidWrite(11, 0x41);
       const cue = source.snapshotValues();
 
-      const target = new RegisterFrame();
+      const target = createRegisterFrame();
       target.setVoiceMuted(1, true);
       target.takeSnapshot();
       target.restoreValues(cue);
@@ -332,7 +332,7 @@ describe('RegisterFrame', () => {
     });
 
     it('drops a half-built frame on restore', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x10);
 
       frame.restoreValues(frame.snapshotValues());
@@ -345,7 +345,7 @@ describe('RegisterFrame', () => {
     it('decodes gate, waveform, frequency and envelope from the shadow, per voice', () => {
       for (let voice = 0; voice < 3; voice++) {
         const base = voice * 7;
-        const frame = new RegisterFrame();
+        const frame = createRegisterFrame();
         frame.onSidWrite(base + 0, 0x34); // frequency low
         frame.onSidWrite(base + 1, 0x12); // frequency high
         frame.onSidWrite(VOICE_CONTROL_REGISTERS[voice], 0x41); // waveform 4, gate on
@@ -362,7 +362,7 @@ describe('RegisterFrame', () => {
     });
 
     it('reads the gate bit and the waveform nibble independently of one another', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(VOICE_CONTROL_REGISTERS[0], 0x10); // waveform 1 (triangle), gate off
       expect(frame.voiceState(0)).toMatchObject({ gate: false, waveform: 0x1 });
 
@@ -374,7 +374,7 @@ describe('RegisterFrame', () => {
     });
 
     it('decodes the raw shadow rather than a scaled one — a pitch correction never moves it', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x00);
       frame.onSidWrite(1, 0x10); // frequency 0x1000
       frame.setVoicePitch(0, 2);
@@ -386,7 +386,7 @@ describe('RegisterFrame', () => {
 
   describe('emittedValues', () => {
     it('matches written and sent everywhere when every control is at home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       for (const register of ALL_REGISTERS) {
         frame.onSidWrite(register, byteFor(register));
       }
@@ -402,7 +402,7 @@ describe('RegisterFrame', () => {
     it.each(SCALED_GROUPS)(
       "differs from written on exactly %s's own registers once scaled off home",
       (group) => {
-        const frame = new RegisterFrame();
+        const frame = createRegisterFrame();
         for (const register of ALL_REGISTERS) {
           frame.onSidWrite(register, byteFor(register));
         }
@@ -422,7 +422,7 @@ describe('RegisterFrame', () => {
     );
 
     it("differs from written only on the pitched voice's frequency pair once off home", () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       for (const register of ALL_REGISTERS) {
         frame.onSidWrite(register, byteFor(register));
       }
@@ -441,7 +441,7 @@ describe('RegisterFrame', () => {
     });
 
     it('leaves a forced filter mode visible on sent[24] with no coefficient off home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0xba); // voice-3 mute set, tune's mode 0b011, volume 10
       frame.setFilterMode('lowPass');
 
@@ -452,12 +452,12 @@ describe('RegisterFrame', () => {
     });
 
     it('never perturbs what the next real frame emits — a pull is side-effect free', () => {
-      const control = new RegisterFrame();
+      const control = createRegisterFrame();
       control.onSidWrite(24, 0x2f);
       control.setOutputGain(0.5);
       const expected = writesOf(control.takeSnapshot());
 
-      const observed = new RegisterFrame();
+      const observed = createRegisterFrame();
       observed.onSidWrite(24, 0x2f);
       observed.setOutputGain(0.5);
       observed.emittedValues();
@@ -467,7 +467,7 @@ describe('RegisterFrame', () => {
     });
 
     it('never consumes the one-shot restore a return home owes the next real frame', () => {
-      const control = new RegisterFrame();
+      const control = createRegisterFrame();
       control.onSidWrite(21, 0x07);
       control.onSidWrite(22, 0x64);
       control.setRegisterScale('cutoff', 0.5);
@@ -475,7 +475,7 @@ describe('RegisterFrame', () => {
       control.setRegisterScale('cutoff', 1); // arms the one-shot restore
       const expectedRestore = writesOf(control.takeSnapshot());
 
-      const observed = new RegisterFrame();
+      const observed = createRegisterFrame();
       observed.onSidWrite(21, 0x07);
       observed.onSidWrite(22, 0x64);
       observed.setRegisterScale('cutoff', 0.5);
@@ -490,7 +490,7 @@ describe('RegisterFrame', () => {
   describe('output gain scaling ($D418, register 24)', () => {
     it('scales only the low nibble, leaving every filter-mode/voice-3-mute combination untouched', () => {
       for (let highNibble = 0; highNibble <= 0xf; highNibble++) {
-        const frame = new RegisterFrame();
+        const frame = createRegisterFrame();
         frame.onSidWrite(24, (highNibble << 4) | 0x0a); // low nibble 10
         frame.setOutputGain(0.5);
 
@@ -501,31 +501,31 @@ describe('RegisterFrame', () => {
     });
 
     it('rounds gain 0 to silence and leaves gain 1 byte-for-byte unchanged', () => {
-      const silenced = new RegisterFrame();
+      const silenced = createRegisterFrame();
       silenced.onSidWrite(24, 0x3f);
       silenced.setOutputGain(0);
       expect(emittedValue(silenced.takeSnapshot(), 24)).toBe(0x30);
 
-      const unchanged = new RegisterFrame();
+      const unchanged = createRegisterFrame();
       unchanged.onSidWrite(24, 0x3f);
       unchanged.setOutputGain(1);
       expect(emittedValue(unchanged.takeSnapshot(), 24)).toBe(0x3f);
     });
 
     it('rounds a mid-gain value up when past the half boundary and down when short of it', () => {
-      const roundsDown = new RegisterFrame();
+      const roundsDown = createRegisterFrame();
       roundsDown.onSidWrite(24, 0x02); // low nibble 2 at gain 0.6 -> 1.2, rounds down to 1
       roundsDown.setOutputGain(0.6);
       expect(emittedValue(roundsDown.takeSnapshot(), 24)).toBe(1);
 
-      const roundsUp = new RegisterFrame();
+      const roundsUp = createRegisterFrame();
       roundsUp.onSidWrite(24, 0x03); // low nibble 3 at gain 0.6 -> 1.8, rounds up to 2
       roundsUp.setOutputGain(0.6);
       expect(emittedValue(roundsUp.takeSnapshot(), 24)).toBe(2);
     });
 
     it('carries the volume register with no $D418 write at all, once gain is off unity', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.takeSnapshot(); // establish an empty frame — the raw value defaults to 0
       frame.setOutputGain(0.5);
 
@@ -533,7 +533,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps emitting the volume register every frame while gain stays off unity, with no rewrite', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f); // written once, never rewritten again
       frame.setOutputGain(0.5);
       frame.takeSnapshot();
@@ -544,7 +544,7 @@ describe('RegisterFrame', () => {
     });
 
     it('carries the volume register once more on the return to exactly unity, to restore the full value', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.setOutputGain(0.5);
       frame.takeSnapshot(); // consumes the "off unity" emission
@@ -555,7 +555,7 @@ describe('RegisterFrame', () => {
     });
 
     it('never emits the volume register while the fader stays at unity', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.takeSnapshot();
 
@@ -563,7 +563,7 @@ describe('RegisterFrame', () => {
     });
 
     it('survives a discarded snapshot between a gain change and the next emitted frame, without swallowing the fader move', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.setOutputGain(0.5);
 
@@ -575,7 +575,7 @@ describe('RegisterFrame', () => {
     });
 
     it('leaves the suppressed-write count untouched across a swept fade', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       for (let i = 0; i < 5; i++) {
         frame.onSidWrite(24, 0x20 + i);
         frame.setOutputGain(i / 4);
@@ -586,7 +586,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps snapshotValues() raw, never gain-scaled', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.setOutputGain(0.5);
 
@@ -594,7 +594,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps a resync at one write per register with gain applied', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x1f);
       frame.setOutputGain(0.5);
 
@@ -606,12 +606,12 @@ describe('RegisterFrame', () => {
     });
 
     it('does not double-apply gain to a cue captured at one fader position and re-entered at another', () => {
-      const source = new RegisterFrame();
+      const source = createRegisterFrame();
       source.onSidWrite(24, 0x2f);
       source.setOutputGain(0.5);
       const cue = source.snapshotValues(); // raw values only, per snapshotValues()'s own contract
 
-      const target = new RegisterFrame();
+      const target = createRegisterFrame();
       target.restoreValues(cue);
       target.setOutputGain(0.25);
       target.markAllDirty();
@@ -633,7 +633,7 @@ describe('RegisterFrame', () => {
     ];
 
     it('passes every register through byte-for-byte with every control at home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       for (const register of ALL_REGISTERS) {
         frame.onSidWrite(register, byteFor(register));
       }
@@ -646,7 +646,7 @@ describe('RegisterFrame', () => {
     });
 
     it('combines the 11-bit cutoff, rounds it once and splits it back, sparing register 21s upper bits', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0xff); // cutoff bits 0-2 = 7, upper five bits all set
       frame.onSidWrite(CUTOFF_HIGH, 0x65); // combined = (101 << 3) | 7 = 815
 
@@ -659,7 +659,7 @@ describe('RegisterFrame', () => {
     });
 
     it('saturates cutoff at its 11-bit ceiling rather than wrapping', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0x00);
       frame.onSidWrite(CUTOFF_HIGH, 0xff); // combined = 2040
 
@@ -671,7 +671,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps re-emitting both cutoff registers while off home, on a tune that wrote them once', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0x07);
       frame.onSidWrite(CUTOFF_HIGH, 0x64); // combined = 807, halved = 404
       frame.setRegisterScale('cutoff', 0.5);
@@ -684,7 +684,7 @@ describe('RegisterFrame', () => {
     });
 
     it('restores the raw cutoff bytes for exactly one frame on the return home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0xff);
       frame.onSidWrite(CUTOFF_HIGH, 0x65);
       frame.setRegisterScale('cutoff', 0.5);
@@ -701,7 +701,7 @@ describe('RegisterFrame', () => {
     });
 
     it('emits nothing when a coefficient is set to the value it already holds', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0x05);
       frame.takeSnapshot();
 
@@ -712,7 +712,7 @@ describe('RegisterFrame', () => {
 
     it('scales register 23s resonance nibble without disturbing its filter-routing nibble', () => {
       for (let routing = 0; routing <= 0x0f; routing++) {
-        const frame = new RegisterFrame();
+        const frame = createRegisterFrame();
         frame.onSidWrite(RESONANCE, 0xc0 | routing); // resonance 12
         frame.setRegisterScale('resonance', 0.5);
 
@@ -728,7 +728,7 @@ describe('RegisterFrame', () => {
     ] as const)(
       'replaces the volume registers mode bits with the forced %s mode alone',
       (mode, bits) => {
-        const frame = new RegisterFrame();
+        const frame = createRegisterFrame();
         frame.onSidWrite(VOLUME, 0xba); // voice-3 mute set, tune's mode 0b011, volume 10
 
         frame.setFilterMode(mode);
@@ -738,7 +738,7 @@ describe('RegisterFrame', () => {
     );
 
     it('composes gain and filter mode into one $D418 byte, neither clobbering the other', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(RESONANCE, 0xc9);
       frame.onSidWrite(VOLUME, 0xba);
 
@@ -751,7 +751,7 @@ describe('RegisterFrame', () => {
     });
 
     it('holds the volume register emitted while a mode is forced and restores the raw byte once on release', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(VOLUME, 0xba);
       frame.setFilterMode('lowPass');
       frame.takeSnapshot();
@@ -764,7 +764,7 @@ describe('RegisterFrame', () => {
     });
 
     it('emits nothing when the filter mode is set to the one already held', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(VOLUME, 0x2f);
       frame.takeSnapshot();
 
@@ -774,7 +774,7 @@ describe('RegisterFrame', () => {
     });
 
     it('applies one pulse-width coefficient identically to all three voices, sparing the unused nibble', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       const raw = [
         [0x34, 0xf5],
         [0xcd, 0x3a],
@@ -800,7 +800,7 @@ describe('RegisterFrame', () => {
     });
 
     it('saturates pulse width at its 12-bit ceiling rather than wrapping', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(2, 0xff);
       frame.onSidWrite(3, 0xf8); // combined = 2303, upper nibble of the high register set
 
@@ -812,7 +812,7 @@ describe('RegisterFrame', () => {
     });
 
     it('applies a pitch coefficient to each voices whole 16-bit frequency value', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       const raw = [
         [0x34, 0x12],
         [0xcd, 0xab],
@@ -838,7 +838,7 @@ describe('RegisterFrame', () => {
     });
 
     it('saturates frequency at its 16-bit ceiling rather than wrapping', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x00);
       frame.onSidWrite(1, 0x80); // 0x8000
 
@@ -850,7 +850,7 @@ describe('RegisterFrame', () => {
     });
 
     it('emits all six frequency registers every frame while off home, then restores them once', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
         frame.onSidWrite(low, 0x40);
         frame.onSidWrite(high, 0x20);
@@ -876,7 +876,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps snapshotValues() raw with every control off home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       const raw: [number, number][] = [
         [CUTOFF_LOW, 0xff],
         [CUTOFF_HIGH, 0x65],
@@ -905,13 +905,13 @@ describe('RegisterFrame', () => {
     });
 
     it('scales a restored cue once at the receiving frames coefficient, never twice', () => {
-      const source = new RegisterFrame();
+      const source = createRegisterFrame();
       source.onSidWrite(CUTOFF_LOW, 0xff);
       source.onSidWrite(CUTOFF_HIGH, 0x65); // combined = 815
       source.setRegisterScale('cutoff', 0.5);
       const cue = source.snapshotValues();
 
-      const target = new RegisterFrame();
+      const target = createRegisterFrame();
       target.restoreValues(cue);
       target.setRegisterScale('cutoff', 0.25);
       target.markAllDirty();
@@ -923,7 +923,7 @@ describe('RegisterFrame', () => {
     });
 
     it('keeps a resync at one write per register with every active control applied', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(CUTOFF_LOW, 0xff);
       frame.onSidWrite(CUTOFF_HIGH, 0x65);
       frame.onSidWrite(RESONANCE, 0xc9);
@@ -950,7 +950,7 @@ describe('RegisterFrame', () => {
 
   describe('the target clock and the per-voice pitch', () => {
     it('scales a PAL tune down to hold its pitch on an NTSC machine', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x34);
       frame.onSidWrite(1, 0x12); // 0x1234
 
@@ -963,7 +963,7 @@ describe('RegisterFrame', () => {
     });
 
     it('emits the high byte the scaling moved, in a frame where the tune wrote only the low one', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
       frame.onSidWrite(0, 0x40);
       frame.onSidWrite(1, 0x02); // 0x0240 -> 0x022b
@@ -977,7 +977,7 @@ describe('RegisterFrame', () => {
     });
 
     it('rounds the scaled value rather than truncating it', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x01);
       frame.onSidWrite(1, 0x01); // 0x0101 = 257
 
@@ -989,7 +989,7 @@ describe('RegisterFrame', () => {
     });
 
     it('clamps at the 16-bit ceiling when the two multipliers together overrun it', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x00);
       frame.onSidWrite(1, 0xfc); // 0xfc00
 
@@ -1002,12 +1002,12 @@ describe('RegisterFrame', () => {
     });
 
     it('reaches the same bytes whichever order the correction and the pitch arrive in', () => {
-      const clockFirst = new RegisterFrame();
+      const clockFirst = createRegisterFrame();
       clockFirst.onSidWrite(1, 0x40); // 0x4000
       clockFirst.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
       clockFirst.setVoicePitch(0, 1.5);
 
-      const pitchFirst = new RegisterFrame();
+      const pitchFirst = createRegisterFrame();
       pitchFirst.onSidWrite(1, 0x40);
       pitchFirst.setVoicePitch(0, 1.5);
       pitchFirst.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
@@ -1019,7 +1019,7 @@ describe('RegisterFrame', () => {
     });
 
     it('holds the correction across a pitch move, and the pitch across a correction', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(1, 0x40); // 0x4000
       frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
       frame.setVoicePitch(0, 1.5);
@@ -1038,7 +1038,7 @@ describe('RegisterFrame', () => {
     });
 
     it('scales three voices by three coefficients of their own', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       FREQUENCY_REGISTERS.forEach(([low, high]) => {
         frame.onSidWrite(low, 0x34);
         frame.onSidWrite(high, 0x12); // 0x1234 on every voice
@@ -1058,7 +1058,7 @@ describe('RegisterFrame', () => {
     });
 
     it('leaves a voice at home out of the frame while a neighbour is scaled', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       FREQUENCY_REGISTERS.forEach(([low, high]) => {
         frame.onSidWrite(low, 0x34);
         frame.onSidWrite(high, 0x12);
@@ -1070,7 +1070,7 @@ describe('RegisterFrame', () => {
     });
 
     it('emits exactly what the tune wrote with the clocks matched and every pitch at 1', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
       FREQUENCY_REGISTERS.forEach(([low, high], voice) => {
         frame.setVoicePitch(voice, 1);
@@ -1089,7 +1089,7 @@ describe('RegisterFrame', () => {
     });
 
     it('restores the raw frequency bytes for exactly one frame when the correction comes home', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x34);
       frame.onSidWrite(1, 0x12);
       frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
@@ -1104,8 +1104,8 @@ describe('RegisterFrame', () => {
     });
 
     it('leaves every register but the frequency pairs byte-identical across a target-clock change', () => {
-      const corrected = new RegisterFrame();
-      const uncorrected = new RegisterFrame();
+      const corrected = createRegisterFrame();
+      const uncorrected = createRegisterFrame();
       corrected.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
       for (const register of ALL_REGISTERS) {
         corrected.onSidWrite(register, byteFor(register));
@@ -1129,7 +1129,7 @@ describe('RegisterFrame', () => {
     });
 
     it('ignores an unusable clock pair, a voice outside the chip and a non-finite coefficient', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.onSidWrite(0, 0x34);
       frame.onSidWrite(1, 0x12);
 
@@ -1146,7 +1146,7 @@ describe('RegisterFrame', () => {
     });
 
     it('addresses no register outside the shadows own range, whatever the writes and coefficients', () => {
-      const frame = new RegisterFrame();
+      const frame = createRegisterFrame();
       frame.setTargetClock(NTSC_PHI2_HZ, PAL_PHI2_HZ);
       frame.setVoicePitch(0, 1e6);
       frame.setVoicePitch(1, 1e-6);
@@ -1183,8 +1183,8 @@ describe('RegisterFrame', () => {
       frames: number,
       perFrame?: (frame: RegisterFrame, index: number) => void,
     ): TuneRun {
-      const frame = new RegisterFrame();
-      const machine = new C64Machine(insid3Out(), frame);
+      const frame = createRegisterFrame();
+      const machine = createC64Machine(insid3Out(), frame);
       machine.initSubtune(1);
 
       const rendered: Write[][] = [];
@@ -1288,8 +1288,8 @@ describe('RegisterFrame', () => {
     /** Plays `frames` play calls with `gain` applied throughout, recording every frame's emitted
      *  $D418 byte by frame index, wherever register 24 went out that frame. */
     function recordVolumeByFrame(frames: number, gain: number): Map<number, number> {
-      const frame = new RegisterFrame();
-      const machine = new C64Machine(insid3Out(), frame);
+      const frame = createRegisterFrame();
+      const machine = createC64Machine(insid3Out(), frame);
       machine.initSubtune(1);
       frame.setOutputGain(gain);
 

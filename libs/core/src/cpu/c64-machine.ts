@@ -96,7 +96,88 @@ export interface MachineSnapshot {
  * and ROM vector stubs — for a tune's `init` and `play` routines to run to completion. Every write
  * the tune makes to the SID's address range is handed to the sink.
  */
-export class C64Machine {
+export interface C64Machine {
+  /** Cycles between play calls when the tune programmed CIA 1 timer A; `null` for a frame-rate tune. */
+  readonly cyclesPerPlayCall: number | null;
+
+  /**
+   * How many play calls a second of this tune wants per frame, 1..16. This is advice for the
+   * caller's clock — `runFrame` still calls the play routine exactly once.
+   */
+  readonly callsPerFrame: number;
+
+  /**
+   * The same rate as `callsPerFrame`, but unrounded — the fractional play rate the CIA timer latch
+   * actually describes.
+   *
+   * A tune programs timer A to whatever period it wants, and that period is under no obligation to
+   * divide the frame evenly: rates like 2.4 calls per frame are ordinary. `callsPerFrame` rounds,
+   * which is right for the integer "how many calls does a frame want" question its name asks, but
+   * wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow, and
+   * the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock; use
+   * `callsPerFrame` only where an integer count is genuinely what is wanted.
+   */
+  readonly exactCallsPerFrame: number;
+
+  /**
+   * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
+   * NTSC depending on this tune's own clock. What a headroom figure divides `FrameResult.cyclesUsed`
+   * against.
+   */
+  readonly frameCycleBudget: Cycles;
+
+  /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
+  readonly resolvedPlayAddress: number;
+
+  /** Where the entry trampoline was written — moved off the default page when the tune covers it. */
+  readonly trampolineBase: number;
+
+  /** Undocumented opcodes executed since the last `initSubtune`; each ran as a 2-cycle no-op. */
+  readonly illegalOpcodeCount: number;
+
+  /**
+   * A complete, detached copy of the machine's mutable state: 64 KB of address space, the CPU's
+   * execution state, and this class's own bookkeeping.
+   *
+   * The point of it is `restore` — a position captured here can be returned to in constant time
+   * rather than by re-emulating the tune from `init`, which is what makes a cue hop free of the
+   * main-thread stall that a replay of the same distance costs.
+   */
+  snapshot(): MachineSnapshot;
+
+  /**
+   * Puts the machine back exactly where `snapshot` was taken.
+   *
+   * Restoring the entire address space is what makes this safe to run on the *live* machine rather
+   * than a throwaway one: nothing of wherever playback currently is survives the call, so there is no
+   * RAM left to bleed into the restored position.
+   */
+  restore(snapshot: MachineSnapshot): void;
+
+  /**
+   * Resets the address space, reloads the tune and runs its init routine for the given 1-based
+   * subtune, then resolves the play address an RSID installs during init.
+   *
+   * @throws {RangeError} when `song` is outside the tune's subtune range.
+   * @throws {UnplayableTuneError} when init finished but left no play address to call.
+   */
+  initSubtune(song: number): FrameResult;
+
+  /**
+   * Runs the play routine exactly once. Batching several calls into one frame would collapse them
+   * downstream, which is precisely the data a multispeed tune exists to deliver.
+   *
+   * @throws {UnplayableTuneError} when no play address has been resolved.
+   */
+  runFrame(): FrameResult;
+}
+
+/** Builds a `C64Machine` for `file`, streaming every SID write it makes to `sink`. */
+export function createC64Machine(file: SidFile, sink: SidWriteSink): C64Machine {
+  return new C64MachineImpl(file, sink);
+}
+
+class C64MachineImpl implements C64Machine {
   private readonly file: SidFile;
   private readonly sink: SidWriteSink;
   private readonly memory: Uint8Array;
@@ -136,14 +217,6 @@ export class C64Machine {
     this.illegalOpcodeTable = buildIllegalOpcodeTable(this.cpu);
   }
 
-  /**
-   * A complete, detached copy of the machine's mutable state: 64 KB of address space, the CPU's
-   * execution state, and this class's own bookkeeping.
-   *
-   * The point of it is `restore` — a position captured here can be returned to in constant time
-   * rather than by re-emulating the tune from `init`, which is what makes a cue hop free of the
-   * main-thread stall that a replay of the same distance costs.
-   */
   snapshot(): MachineSnapshot {
     return {
       memory: this.memory.slice(),
@@ -159,13 +232,6 @@ export class C64Machine {
     };
   }
 
-  /**
-   * Puts the machine back exactly where `snapshot` was taken.
-   *
-   * Restoring the entire address space is what makes this safe to run on the *live* machine rather
-   * than a throwaway one: nothing of wherever playback currently is survives the call, so there is no
-   * RAM left to bleed into the restored position.
-   */
   restore(snapshot: MachineSnapshot): void {
     this.memory.set(snapshot.memory);
     this.cpu.setState(snapshot.cpu);
@@ -179,15 +245,10 @@ export class C64Machine {
     this.illegalOpcodes = snapshot.illegalOpcodes;
   }
 
-  /** Cycles between play calls when the tune programmed CIA 1 timer A; `null` for a frame-rate tune. */
   get cyclesPerPlayCall(): number | null {
     return this.timerALatch === null ? null : this.timerALatch + 1;
   }
 
-  /**
-   * How many play calls a second of this tune wants per frame, 1..16. This is advice for the
-   * caller's clock — `runFrame` still calls the play routine exactly once.
-   */
   get callsPerFrame(): number {
     const rate = this.cyclesPerPlayCall;
     if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
@@ -196,17 +257,6 @@ export class C64Machine {
     return Math.min(MAX_CALLS_PER_FRAME, Math.max(1, Math.round(this.cyclesPerFrame / rate)));
   }
 
-  /**
-   * The same rate as `callsPerFrame`, but unrounded — the fractional play rate the CIA timer latch
-   * actually describes.
-   *
-   * A tune programs timer A to whatever period it wants, and that period is under no obligation to
-   * divide the frame evenly: rates like 2.4 calls per frame are ordinary. `callsPerFrame` rounds,
-   * which is right for the integer "how many calls does a frame want" question its name asks, but
-   * wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow, and
-   * the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock; use
-   * `callsPerFrame` only where an integer count is genuinely what is wanted.
-   */
   get exactCallsPerFrame(): number {
     const rate = this.cyclesPerPlayCall;
     if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
@@ -215,37 +265,22 @@ export class C64Machine {
     return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / rate);
   }
 
-  /**
-   * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
-   * NTSC depending on this tune's own clock. What a headroom figure divides `FrameResult.cyclesUsed`
-   * against.
-   */
   get frameCycleBudget(): Cycles {
     return cycles(this.cyclesPerFrame * PLAY_BUDGET_FRAMES);
   }
 
-  /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
   get resolvedPlayAddress(): number {
     return this.playAddress;
   }
 
-  /** Where the entry trampoline was written — moved off the default page when the tune covers it. */
   get trampolineBase(): number {
     return this.trampoline;
   }
 
-  /** Undocumented opcodes executed since the last `initSubtune`; each ran as a 2-cycle no-op. */
   get illegalOpcodeCount(): number {
     return this.illegalOpcodes;
   }
 
-  /**
-   * Resets the address space, reloads the tune and runs its init routine for the given 1-based
-   * subtune, then resolves the play address an RSID installs during init.
-   *
-   * @throws {RangeError} when `song` is outside the tune's subtune range.
-   * @throws {UnplayableTuneError} when init finished but left no play address to call.
-   */
   initSubtune(song: number): FrameResult {
     const subtunes = Math.max(1, this.file.songs);
     if (!Number.isInteger(song) || song < 1 || song > subtunes) {
@@ -276,12 +311,6 @@ export class C64Machine {
     return result;
   }
 
-  /**
-   * Runs the play routine exactly once. Batching several calls into one frame would collapse them
-   * downstream, which is precisely the data a multispeed tune exists to deliver.
-   *
-   * @throws {UnplayableTuneError} when no play address has been resolved.
-   */
   runFrame(): FrameResult {
     if (this.playAddress === 0) {
       throw new UnplayableTuneError('no play address has been resolved — run initSubtune first');

@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { C64Machine, type MachineSnapshot } from '../cpu/c64-machine.js';
-import { RegisterFrame, type RegisterValuesSnapshot } from '../registers/register-frame.js';
+import { createC64Machine, type C64Machine, type MachineSnapshot } from '../cpu/c64-machine.js';
+import {
+  createRegisterFrame,
+  type RegisterFrame,
+  type RegisterValuesSnapshot,
+} from '../registers/register-frame.js';
 import { runFramesTo } from '../replay/run-frames.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames, type Frames } from '../units.js';
@@ -42,8 +46,8 @@ interface State {
 
 /** Where an unbroken run from `init` stands at `target` — the control a seek is measured against. */
 function runUnbrokenTo(target: Frames): State {
-  const registers = new RegisterFrame();
-  const machine = new C64Machine(counterTune(), registers);
+  const registers = createRegisterFrame();
+  const machine = createC64Machine(counterTune(), registers);
   machine.initSubtune(1);
   runFramesTo(machine, frames(0), target, () => {
     registers.takeSnapshot();
@@ -58,8 +62,8 @@ describe('seekToFrame', () => {
   let position: number;
 
   beforeEach(() => {
-    registers = new RegisterFrame();
-    machine = new C64Machine(counterTune(), registers);
+    registers = createRegisterFrame();
+    machine = createC64Machine(counterTune(), registers);
     machine.initSubtune(1);
     ring = createAnchorRing(() => frames(50)); // an anchor every 25 frames
     ring.record(machine, registers, frames(0)); // the frame-0 seed a load takes

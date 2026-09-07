@@ -184,7 +184,145 @@ function scaledFrequencyPacked(rawLow: number, rawHigh: number, coefficient: num
  * other register overwrites the first where it already stands and is counted as suppressed. Either
  * way the frame is never flushed early: one frame is one call of the tune's play routine.
  */
-export class RegisterFrame implements SidWriteSink {
+export interface RegisterFrame extends SidWriteSink {
+  /** Voice 0/1/2. Muting forces that voice's control register to 0 once, then drops every further
+   * write the tune's code makes to it until unmuted — every other register for that voice keeps
+   * updating live throughout — the hardware-mute technique the TeensyROM firmware uses.
+   *
+   * The zeroing is not a write the tune made, so it lands with the forced registers rather than in
+   * write order. */
+  setVoiceMuted(voice: number, muted: boolean): void;
+
+  /**
+   * Multiplies a register group by `coefficient`, full resolution, applied in `takeSnapshot()` and
+   * never at the write — scaling on the way out rather than in `onSidWrite` is what keeps
+   * `snapshotValues()`/`restoreValues()` raw (so a cue re-entered at a different knob position never
+   * double-applies a coefficient), keeps quantization to a single rounding per field, and keeps this
+   * stage out of `suppressedWrites` entirely, since none of these registers routes through a scaling
+   * branch in the write path.
+   *
+   * A coefficient of exactly 1 is home, not a multiplication by one: the group's raw bytes pass
+   * through untouched. `pulseWidth` holds one coefficient shared by all three voices, so scaling it
+   * preserves the tune's internal balance between them.
+   *
+   * A no-op call (the coefficient already held) leaves the one-shot restore untouched, so repeatedly
+   * setting the same value can never manufacture a spurious extra write.
+   */
+  setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void;
+
+  /**
+   * The pitch correction for a tune written for a machine clocked at `sourceHz` and played on one
+   * clocked at `targetHz` — the frequency registers alone, since the filter is analog, duty cycle is
+   * a fraction of the accumulator period and an envelope rate is a lookup index.
+   *
+   * The machine clock, not the chip model — 6581 versus 8580 is a separate value the sink forwards
+   * in its own packet.
+   *
+   * Tempo is not in this equation. The oscillator is a free-running phase accumulator inside the
+   * chip, so how often the play routine runs moves the tune's sequencer and nothing else; that half
+   * belongs to the play rate.
+   *
+   * A pair that is not two usable clock frequencies is ignored rather than allowed to become a
+   * coefficient.
+   */
+  setTargetClock(sourceHz: number, targetHz: number): void;
+
+  /**
+   * Voice 0/1/2's own pitch coefficient, which multiplies the clock correction rather than replacing
+   * it: the two compose, and neither can move the other. Ganging voices together is the
+   * application's decision — this accepts three independent values.
+   *
+   * A non-finite coefficient is ignored: it would scale every frequency to silence while never
+   * comparing equal to itself, so nothing could ever set it back.
+   */
+  setVoicePitch(voice: number, coefficient: number): void;
+
+  /**
+   * Replaces `$D418`'s filter-mode bits in every emitted volume byte until deselected. This is an
+   * override rather than a scale — the tune's own mode bits are discarded while one is held, and
+   * `null` hands them back. Selecting forces the volume register out the same way an off-home
+   * coefficient does; deselecting arms the same one-shot restore.
+   */
+  setFilterMode(mode: SidFilterMode | null): void;
+
+  /** 0…1, full resolution — the deck-gain entry point onto `$D418`'s low nibble, and one group of
+   *  the same scaling stage as every other control. */
+  setOutputGain(gain: number): void;
+
+  /**
+   * Forces every one of the 25 registers into the next frame at its current value (0 if never
+   * written) — called once after init so the chip starts a session from a known state instead of
+   * carrying over silence.
+   *
+   * A resync frame is not a fixed layout: the tune's own writes still come first and the forced ones
+   * fill in around them, so a caller reaching for a particular register must find it by register
+   * number rather than by position.
+   */
+  markAllDirty(): void;
+
+  /**
+   * Second writes folded into a register's existing entry instead of becoming a retrigger, counted
+   * across this object's lifetime rather than per frame — the data point for how often it matters
+   * in practice.
+   */
+  readonly suppressedWriteCount: number;
+
+  /**
+   * Fills the reused `SidFrame` with this frame's writes and clears the per-frame state — including
+   * the second-write tracking — so the next frame starts empty.
+   *
+   * The order is: what the tune wrote, as it wrote it; then whatever a resync, an off-home
+   * coefficient or a mute forces out, ascending by register and only for registers the tune left
+   * alone. An override replaces the byte of the write it applies to and never adds one.
+   *
+   * Forcing a group out is a standing condition re-checked live on every call, so a frame a caller
+   * discards can never swallow a knob move on a tune that does not keep rewriting those registers
+   * itself. Scaled bytes are computed once per frame, before the fill, because a two-register group
+   * read per write would combine and round twice.
+   */
+  takeSnapshot(): SidFrame;
+
+  /**
+   * Copies the accumulated register values, leaving this frame untouched.
+   *
+   * Per-frame state is excluded on purpose — a cue records where the chip stood, not which registers
+   * happened to be mid-flight when it was captured.
+   */
+  snapshotValues(): RegisterValuesSnapshot;
+
+  /**
+   * Replaces the accumulated register values wholesale and drops any half-built frame.
+   *
+   * Mute is not part of the snapshot: whichever voices are muted *now* stay muted, so returning to a
+   * cue captured before a mute does not un-mute it on the way back in.
+   */
+  restoreValues(snapshot: RegisterValuesSnapshot): void;
+
+  /**
+   * Voice `voice`'s gate, waveform, frequency and envelope, decoded from the shadow on every call —
+   * the same decode teensyrom-web's `frame-features.ts` runs offline against a recorded scan, run
+   * here against the live register values instead so a visualiser can read it every animation frame
+   * without waiting on a capture. Raw, like the shadow itself: a pitch correction or a knob scale
+   * shows up in `emittedValues()`, not here.
+   */
+  voiceState(voice: number): VoiceRegisterState;
+
+  /**
+   * The 25 registers as the tune wrote them (`written`) and as scaling would emit them if a frame
+   * went out this instant (`sent`) — computed fresh from the shadow and the live coefficients on
+   * every call rather than read off the last real frame: `takeSnapshot()` only ever carries the
+   * registers that frame actually wrote, and discards its own override scratch the moment it
+   * returns, so there is nothing per-frame left lying around for a pull to reuse.
+   */
+  emittedValues(): { readonly written: Uint8Array; readonly sent: Uint8Array };
+}
+
+/** Builds a fresh `RegisterFrame`, its coefficients and mutes all at home. */
+export function createRegisterFrame(): RegisterFrame {
+  return new RegisterFrameImpl();
+}
+
+class RegisterFrameImpl implements RegisterFrame {
   private readonly values = new Uint8Array(SID_REGISTER_COUNT);
   private readonly writtenThisFrame = new Uint8Array(SID_REGISTER_COUNT);
   /** The retrigger write to a voice control register, held apart from the shadow so both bytes of a
@@ -245,12 +383,6 @@ export class RegisterFrame implements SidWriteSink {
     offsetsUs: new Int32Array(MAX_FRAME_WRITES),
   };
 
-  /** Voice 0/1/2. Muting forces that voice's control register to 0 once, then drops every further
-   * write the tune's code makes to it until unmuted — every other register for that voice keeps
-   * updating live throughout — the hardware-mute technique the TeensyROM firmware uses.
-   *
-   * The zeroing is not a write the tune made, so it lands with the forced registers rather than in
-   * write order. */
   setVoiceMuted(voice: number, muted: boolean): void {
     if (voice < 0 || voice >= VOICE_CONTROL_REGISTERS.length) return;
     if (muted === this.mutedVoices.has(voice)) return;
@@ -264,21 +396,6 @@ export class RegisterFrame implements SidWriteSink {
     }
   }
 
-  /**
-   * Multiplies a register group by `coefficient`, full resolution, applied in `takeSnapshot()` and
-   * never at the write — scaling on the way out rather than in `onSidWrite` is what keeps
-   * `snapshotValues()`/`restoreValues()` raw (so a cue re-entered at a different knob position never
-   * double-applies a coefficient), keeps quantization to a single rounding per field, and keeps this
-   * stage out of `suppressedWrites` entirely, since none of these registers routes through a scaling
-   * branch in the write path.
-   *
-   * A coefficient of exactly 1 is home, not a multiplication by one: the group's raw bytes pass
-   * through untouched. `pulseWidth` holds one coefficient shared by all three voices, so scaling it
-   * preserves the tune's internal balance between them.
-   *
-   * A no-op call (the coefficient already held) leaves the one-shot restore untouched, so repeatedly
-   * setting the same value can never manufacture a spurious extra write.
-   */
   setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void {
     if (coefficient === this.coefficients[group]) return;
     if (this.coefficients[group] !== 1 && coefficient === 1) {
@@ -287,21 +404,6 @@ export class RegisterFrame implements SidWriteSink {
     this.coefficients[group] = coefficient;
   }
 
-  /**
-   * The pitch correction for a tune written for a machine clocked at `sourceHz` and played on one
-   * clocked at `targetHz` — the frequency registers alone, since the filter is analog, duty cycle is
-   * a fraction of the accumulator period and an envelope rate is a lookup index.
-   *
-   * The machine clock, not the chip model — 6581 versus 8580 is a separate value the sink forwards
-   * in its own packet.
-   *
-   * Tempo is not in this equation. The oscillator is a free-running phase accumulator inside the
-   * chip, so how often the play routine runs moves the tune's sequencer and nothing else; that half
-   * belongs to the play rate.
-   *
-   * A pair that is not two usable clock frequencies is ignored rather than allowed to become a
-   * coefficient.
-   */
   setTargetClock(sourceHz: number, targetHz: number): void {
     const ratio = clockRatio(sourceHz, targetHz);
     if (ratio === null || ratio === this.clockRatio) return;
@@ -311,14 +413,6 @@ export class RegisterFrame implements SidWriteSink {
     this.clockRatio = ratio;
   }
 
-  /**
-   * Voice 0/1/2's own pitch coefficient, which multiplies the clock correction rather than replacing
-   * it: the two compose, and neither can move the other. Ganging voices together is the
-   * application's decision — this accepts three independent values.
-   *
-   * A non-finite coefficient is ignored: it would scale every frequency to silence while never
-   * comparing equal to itself, so nothing could ever set it back.
-   */
   setVoicePitch(voice: number, coefficient: number): void {
     if (voice < 0 || voice >= VOICE_COUNT) return;
     if (!Number.isFinite(coefficient) || coefficient === this.voicePitch[voice]) return;
@@ -339,12 +433,6 @@ export class RegisterFrame implements SidWriteSink {
     }
   }
 
-  /**
-   * Replaces `$D418`'s filter-mode bits in every emitted volume byte until deselected. This is an
-   * override rather than a scale — the tune's own mode bits are discarded while one is held, and
-   * `null` hands them back. Selecting forces the volume register out the same way an off-home
-   * coefficient does; deselecting arms the same one-shot restore.
-   */
   setFilterMode(mode: SidFilterMode | null): void {
     if (mode === this.forcedFilterMode) return;
     if (this.forcedFilterMode !== null && mode === null) {
@@ -353,8 +441,6 @@ export class RegisterFrame implements SidWriteSink {
     this.forcedFilterMode = mode;
   }
 
-  /** 0…1, full resolution — the deck-gain entry point onto `$D418`'s low nibble, and one group of
-   *  the same scaling stage as every other control. */
   setOutputGain(gain: number): void {
     this.setRegisterScale('volume', gain);
   }
@@ -392,41 +478,14 @@ export class RegisterFrame implements SidWriteSink {
     this.writeCount++;
   }
 
-  /**
-   * Forces every one of the 25 registers into the next frame at its current value (0 if never
-   * written) — called once after init so the chip starts a session from a known state instead of
-   * carrying over silence.
-   *
-   * A resync frame is not a fixed layout: the tune's own writes still come first and the forced ones
-   * fill in around them, so a caller reaching for a particular register must find it by register
-   * number rather than by position.
-   */
   markAllDirty(): void {
     this.forcedRegisters.fill(1);
   }
 
-  /**
-   * Second writes folded into a register's existing entry instead of becoming a retrigger, counted
-   * across this object's lifetime rather than per frame — the data point for how often it matters
-   * in practice.
-   */
   get suppressedWriteCount(): number {
     return this.suppressedWrites;
   }
 
-  /**
-   * Fills the reused `SidFrame` with this frame's writes and clears the per-frame state — including
-   * the second-write tracking — so the next frame starts empty.
-   *
-   * The order is: what the tune wrote, as it wrote it; then whatever a resync, an off-home
-   * coefficient or a mute forces out, ascending by register and only for registers the tune left
-   * alone. An override replaces the byte of the write it applies to and never adds one.
-   *
-   * Forcing a group out is a standing condition re-checked live on every call, so a frame a caller
-   * discards can never swallow a knob move on a tune that does not keep rewriting those registers
-   * itself. Scaled bytes are computed once per frame, before the fill, because a two-register group
-   * read per write would combine and round twice.
-   */
   takeSnapshot(): SidFrame {
     this.forceScaledGroups();
     this.buildScaledOverrides();
@@ -646,22 +705,10 @@ export class RegisterFrame implements SidWriteSink {
     }
   }
 
-  /**
-   * Copies the accumulated register values, leaving this frame untouched.
-   *
-   * Per-frame state is excluded on purpose — a cue records where the chip stood, not which registers
-   * happened to be mid-flight when it was captured.
-   */
   snapshotValues(): RegisterValuesSnapshot {
     return { values: this.values.slice() };
   }
 
-  /**
-   * Replaces the accumulated register values wholesale and drops any half-built frame.
-   *
-   * Mute is not part of the snapshot: whichever voices are muted *now* stay muted, so returning to a
-   * cue captured before a mute does not un-mute it on the way back in.
-   */
   restoreValues(snapshot: RegisterValuesSnapshot): void {
     this.values.set(snapshot.values);
     this.writtenThisFrame.fill(0);
@@ -672,13 +719,6 @@ export class RegisterFrame implements SidWriteSink {
     }
   }
 
-  /**
-   * Voice `voice`'s gate, waveform, frequency and envelope, decoded from the shadow on every call —
-   * the same decode teensyrom-web's `frame-features.ts` runs offline against a recorded scan, run
-   * here against the live register values instead so a visualiser can read it every animation frame
-   * without waiting on a capture. Raw, like the shadow itself: a pitch correction or a knob scale
-   * shows up in `emittedValues()`, not here.
-   */
   voiceState(voice: number): VoiceRegisterState {
     const base = voice * REGISTERS_PER_VOICE;
     const control = this.values[VOICE_CONTROL_REGISTERS[voice]];
@@ -694,13 +734,6 @@ export class RegisterFrame implements SidWriteSink {
     };
   }
 
-  /**
-   * The 25 registers as the tune wrote them (`written`) and as scaling would emit them if a frame
-   * went out this instant (`sent`) — computed fresh from the shadow and the live coefficients on
-   * every call rather than read off the last real frame: `takeSnapshot()` only ever carries the
-   * registers that frame actually wrote, and discards its own override scratch the moment it
-   * returns, so there is nothing per-frame left lying around for a pull to reuse.
-   */
   emittedValues(): { readonly written: Uint8Array; readonly sent: Uint8Array } {
     const written = this.values.slice();
     const sent = written.slice();

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { RegisterFrame } from '../registers/register-frame.js';
-import { C64Machine } from '../cpu/c64-machine.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
 import { VOICE_CONTROL_REGISTERS } from '../registers/sid-constants.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames } from '../units.js';
@@ -111,8 +111,8 @@ function unplayableTune(): SidFile {
  * frame by frame with each snapshot discarded. What `replayToFrame` has to reproduce exactly.
  */
 function runLive(file: SidFile, subtune: number, frameCount: number) {
-  const frame = new RegisterFrame();
-  const machine = new C64Machine(file, frame);
+  const frame = createRegisterFrame();
+  const machine = createC64Machine(file, frame);
   machine.initSubtune(subtune);
   for (let i = 0; i < frameCount; i++) {
     machine.runFrame();

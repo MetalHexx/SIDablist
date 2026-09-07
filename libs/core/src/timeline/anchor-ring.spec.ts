@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { C64Machine } from '../cpu/c64-machine.js';
-import { RegisterFrame } from '../registers/register-frame.js';
+import { createC64Machine } from '../cpu/c64-machine.js';
+import type { C64Machine } from '../cpu/c64-machine.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
+import type { RegisterFrame } from '../registers/register-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames, type Frames } from '../units.js';
 import { createAnchorRing, type AnchorRing } from './anchor-ring.js';
@@ -39,8 +41,8 @@ describe('createAnchorRing', () => {
   let ring: AnchorRing;
 
   beforeEach(() => {
-    registers = new RegisterFrame();
-    machine = new C64Machine(idleTune(), registers);
+    registers = createRegisterFrame();
+    machine = createC64Machine(idleTune(), registers);
     machine.initSubtune(1);
     range = frames(50); // an anchor every 25 frames
     ring = createAnchorRing(() => range);

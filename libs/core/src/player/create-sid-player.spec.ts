@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { C64Machine } from '../cpu/c64-machine.js';
 import {
   NTSC_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_FRAME,
@@ -22,6 +21,37 @@ import { frames, microseconds, milliseconds } from '../units.js';
 import type { Microseconds, Milliseconds } from '../units.js';
 import { createSidPlayer } from './create-sid-player.js';
 import type { SidPlayer } from './sid-player.js';
+
+/**
+ * Counts every `runFrame()` call across every `C64Machine` this test file's code creates — the live
+ * ticking machine and any throwaway one a replay builds alike — the same cross-instance visibility
+ * `C64Machine.prototype` spying gave before the class became a factory-built, unexported internal.
+ * Reset with `runFrameSpy.mockClear()` at the point a test wants to start counting from.
+ */
+const { runFrameSpy } = vi.hoisted(() => ({ runFrameSpy: vi.fn() }));
+
+vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cpu/c64-machine.js')>();
+  return {
+    ...actual,
+    createC64Machine: (
+      ...args: Parameters<typeof actual.createC64Machine>
+    ): ReturnType<typeof actual.createC64Machine> => {
+      const machine = actual.createC64Machine(...args);
+      return new Proxy(machine, {
+        get(target, prop) {
+          if (prop === 'runFrame') {
+            return () => {
+              runFrameSpy();
+              return target.runFrame();
+            };
+          }
+          return Reflect.get(target, prop, target);
+        },
+      });
+    },
+  };
+});
 
 /** Answers every request against the real `replayToFrame`, immediately — the landing is what these
  *  tests are about, not the thread it crosses. */
@@ -435,7 +465,7 @@ describe('createSidPlayer', () => {
 
       run(clock, 9); // up to, but not touching, the loop's end
 
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       run(clock, 1); // crosses the loop's end and re-enters its start on this same tick
 
       // One call for the tick's own frame and nothing more — a seek along the anchor path would have
@@ -457,7 +487,7 @@ describe('createSidPlayer', () => {
       // cache any other way.
       player.capturePosition();
 
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
       await player.seek(frames(deepStart));
 
@@ -481,7 +511,7 @@ describe('createSidPlayer', () => {
       run(clock, 10); // first wrap: 500 -> 510 -> back to 500
       run(clock, 1); // the gate-off tick the first wrap owed the stream
 
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       run(clock, 10); // second wrap in full: every one of these ticks is a real one
 
       expect(runFrameSpy).toHaveBeenCalledTimes(10);
@@ -510,7 +540,7 @@ describe('createSidPlayer', () => {
       player.setActiveLoop(null);
       run(clock, 1); // the gate-off tick the earlier wrap owed the stream
 
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       run(clock, 50); // back around to the track loop's own end again
 
       expect(runFrameSpy).toHaveBeenCalledTimes(50);
@@ -528,7 +558,7 @@ describe('createSidPlayer', () => {
       await flushEntryImageCapture();
       run(clock, 3); // a few frames into the lap, so the jump back is a real move
 
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       await player.seek(frames(deepStart));
 
       // A trigger, a start audition and a queued hand-off all resolve to exactly this jump. Nothing
@@ -558,7 +588,7 @@ describe('createSidPlayer', () => {
 
       // Arming a loop and jumping to its own start is what a lap-boundary hand-off does; the loop
       // handed back to here is the one whose image a single-image cache would have thrown away.
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       player.setActiveLoop(first);
       await player.seek(first.startFrame);
 
@@ -578,7 +608,7 @@ describe('createSidPlayer', () => {
 
       // A scrub landing anywhere but that one frame — applying the image here would put the playhead
       // ten frames from where it was asked for.
-      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      runFrameSpy.mockClear();
       await player.seek(frames(deepStart + 10));
 
       expect(runFrameSpy).toHaveBeenCalled();

@@ -1,8 +1,9 @@
 export { parseSidFile } from './sid/sid-file.parser.js';
 export { type SidClock, type SidFile, type SidModel, SidParseError } from './sid/sid-file.model.js';
 export {
-  C64Machine,
+  createC64Machine,
   UnplayableTuneError,
+  type C64Machine,
   type FrameResult,
   type MachineSnapshot,
   type SidWriteSink,
@@ -19,7 +20,8 @@ export {
 } from './units.js';
 export { type SidFrame } from './registers/sid-frame.js';
 export {
-  RegisterFrame,
+  createRegisterFrame,
+  type RegisterFrame,
   type RegisterValuesSnapshot,
   type ScaledRegisterGroup,
   type SidFilterMode,

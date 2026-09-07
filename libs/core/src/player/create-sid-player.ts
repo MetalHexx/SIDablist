@@ -11,8 +11,12 @@ import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
 import type { SidSink } from '../ports/sink.js';
 import { clockRatio } from '../registers/clock-ratio.js';
-import { RegisterFrame } from '../registers/register-frame.js';
-import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
+import { createRegisterFrame } from '../registers/register-frame.js';
+import type {
+  RegisterFrame,
+  ScaledRegisterGroup,
+  SidFilterMode,
+} from '../registers/register-frame.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import {
   NTSC_FRAME_INTERVAL_US,
@@ -113,7 +117,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /** The scratch frame every gate-off is built on. Never the live frame: that one mirrors the
    *  emulated chip and is what a resume restores from. */
-  private readonly gateOff = new RegisterFrame();
+  private readonly gateOff = createRegisterFrame();
 
   private transport: PlayerSnapshot['transport'] = 'stopped';
   private error: string | null = null;
