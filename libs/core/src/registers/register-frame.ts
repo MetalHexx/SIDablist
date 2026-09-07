@@ -15,12 +15,14 @@ import {
   SID_FILTER_RESONANCE_REGISTER,
   SID_REGISTER_COUNT,
   SID_VOLUME_REGISTER,
+  VOICE_ATTACK_DECAY_OFFSET,
   VOICE_CONTROL_REGISTERS,
   VOICE_COUNT,
   VOICE_FREQUENCY_HIGH_OFFSET,
   VOICE_FREQUENCY_LOW_OFFSET,
   VOICE_PULSE_WIDTH_HIGH_OFFSET,
   VOICE_PULSE_WIDTH_LOW_OFFSET,
+  VOICE_SUSTAIN_RELEASE_OFFSET,
 } from './sid-constants.js';
 
 /**
@@ -32,6 +34,15 @@ import {
  */
 export interface RegisterValuesSnapshot {
   readonly values: Uint8Array;
+}
+
+/** A voice's own registers, decoded — raw, not scaled: what the tune itself put there, the same
+ *  bytes `emittedValues().written` carries for these registers. */
+export interface VoiceRegisterState {
+  readonly gate: boolean;
+  readonly waveform: number;
+  readonly frequency: number;
+  readonly envelope: number;
 }
 
 /**
@@ -113,6 +124,55 @@ interface MutableSidFrame extends Omit<SidFrame, 'count'> {
  */
 function scaleField(value: number, coefficient: number, ceiling: number): number {
   return clamp(Math.round(value * coefficient), 0, ceiling);
+}
+
+/**
+ * `$D418`'s composed byte: gain owns the low nibble, a forced filter mode owns bits 4-6, and bit 7
+ * (voice-3 mute) belongs to neither and always passes through raw. Pure and shared by the per-frame
+ * override path and `emittedValues()`'s read-only one, so a stats read can never drift from what a
+ * real frame would actually emit.
+ */
+function scaledVolumeByte(
+  raw: number,
+  gain: number,
+  forcedFilterMode: SidFilterMode | null,
+): number {
+  const volume = gain === 1 ? raw & 0x0f : scaleField(raw & 0x0f, gain, NIBBLE_CEILING);
+  const mode =
+    forcedFilterMode === null
+      ? (raw >> SID_FILTER_MODE_SHIFT) & SID_FILTER_MODE_MASK
+      : FILTER_MODE_BITS[forcedFilterMode];
+  return (raw & 0x80) | (mode << SID_FILTER_MODE_SHIFT) | volume;
+}
+
+/** 11 bits across the cutoff register pair, packed as low byte | (high byte << 8) so a caller can
+ *  split the pair back out without this allocating one. */
+function scaledCutoffPacked(rawLow: number, rawHigh: number, coefficient: number): number {
+  const scaled = scaleField((rawHigh << 3) | (rawLow & 0x07), coefficient, CUTOFF_CEILING);
+  const low = (rawLow & 0xf8) | (scaled & 0x07);
+  const high = (scaled >> 3) & 0xff;
+  return low | (high << 8);
+}
+
+/** Register 23's high nibble only — the low nibble routes voices through the filter and is the
+ *  tune's alone. */
+function scaledResonanceByte(raw: number, coefficient: number): number {
+  const scaled = scaleField((raw >> 4) & 0x0f, coefficient, NIBBLE_CEILING);
+  return (raw & 0x0f) | (scaled << 4);
+}
+
+/** 12 bits across a voice's pulse-width pair, packed the same way `scaledCutoffPacked` is. */
+function scaledPulseWidthPacked(rawLow: number, rawHigh: number, coefficient: number): number {
+  const scaled = scaleField(((rawHigh & 0x0f) << 8) | rawLow, coefficient, PULSE_WIDTH_CEILING);
+  const low = scaled & 0xff;
+  const high = (rawHigh & 0xf0) | ((scaled >> 8) & 0x0f);
+  return low | (high << 8);
+}
+
+/** A full 16 bits across a voice's frequency pair, packed the same way. */
+function scaledFrequencyPacked(rawLow: number, rawHigh: number, coefficient: number): number {
+  const scaled = scaleField((rawHigh << 8) | rawLow, coefficient, FREQUENCY_CEILING);
+  return (scaled & 0xff) | (((scaled >> 8) & 0xff) << 8);
 }
 
 /**
@@ -453,67 +513,64 @@ export class RegisterFrame implements SidWriteSink {
     }
   }
 
-  /** `$D418` composes two controls at once: gain owns the low nibble, the forced filter mode owns
-   *  bits 4-6, and bit 7 (voice-3 mute) belongs to neither and always passes through raw. */
+  /** Off-home guard around `scaledVolumeByte` — see that function for the byte layout. */
   private composeVolumeByte(): void {
     const gain = this.coefficients.volume;
     if (gain === 1 && this.forcedFilterMode === null) return;
 
-    const raw = this.values[SID_VOLUME_REGISTER];
-    const volume = gain === 1 ? raw & 0x0f : scaleField(raw & 0x0f, gain, NIBBLE_CEILING);
-    const mode =
-      this.forcedFilterMode === null
-        ? (raw >> SID_FILTER_MODE_SHIFT) & SID_FILTER_MODE_MASK
-        : FILTER_MODE_BITS[this.forcedFilterMode];
-
-    this.setOverride(SID_VOLUME_REGISTER, (raw & 0x80) | (mode << SID_FILTER_MODE_SHIFT) | volume);
+    this.setOverride(
+      SID_VOLUME_REGISTER,
+      scaledVolumeByte(this.values[SID_VOLUME_REGISTER], gain, this.forcedFilterMode),
+    );
   }
 
-  /** 11 bits across registers 21 and 22, register 21's upper five bits belonging to nothing here. */
+  /** Off-home guard around `scaledCutoffPacked` — see that function for the bit layout. */
   private scaleCutoff(coefficient: number): void {
     if (coefficient === 1) return;
 
-    const rawLow = this.values[SID_FILTER_CUTOFF_LOW_REGISTER];
-    const rawHigh = this.values[SID_FILTER_CUTOFF_HIGH_REGISTER];
-    const scaled = scaleField((rawHigh << 3) | (rawLow & 0x07), coefficient, CUTOFF_CEILING);
-
-    this.setOverride(SID_FILTER_CUTOFF_LOW_REGISTER, (rawLow & 0xf8) | (scaled & 0x07));
-    this.setOverride(SID_FILTER_CUTOFF_HIGH_REGISTER, (scaled >> 3) & 0xff);
+    const packed = scaledCutoffPacked(
+      this.values[SID_FILTER_CUTOFF_LOW_REGISTER],
+      this.values[SID_FILTER_CUTOFF_HIGH_REGISTER],
+      coefficient,
+    );
+    this.setOverride(SID_FILTER_CUTOFF_LOW_REGISTER, packed & 0xff);
+    this.setOverride(SID_FILTER_CUTOFF_HIGH_REGISTER, (packed >> 8) & 0xff);
   }
 
-  /** Register 23's high nibble only — the low nibble routes voices through the filter and is the
-   *  tune's alone. */
+  /** Off-home guard around `scaledResonanceByte` — see that function for the bit layout. */
   private scaleResonance(coefficient: number): void {
     if (coefficient === 1) return;
 
-    const raw = this.values[SID_FILTER_RESONANCE_REGISTER];
-    const scaled = scaleField((raw >> 4) & 0x0f, coefficient, NIBBLE_CEILING);
-
-    this.setOverride(SID_FILTER_RESONANCE_REGISTER, (raw & 0x0f) | (scaled << 4));
+    this.setOverride(
+      SID_FILTER_RESONANCE_REGISTER,
+      scaledResonanceByte(this.values[SID_FILTER_RESONANCE_REGISTER], coefficient),
+    );
   }
 
-  /** 12 bits across the voice's register pair, the high register's upper nibble unused. */
+  /** Off-home guard around `scaledPulseWidthPacked` — see that function for the bit layout. */
   private scaleVoicePulseWidth(voice: number, coefficient: number): void {
     if (coefficient === 1) return;
 
     const base = voice * REGISTERS_PER_VOICE;
     const lowRegister = base + VOICE_PULSE_WIDTH_LOW_OFFSET;
     const highRegister = base + VOICE_PULSE_WIDTH_HIGH_OFFSET;
-    const rawLow = this.values[lowRegister];
-    const rawHigh = this.values[highRegister];
-    const scaled = scaleField(((rawHigh & 0x0f) << 8) | rawLow, coefficient, PULSE_WIDTH_CEILING);
-
-    this.setOverride(lowRegister, scaled & 0xff);
-    this.setOverride(highRegister, (rawHigh & 0xf0) | ((scaled >> 8) & 0x0f));
+    const packed = scaledPulseWidthPacked(
+      this.values[lowRegister],
+      this.values[highRegister],
+      coefficient,
+    );
+    this.setOverride(lowRegister, packed & 0xff);
+    this.setOverride(highRegister, (packed >> 8) & 0xff);
   }
 
   /**
-   * A full 16 bits across the voice's register pair — no shared fields to preserve.
+   * Off-home guard around `scaledFrequencyPacked` — see that function for the bit layout.
    *
    * The whole value is recombined from both shadow bytes and rounded once, which is what makes
-   * scaling change the *high* byte of a value the tune only wrote the low byte of. The forcing above
-   * is the other half of that: while a voice is off home both its registers go out every frame, so
-   * the moved high byte reaches the chip rather than being left behind at the tune's own.
+   * scaling change the *high* byte of a value the tune only wrote the low byte of. The forcing in
+   * `forceScaledGroups` is the other half of that: while a voice is off home both its registers go
+   * out every frame, so the moved high byte reaches the chip rather than being left behind at the
+   * tune's own.
    */
   private scaleVoiceFrequency(voice: number, coefficient: number): void {
     if (coefficient === 1) return;
@@ -521,19 +578,72 @@ export class RegisterFrame implements SidWriteSink {
     const base = voice * REGISTERS_PER_VOICE;
     const lowRegister = base + VOICE_FREQUENCY_LOW_OFFSET;
     const highRegister = base + VOICE_FREQUENCY_HIGH_OFFSET;
-    const scaled = scaleField(
-      (this.values[highRegister] << 8) | this.values[lowRegister],
+    const packed = scaledFrequencyPacked(
+      this.values[lowRegister],
+      this.values[highRegister],
       coefficient,
-      FREQUENCY_CEILING,
     );
-
-    this.setOverride(lowRegister, scaled & 0xff);
-    this.setOverride(highRegister, (scaled >> 8) & 0xff);
+    this.setOverride(lowRegister, packed & 0xff);
+    this.setOverride(highRegister, (packed >> 8) & 0xff);
   }
 
   private setOverride(register: number, value: number): void {
     this.overrideValues[register] = value;
     this.overrideApplies[register] = 1;
+  }
+
+  /**
+   * `target`'s registers wherever scaling is off home this instant — everywhere else `target` is
+   * left as its caller filled it, since a group at home writes none of its bytes. Mirrors
+   * `forceScaledGroups`/`buildScaledOverrides`'s condition set exactly, but computes into a
+   * caller-owned array instead of the per-frame override scratch, so a read can never arm or
+   * consume the one-shot restore flags early or perturb what the next real frame emits.
+   */
+  private applyScaling(target: Uint8Array): void {
+    if (this.coefficients.volume !== 1 || this.forcedFilterMode !== null) {
+      target[SID_VOLUME_REGISTER] = scaledVolumeByte(
+        this.values[SID_VOLUME_REGISTER],
+        this.coefficients.volume,
+        this.forcedFilterMode,
+      );
+    }
+    if (this.coefficients.cutoff !== 1) {
+      const packed = scaledCutoffPacked(
+        this.values[SID_FILTER_CUTOFF_LOW_REGISTER],
+        this.values[SID_FILTER_CUTOFF_HIGH_REGISTER],
+        this.coefficients.cutoff,
+      );
+      target[SID_FILTER_CUTOFF_LOW_REGISTER] = packed & 0xff;
+      target[SID_FILTER_CUTOFF_HIGH_REGISTER] = (packed >> 8) & 0xff;
+    }
+    if (this.coefficients.resonance !== 1) {
+      target[SID_FILTER_RESONANCE_REGISTER] = scaledResonanceByte(
+        this.values[SID_FILTER_RESONANCE_REGISTER],
+        this.coefficients.resonance,
+      );
+    }
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      const base = voice * REGISTERS_PER_VOICE;
+      if (this.coefficients.pulseWidth !== 1) {
+        const packed = scaledPulseWidthPacked(
+          this.values[base + VOICE_PULSE_WIDTH_LOW_OFFSET],
+          this.values[base + VOICE_PULSE_WIDTH_HIGH_OFFSET],
+          this.coefficients.pulseWidth,
+        );
+        target[base + VOICE_PULSE_WIDTH_LOW_OFFSET] = packed & 0xff;
+        target[base + VOICE_PULSE_WIDTH_HIGH_OFFSET] = (packed >> 8) & 0xff;
+      }
+      const frequencyCoefficient = this.frequencyCoefficient(voice);
+      if (frequencyCoefficient !== 1) {
+        const packed = scaledFrequencyPacked(
+          this.values[base + VOICE_FREQUENCY_LOW_OFFSET],
+          this.values[base + VOICE_FREQUENCY_HIGH_OFFSET],
+          frequencyCoefficient,
+        );
+        target[base + VOICE_FREQUENCY_LOW_OFFSET] = packed & 0xff;
+        target[base + VOICE_FREQUENCY_HIGH_OFFSET] = (packed >> 8) & 0xff;
+      }
+    }
   }
 
   /**
@@ -560,5 +670,41 @@ export class RegisterFrame implements SidWriteSink {
     for (const voice of this.mutedVoices) {
       this.values[VOICE_CONTROL_REGISTERS[voice]] = 0;
     }
+  }
+
+  /**
+   * Voice `voice`'s gate, waveform, frequency and envelope, decoded from the shadow on every call —
+   * the same decode teensyrom-web's `frame-features.ts` runs offline against a recorded scan, run
+   * here against the live register values instead so a visualiser can read it every animation frame
+   * without waiting on a capture. Raw, like the shadow itself: a pitch correction or a knob scale
+   * shows up in `emittedValues()`, not here.
+   */
+  voiceState(voice: number): VoiceRegisterState {
+    const base = voice * REGISTERS_PER_VOICE;
+    const control = this.values[VOICE_CONTROL_REGISTERS[voice]];
+    return {
+      gate: (control & 0x01) !== 0,
+      waveform: (control >> 4) & 0x0f,
+      frequency:
+        (this.values[base + VOICE_FREQUENCY_HIGH_OFFSET] << 8) |
+        this.values[base + VOICE_FREQUENCY_LOW_OFFSET],
+      envelope:
+        (this.values[base + VOICE_ATTACK_DECAY_OFFSET] << 8) |
+        this.values[base + VOICE_SUSTAIN_RELEASE_OFFSET],
+    };
+  }
+
+  /**
+   * The 25 registers as the tune wrote them (`written`) and as scaling would emit them if a frame
+   * went out this instant (`sent`) — computed fresh from the shadow and the live coefficients on
+   * every call rather than read off the last real frame: `takeSnapshot()` only ever carries the
+   * registers that frame actually wrote, and discards its own override scratch the moment it
+   * returns, so there is nothing per-frame left lying around for a pull to reuse.
+   */
+  emittedValues(): { readonly written: Uint8Array; readonly sent: Uint8Array } {
+    const written = this.values.slice();
+    const sent = written.slice();
+    this.applyScaling(sent);
+    return { written, sent };
   }
 }

@@ -1,4 +1,4 @@
-import type { Frames, Microseconds, Milliseconds } from '../units.js';
+import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { FrameClockStats } from '../ports/clock.js';
 import type { FarEndConsumption, SinkCapabilities } from '../ports/sink.js';
@@ -45,9 +45,10 @@ export interface PlayerSnapshot {
  * split as `getPosition()`, and for the same reason: they move every frame, and forcing that
  * through change detection would wake every consumer to tell it something it can already ask for.
  *
- * This is the base shape; P07-T02 adds further groups additively and must not repurpose any of the
- * ones already here. Packets and bytes sent, cancel support and last-cancel latency are the sink's
- * own counters, not this one — a consumer that wants them asks the sink it constructed.
+ * Grouped by name rather than flattened, so a field a later change adds lands inside its own group
+ * instead of shifting every one already here — never repurpose an existing field for a new meaning.
+ * Packets and bytes sent, cancel support and last-cancel latency are the sink's own counters, not
+ * this one — a consumer that wants them asks the sink it constructed.
  */
 export interface PlayerStats {
   readonly framesRendered: Frames;
@@ -71,4 +72,25 @@ export interface PlayerStats {
   };
   readonly suppressedWrites: number;
   readonly illegalOpcodeCount: number;
+  /** How much of the frame's cycle budget the play routine actually spent, and the unused fraction
+   *  of it, 0..1 — see `C64Machine.frameCycleBudget`. */
+  readonly cpu: { readonly cyclesUsed: Cycles; readonly headroom: number };
+  /** Voice 0/1/2's gate, waveform, frequency and envelope, decoded from the register shadow on read
+   *  — see `RegisterFrame.voiceState`. */
+  readonly voices: readonly {
+    readonly gate: boolean;
+    readonly waveform: number;
+    readonly frequency: number;
+    readonly envelope: number;
+  }[];
+  /** Every register as the tune wrote it versus as scaling would emit it this instant — see
+   *  `RegisterFrame.emittedValues`. */
+  readonly emitted: { readonly written: Uint8Array; readonly sent: Uint8Array };
+  /** Whether a resync's gate-off step is still owed to the stream — 1 while `queueResync` is
+   *  waiting for the next tick to release it, 0 once it has gone out. */
+  readonly resync: { readonly inFlightDepth: number };
+  /** The tune's multispeed exactly as its CIA timer latch describes it, alongside the integer form
+   *  already published in `tempo.callsPerFrame` — see `C64Machine.exactCallsPerFrame`'s own doc for
+   *  the rounding discrepancy this makes visible. */
+  readonly rate: { readonly exactCallsPerFrame: number; readonly roundedCallsPerFrame: number };
 }

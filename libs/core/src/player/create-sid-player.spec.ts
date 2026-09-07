@@ -1,8 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import {
+  NTSC_CYCLES_PER_FRAME,
+  PAL_CYCLES_PER_FRAME,
+  PLAY_BUDGET_FRAMES,
+} from '../cpu/cpu-constants.js';
 import type { FrameClock, FrameClockStats } from '../ports/clock.js';
 import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
 import type { SidFrame } from '../registers/sid-frame.js';
-import { PAL_FRAME_INTERVAL_US, VOICE_CONTROL_REGISTERS } from '../registers/sid-constants.js';
+import {
+  PAL_FRAME_INTERVAL_US,
+  SID_REGISTER_COUNT,
+  VOICE_CONTROL_REGISTERS,
+} from '../registers/sid-constants.js';
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import { replayToFrame } from '../replay/replay-to-frame.js';
 import type { SidClock, SidFile, SidModel } from '../sid/sid-file.model.js';
@@ -160,12 +169,38 @@ function silentTune(songs = 1, model: SidModel = 'unknown'): SidFile {
 }
 
 /** init increments a zero-page counter and stores it into $D400 every play call, so the frame a
- *  replay landed on can be read back off the delivered frame. */
-function counterTune(): SidFile {
+ *  replay landed on can be read back off the delivered frame. Its play routine costs the same
+ *  handful of cycles whichever clock it is told to run under — only the budget it is measured
+ *  against moves with `clock`. */
+function counterTune(clock: SidClock = 'pal'): SidFile {
   return tune({
+    clock,
     blocks: [
       { at: 0x1000, bytes: [RTS] },
       { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+    ],
+  });
+}
+
+/** play writes `value` to $D418 (volume/filter-mode) every call, so a gain or a forced filter mode
+ *  scaling it is readable off `getStats().emitted`. */
+function volumeTune(value: number): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [0xa9, value, 0x8d, 0x18, 0xd4, RTS] }, // LDA #value; STA $D418; RTS
+    ],
+  });
+}
+
+/** init programs CIA 1 timer A to a latch of $1FFD, so 19656 / 8190 = 2.4 calls per frame — a rate
+ *  that does not divide the frame evenly, which is exactly the case `exactCallsPerFrame` exists to
+ *  report correctly and `callsPerFrame` rounds away. */
+function fractionalSpeedTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
     ],
   });
 }
@@ -877,6 +912,126 @@ describe('createSidPlayer', () => {
       player.pause();
 
       expect(player.getStats().delivery.scheduledFrames).toBe(2);
+    });
+  });
+
+  describe('cpu headroom', () => {
+    it("computes headroom against the tune's own PAL or NTSC cycle budget", async () => {
+      const pal = harness();
+      pal.player.loadTune(counterTune('pal'));
+      await pal.player.play();
+      run(pal.clock, 1);
+      const palStats = pal.player.getStats();
+      const palBudget = PAL_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES;
+
+      const ntsc = harness();
+      ntsc.player.loadTune(counterTune('ntsc'));
+      await ntsc.player.play();
+      run(ntsc.clock, 1);
+      const ntscStats = ntsc.player.getStats();
+      const ntscBudget = NTSC_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES;
+
+      // The same play routine costs the same cycles under either clock — only the budget the
+      // headroom figure divides it against should differ.
+      expect(palStats.cpu.cyclesUsed).toBe(ntscStats.cpu.cyclesUsed);
+      expect(palStats.cpu.headroom).toBeCloseTo(1 - palStats.cpu.cyclesUsed / palBudget, 10);
+      expect(ntscStats.cpu.headroom).toBeCloseTo(1 - ntscStats.cpu.cyclesUsed / ntscBudget, 10);
+      expect(palStats.cpu.headroom).not.toBe(ntscStats.cpu.headroom);
+    });
+
+    it('reports full headroom and no cycles spent before any frame has run', () => {
+      const { player } = harness();
+
+      expect(player.getStats().cpu).toEqual({ cyclesUsed: 0, headroom: 1 });
+    });
+
+    it('reports zero headroom when the play routine burns its whole cycle budget', async () => {
+      const { player, clock } = harness();
+      player.loadTune(runawayTune());
+      await player.play();
+
+      run(clock, 1);
+
+      expect(player.getStats().cpu.headroom).toBe(0);
+    });
+  });
+
+  describe('voice register stats', () => {
+    it('decodes gate and waveform off the live register shadow', async () => {
+      const { player, clock } = harness();
+      player.loadTune(gateTune()); // writes 0x41 to $D404 every play call — waveform 4, gate on
+      await player.play();
+      run(clock, 1);
+
+      const { voices } = player.getStats();
+      expect(voices[0]).toEqual({ gate: true, waveform: 0x4, frequency: 0, envelope: 0 });
+      expect(voices[1]).toEqual({ gate: false, waveform: 0, frequency: 0, envelope: 0 });
+      expect(voices[2]).toEqual({ gate: false, waveform: 0, frequency: 0, envelope: 0 });
+    });
+
+    it('reports three silent voices before any tune has loaded', () => {
+      const { player } = harness();
+
+      expect(player.getStats().voices).toEqual([
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+      ]);
+    });
+  });
+
+  describe('emitted register bytes', () => {
+    it("reports the tune's raw volume byte as written and the gain-scaled one as sent", async () => {
+      const { player, clock } = harness();
+      player.loadTune(volumeTune(0x2f));
+      player.setOutputGain(0.5);
+      await player.play();
+      run(clock, 1);
+
+      const { emitted } = player.getStats();
+      expect(emitted.written[24]).toBe(0x2f);
+      expect(emitted.sent[24]).toBe(0x20 | Math.round(0x0f * 0.5));
+      expect(emitted.sent[0]).toBe(emitted.written[0]); // untouched by gain — unchanged
+    });
+
+    it('matches written and sent, 25 registers wide, before any tune has loaded', () => {
+      const { player } = harness();
+
+      const { emitted } = player.getStats();
+      expect(emitted.written).toHaveLength(SID_REGISTER_COUNT);
+      expect(emitted.sent).toEqual(emitted.written);
+    });
+  });
+
+  describe('resync in-flight depth', () => {
+    it("reports 1 while a landed jump's gate-off is still owed to the stream, 0 once it has gone out", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 2);
+
+      await player.seek(frames(10));
+      expect(player.getStats().resync.inFlightDepth).toBe(1);
+
+      run(clock, 1); // delivers the gate-off, clearing what was owed
+      expect(player.getStats().resync.inFlightDepth).toBe(0);
+    });
+
+    it('reports 0 before any jump or loop has ever queued a resync', () => {
+      const { player } = harness();
+
+      expect(player.getStats().resync.inFlightDepth).toBe(0);
+    });
+  });
+
+  describe('the exact play-call rate', () => {
+    it('reports the unrounded rate alongside the rounded one once they genuinely disagree', () => {
+      const { player } = harness();
+      player.loadTune(fractionalSpeedTune());
+
+      const { rate } = player.getStats();
+      expect(rate.exactCallsPerFrame).toBeCloseTo(2.4, 5);
+      expect(rate.roundedCallsPerFrame).toBe(2);
     });
   });
 

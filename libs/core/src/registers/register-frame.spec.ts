@@ -3,7 +3,7 @@ import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from './clock-ratio.js';
 import { RegisterFrame } from './register-frame.js';
 import type { ScaledRegisterGroup, SidFilterMode } from './register-frame.js';
 import type { SidFrame } from './sid-frame.js';
-import { SID_REGISTER_COUNT } from './sid-constants.js';
+import { SID_REGISTER_COUNT, VOICE_CONTROL_REGISTERS } from './sid-constants.js';
 import { clamp } from '../common/math.js';
 import { C64Machine } from '../cpu/c64-machine.js';
 import type { SidFile } from '../sid/sid-file.model.js';
@@ -23,6 +23,15 @@ const SCALED_GROUPS: readonly ScaledRegisterGroup[] = [
   'resonance',
   'pulseWidth',
 ];
+
+/** Every register a group owns — the `emittedValues()` tests use this to check that scaling one
+ *  group leaves every other register's `sent` byte equal to `written`. */
+const REGISTERS_BY_GROUP: Readonly<Record<ScaledRegisterGroup, readonly number[]>> = {
+  volume: [24],
+  cutoff: [21, 22],
+  resonance: [23],
+  pulseWidth: [2, 3, 9, 10, 16, 17],
+};
 
 /** [low, high] frequency register pairs per voice. */
 const FREQUENCY_REGISTERS = [
@@ -329,6 +338,152 @@ describe('RegisterFrame', () => {
       frame.restoreValues(frame.snapshotValues());
 
       expect(frame.takeSnapshot().count).toBe(0);
+    });
+  });
+
+  describe('voiceState', () => {
+    it('decodes gate, waveform, frequency and envelope from the shadow, per voice', () => {
+      for (let voice = 0; voice < 3; voice++) {
+        const base = voice * 7;
+        const frame = new RegisterFrame();
+        frame.onSidWrite(base + 0, 0x34); // frequency low
+        frame.onSidWrite(base + 1, 0x12); // frequency high
+        frame.onSidWrite(VOICE_CONTROL_REGISTERS[voice], 0x41); // waveform 4, gate on
+        frame.onSidWrite(base + 5, 0x0a); // attack/decay
+        frame.onSidWrite(base + 6, 0x55); // sustain/release
+
+        expect(frame.voiceState(voice)).toEqual({
+          gate: true,
+          waveform: 0x4,
+          frequency: 0x1234,
+          envelope: 0x0a55,
+        });
+      }
+    });
+
+    it('reads the gate bit and the waveform nibble independently of one another', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(VOICE_CONTROL_REGISTERS[0], 0x10); // waveform 1 (triangle), gate off
+      expect(frame.voiceState(0)).toMatchObject({ gate: false, waveform: 0x1 });
+
+      // A fresh frame between the writes, rather than a second write to the same gate register in
+      // one frame — that would retrigger instead of replacing the shadow byte `voiceState` reads.
+      frame.takeSnapshot();
+      frame.onSidWrite(VOICE_CONTROL_REGISTERS[0], 0x81); // waveform 8 (noise), gate on
+      expect(frame.voiceState(0)).toMatchObject({ gate: true, waveform: 0x8 });
+    });
+
+    it('decodes the raw shadow rather than a scaled one — a pitch correction never moves it', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(0, 0x00);
+      frame.onSidWrite(1, 0x10); // frequency 0x1000
+      frame.setVoicePitch(0, 2);
+      frame.takeSnapshot(); // scaling only ever touches the emitted bytes, never the shadow
+
+      expect(frame.voiceState(0).frequency).toBe(0x1000);
+    });
+  });
+
+  describe('emittedValues', () => {
+    it('matches written and sent everywhere when every control is at home', () => {
+      const frame = new RegisterFrame();
+      for (const register of ALL_REGISTERS) {
+        frame.onSidWrite(register, byteFor(register));
+      }
+
+      const { written, sent } = frame.emittedValues();
+
+      for (const register of ALL_REGISTERS) {
+        expect(written[register]).toBe(byteFor(register));
+        expect(sent[register]).toBe(byteFor(register));
+      }
+    });
+
+    it.each(SCALED_GROUPS)(
+      "differs from written on exactly %s's own registers once scaled off home",
+      (group) => {
+        const frame = new RegisterFrame();
+        for (const register of ALL_REGISTERS) {
+          frame.onSidWrite(register, byteFor(register));
+        }
+        frame.setRegisterScale(group, 0.5);
+
+        const { written, sent } = frame.emittedValues();
+        const scaled = new Set(REGISTERS_BY_GROUP[group]);
+
+        for (const register of ALL_REGISTERS) {
+          if (scaled.has(register)) {
+            expect(sent[register]).not.toBe(written[register]);
+          } else {
+            expect(sent[register]).toBe(written[register]);
+          }
+        }
+      },
+    );
+
+    it("differs from written only on the pitched voice's frequency pair once off home", () => {
+      const frame = new RegisterFrame();
+      for (const register of ALL_REGISTERS) {
+        frame.onSidWrite(register, byteFor(register));
+      }
+      frame.setVoicePitch(1, 2);
+
+      const { written, sent } = frame.emittedValues();
+      const [low, high] = FREQUENCY_REGISTERS[1];
+
+      for (const register of ALL_REGISTERS) {
+        if (register === low || register === high) {
+          expect(sent[register]).not.toBe(written[register]);
+        } else {
+          expect(sent[register]).toBe(written[register]);
+        }
+      }
+    });
+
+    it('leaves a forced filter mode visible on sent[24] with no coefficient off home', () => {
+      const frame = new RegisterFrame();
+      frame.onSidWrite(24, 0xba); // voice-3 mute set, tune's mode 0b011, volume 10
+      frame.setFilterMode('lowPass');
+
+      const { written, sent } = frame.emittedValues();
+
+      expect(written[24]).toBe(0xba);
+      expect(sent[24]).toBe(0x80 | (0b001 << 4) | 0x0a);
+    });
+
+    it('never perturbs what the next real frame emits — a pull is side-effect free', () => {
+      const control = new RegisterFrame();
+      control.onSidWrite(24, 0x2f);
+      control.setOutputGain(0.5);
+      const expected = writesOf(control.takeSnapshot());
+
+      const observed = new RegisterFrame();
+      observed.onSidWrite(24, 0x2f);
+      observed.setOutputGain(0.5);
+      observed.emittedValues();
+      observed.emittedValues();
+
+      expect(writesOf(observed.takeSnapshot())).toEqual(expected);
+    });
+
+    it('never consumes the one-shot restore a return home owes the next real frame', () => {
+      const control = new RegisterFrame();
+      control.onSidWrite(21, 0x07);
+      control.onSidWrite(22, 0x64);
+      control.setRegisterScale('cutoff', 0.5);
+      control.takeSnapshot(); // consumes the initial off-home emission
+      control.setRegisterScale('cutoff', 1); // arms the one-shot restore
+      const expectedRestore = writesOf(control.takeSnapshot());
+
+      const observed = new RegisterFrame();
+      observed.onSidWrite(21, 0x07);
+      observed.onSidWrite(22, 0x64);
+      observed.setRegisterScale('cutoff', 0.5);
+      observed.takeSnapshot();
+      observed.setRegisterScale('cutoff', 1);
+      observed.emittedValues(); // must not consume the restore before takeSnapshot() gets to it
+
+      expect(writesOf(observed.takeSnapshot())).toEqual(expectedRestore);
     });
   });
 

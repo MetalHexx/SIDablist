@@ -1,4 +1,5 @@
 import type { SidFile } from '../sid/sid-file.model.js';
+import { cycles, type Cycles } from '../units.js';
 import { createVendorCpu } from './vendor-cpu.js';
 import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 import {
@@ -212,6 +213,15 @@ export class C64Machine {
       return 1;
     }
     return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / rate);
+  }
+
+  /**
+   * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
+   * NTSC depending on this tune's own clock. What a headroom figure divides `FrameResult.cyclesUsed`
+   * against.
+   */
+  get frameCycleBudget(): Cycles {
+    return cycles(this.cyclesPerFrame * PLAY_BUDGET_FRAMES);
   }
 
   /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */

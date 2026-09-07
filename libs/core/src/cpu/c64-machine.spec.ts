@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { C64Machine, type SidWriteSink, UnplayableTuneError } from './c64-machine.js';
-import { PAL_CYCLES_PER_FRAME, TRAMPOLINE_BASE } from './cpu-constants.js';
+import {
+  NTSC_CYCLES_PER_FRAME,
+  PAL_CYCLES_PER_FRAME,
+  PLAY_BUDGET_FRAMES,
+  TRAMPOLINE_BASE,
+} from './cpu-constants.js';
 import type { SidClock, SidFile } from '../sid/sid-file.model.js';
 import { parseSidFile } from '../sid/sid-file.parser.js';
 import { BUNDLED_TUNES, decodeBundledTune } from '../sid/__fixtures__/index.js';
@@ -228,6 +233,21 @@ describe('C64Machine', () => {
     // The integer form still answers its own question, and the two genuinely disagree here — an
     // interval divided by the rounded rate would run this tune 20% slow.
     expect(machine.callsPerFrame).toBe(2);
+  });
+
+  it("reports the frame cycle budget against the tune's own clock, PAL or NTSC", () => {
+    const palMachine = new C64Machine(
+      tune({ clock: 'pal', blocks: [{ at: 0x1000, bytes: [0x60] }] }),
+      new RecordingSink(),
+    );
+    const ntscMachine = new C64Machine(
+      tune({ clock: 'ntsc', blocks: [{ at: 0x1000, bytes: [0x60] }] }),
+      new RecordingSink(),
+    );
+
+    expect(palMachine.frameCycleBudget).toBe(PAL_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES);
+    expect(ntscMachine.frameCycleBudget).toBe(NTSC_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES);
+    expect(palMachine.frameCycleBudget).not.toBe(ntscMachine.frameCycleBudget);
   });
 
   it('reports one call per frame for a tune that never programs the timer', () => {

@@ -23,6 +23,7 @@ export {
   type RegisterValuesSnapshot,
   type ScaledRegisterGroup,
   type SidFilterMode,
+  type VoiceRegisterState,
 } from './registers/register-frame.js';
 export { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from './registers/clock-ratio.js';
 export {

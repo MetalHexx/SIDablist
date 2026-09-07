@@ -1,4 +1,5 @@
 import { describeError } from '../common/errors.js';
+import { clamp } from '../common/math.js';
 import {
   DEFAULT_TIMING_MODE,
   msToPlayCalls,
@@ -16,6 +17,7 @@ import type { SidFrame } from '../registers/sid-frame.js';
 import {
   NTSC_FRAME_INTERVAL_US,
   PAL_FRAME_INTERVAL_US,
+  SID_REGISTER_COUNT,
   VOICE_CONTROL_REGISTERS,
   VOICE_COUNT,
 } from '../registers/sid-constants.js';
@@ -27,14 +29,28 @@ import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
 import { createTrackStructure } from '../timeline/track-structure.js';
 import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-structure.js';
-import { frames, microseconds, milliseconds } from '../units.js';
-import type { Frames, Microseconds, Milliseconds } from '../units.js';
+import { cycles, frames, microseconds, milliseconds } from '../units.js';
+import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import type { SidPlayer } from './sid-player.js';
 import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
 import { createTuneSession } from './tune-session.js';
 import type { TuneSession } from './tune-session.js';
+
+/** `emitted`'s default before any tune has loaded a register shadow to read. */
+const EMPTY_REGISTER_BYTES = new Uint8Array(SID_REGISTER_COUNT);
+const EMPTY_EMITTED: PlayerStats['emitted'] = {
+  written: EMPTY_REGISTER_BYTES,
+  sent: EMPTY_REGISTER_BYTES,
+};
+/** `voices`' default for a voice with no register shadow to decode yet. */
+const EMPTY_VOICE_STATE: PlayerStats['voices'][number] = {
+  gate: false,
+  waveform: 0,
+  frequency: 0,
+  envelope: 0,
+};
 
 /**
  * The widest backward walk a seek target can carry, in real time — what the anchor ring is spaced
@@ -139,6 +155,9 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The previous frame's due time, so `record` can spot an inversion. Null before the first frame
    *  of a run — there is nothing yet to be earlier than. */
   private lastDueAtMs: Milliseconds | null = null;
+  /** The most recent `runFrame()` call's cost, win or fail — `getStats()`'s cheap read against it
+   *  rather than re-deriving it, since a pull must never re-run the frame it is reporting on. */
+  private lastCyclesUsed: Cycles = cycles(0);
 
   constructor(collaborators: SidPlayerCollaborators) {
     this.sink = collaborators.sink;
@@ -181,6 +200,7 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   getStats(): PlayerStats {
+    const frame = this.session.frame;
     return {
       framesRendered: this.session.framesRendered,
       clock: this.clock.stats,
@@ -196,9 +216,35 @@ class SidPlayerCoordinator implements SidPlayer {
         clampedFrames: this.clampedFrames,
       },
       sink: { farEnd: this.sink.readAt(), capabilities: this.sink.capabilities },
-      suppressedWrites: this.session.frame?.suppressedWriteCount ?? 0,
+      suppressedWrites: frame?.suppressedWriteCount ?? 0,
       illegalOpcodeCount: this.session.machine?.illegalOpcodeCount ?? 0,
+      cpu: { cyclesUsed: this.lastCyclesUsed, headroom: this.cpuHeadroom() },
+      voices: this.voiceStats(frame),
+      emitted: frame?.emittedValues() ?? EMPTY_EMITTED,
+      resync: { inFlightDepth: this.gateOffOwed ? 1 : 0 },
+      rate: {
+        exactCallsPerFrame: this.machineRates.exact,
+        roundedCallsPerFrame: this.machineRates.rounded,
+      },
     };
+  }
+
+  /** `1 - cyclesUsed / frameCycleBudget`, clamped — no machine loaded reports full headroom, since
+   *  nothing is spending any of a budget that does not yet exist. */
+  private cpuHeadroom(): number {
+    const machine = this.session.machine;
+    if (machine === null) return 1;
+    return clamp(1 - this.lastCyclesUsed / machine.frameCycleBudget, 0, 1);
+  }
+
+  /** Decoded fresh from the shadow on every call — see `RegisterFrame.voiceState`'s own doc for why
+   *  that is cheap enough for a pull. */
+  private voiceStats(frame: RegisterFrame | null): PlayerStats['voices'] {
+    const voices: PlayerStats['voices'][number][] = [];
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      voices.push(frame?.voiceState(voice) ?? EMPTY_VOICE_STATE);
+    }
+    return voices;
   }
 
   /** Rebuilds the machine and register frame for `file` and initialises its start subtune. */
@@ -512,6 +558,9 @@ class SidPlayerCoordinator implements SidPlayer {
       this.fail(`the play routine could not run — ${describeError(error)}`);
       return;
     }
+    // Recorded before the completion check: a runaway routine's headroom is exactly what a
+    // consumer needs to see, alongside the failure the incomplete branch below raises for it.
+    this.lastCyclesUsed = cycles(result.cyclesUsed);
     if (!result.completed) {
       this.fail(
         `the play routine did not return within its cycle budget (${result.cyclesUsed} cycles)`,
@@ -685,6 +734,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.reorderedFrames = 0;
     this.clampedFrames = 0;
     this.lastDueAtMs = null;
+    this.lastCyclesUsed = cycles(0);
     this.sink.reset();
   }
 
