@@ -29,11 +29,9 @@ export function midiOutputPortFrom(output: MIDIOutput): MidiOutputPort {
     portId: midiOutput.id,
     supportsCancel,
     send(bytes: Uint8Array, timestampMs?: number) {
-      // TypeScript's DOM lib types MIDIOutput.send as taking number[], but all browsers accept
-      // Uint8Array. Cast to unknown then number[] here at the boundary to satisfy the type checker
-      // while actually passing the Uint8Array that browsers expect.
-       
-      midiOutput.send(bytes as unknown as number[], timestampMs);
+      // midiOutput is cast as MIDIOutputLike which declares send accepts Uint8Array directly,
+      // matching what all browsers actually support (the DOM lib's number[] type is incomplete).
+      midiOutput.send(bytes, timestampMs);
     },
     cancelPending(): boolean {
       if (typeof midiOutput.clear !== 'function') {
