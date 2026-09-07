@@ -377,9 +377,14 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.session.currentSubtune === before) {
       return;
     }
-    // The entry image describes a machine the re-init has just replaced.
+    // Every entry image describes a machine the re-init has just replaced — the track's own and
+    // whichever loop is presently active alike.
     this.dropTrackLoopEntry();
     void this.captureTrackLoopEntry();
+    const activeLoop = this.activeLoop.get();
+    if (activeLoop !== null) {
+      void this.captureActiveLoopEntry(activeLoop);
+    }
   }
 
   /** Routes through `selectSubtune` rather than `session.nextSubtune()` directly, so a step still
@@ -394,9 +399,16 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setActiveLoop(loop: ActiveLoop): void {
     this.activeLoop.set(loop);
-    // The entry image is the *track* loop's, taken at its own start frame, so it is only ever the
-    // right way into a lap while no other loop is running.
+    // Null reverts to the track's own loop's cached entry, exactly as before this loop was armed. A
+    // newly armed loop starts with none of its own — `captureActiveLoopEntry` below pays the same
+    // one-time off-thread cost `captureTrackLoopEntry` already pays for the track's own loop, so
+    // every lap after the first re-enters through a restore rather than a replay along the ring.
     this.activeLoop.setEntryImage(loop === null ? this.trackLoopEntry : null);
+    if (loop !== null) {
+      // Not awaited: nothing on this path needs the image, and a lap cannot reach this loop's own
+      // end for a whole pass yet.
+      void this.captureActiveLoopEntry(loop);
+    }
     this.markDirty();
   }
 
@@ -410,6 +422,13 @@ class SidPlayerCoordinator implements SidPlayer {
     // Not awaited: nothing on this path needs the image, and playback cannot reach the loop's end
     // for a whole lap yet.
     void this.captureTrackLoopEntry();
+    // A marker loop already running keeps running straight through the structure change; its own
+    // entry image was just dropped above along with the track's, and recapturing it here — rather
+    // than waiting on the performer to re-arm it — keeps its very next lap instant too.
+    const activeLoop = this.activeLoop.get();
+    if (activeLoop !== null) {
+      void this.captureActiveLoopEntry(activeLoop);
+    }
   }
 
   setRepeatTrack(enabled: boolean): void {
@@ -686,23 +705,37 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /**
-   * Produces the track loop's re-entry image once, off-thread. A loop start of 0 needs none — the
-   * frame-0 anchor already is one — and neither does a track with no detected loop.
-   *
-   * The replay outlives the state it was asked against, so the file, the subtune and the loop start
-   * are all re-checked on the way back: landing a stale image is worse than landing none, since the
-   * fallback to a seek along the anchor path is correct where a foreign machine image is not.
+   * Replays to `startFrame` off-thread and returns the resulting image, or null when it needs none
+   * (frame 0 — the anchor ring's own seed already is one) or the file/subtune moved on underneath
+   * the request while it was in flight. Shared by `captureTrackLoopEntry` and
+   * `captureActiveLoopEntry`, which each layer on the staleness check specific to what they are
+   * caching the image for.
    */
-  private async captureTrackLoopEntry(): Promise<void> {
-    const startFrame = this.track.loopStartFrame();
-    if (startFrame === null || startFrame === 0) return;
+  private async captureEntryImage(startFrame: Frames): Promise<PositionAnchor | null> {
+    if (startFrame === 0) return null;
     const file = this.session.file;
-    if (file === null) return;
+    if (file === null) return null;
     const subtune = this.session.currentSubtune;
 
     const result = await this.session.replayImage(startFrame);
+    if (result === null) return null;
+    if (this.session.file !== file || this.session.currentSubtune !== subtune) return null;
+    return result;
+  }
+
+  /**
+   * Produces the track loop's own re-entry image once, off-thread — run ahead of need, from
+   * `setTrackStructure`, since `advance` arms this loop itself only once the track first wraps.
+   *
+   * Re-checked against the loop start on the way back, on top of `captureEntryImage`'s own file and
+   * subtune guard: a fresh detection landing mid-capture would otherwise cache an image for a loop
+   * that is no longer the one detected.
+   */
+  private async captureTrackLoopEntry(): Promise<void> {
+    const startFrame = this.track.loopStartFrame();
+    if (startFrame === null) return;
+    const result = await this.captureEntryImage(startFrame);
     if (result === null) return;
-    if (this.session.file !== file || this.session.currentSubtune !== subtune) return;
     if (this.track.loopStartFrame() !== startFrame) return;
 
     this.trackLoopEntry = result;
@@ -711,6 +744,40 @@ class SidPlayerCoordinator implements SidPlayer {
     }
   }
 
+  /**
+   * Produces `loop`'s own re-entry image once, off-thread — the mechanism `captureTrackLoopEntry`
+   * already gives the track's own loop, generalized to any loop a performer arms through
+   * `setActiveLoop`. Without it, a marker loop's narrow, endlessly-repeated frame range never earns
+   * itself a usable anchor on the ring (`AnchorRing.select` needs one recorded a full nudge range
+   * *before* the target, which a loop that only ever revisits its own start never gets), so every
+   * lap would replay from the frame-0 seed at a cost proportional to how deep the loop sits.
+   *
+   * Also re-run wherever something strands an already-captured image out from under the presently
+   * active loop — a subtune change, a fresh track-structure detection — rather than leaving that
+   * loop to pay a slow lap before the performer happens to re-arm it.
+   *
+   * Re-checked against the presently active loop on the way back, on top of `captureEntryImage`'s
+   * own file and subtune guard: a performer can swap loops, or clear one, while this is in flight.
+   */
+  private async captureActiveLoopEntry(loop: ActiveLoop): Promise<void> {
+    if (loop === null) return;
+    const result = await this.captureEntryImage(loop.startFrame);
+    if (result === null) return;
+
+    const current = this.activeLoop.get();
+    if (
+      current === null ||
+      current.startFrame !== loop.startFrame ||
+      current.endFrame !== loop.endFrame
+    ) {
+      return;
+    }
+    this.activeLoop.setEntryImage(result);
+  }
+
+  /** Drops the track's own loop's cached entry along with whatever image the tracker presently
+   *  holds — the same call whether that image came from the track's own loop or a marker's, since
+   *  both describe a machine a subtune re-init or a fresh detection has just invalidated. */
   private dropTrackLoopEntry(): void {
     this.trackLoopEntry = null;
     this.activeLoop.setEntryImage(null);

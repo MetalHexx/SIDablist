@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { C64Machine } from '../cpu/c64-machine.js';
 import {
   NTSC_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_FRAME,
@@ -269,6 +270,13 @@ function run(clock: FakeClock, count: number, from = 0): void {
   }
 }
 
+/** Drains every pending microtask, however deep the chain — what settles an entry-image capture
+ *  fired without being awaited (`setActiveLoop`, `setTrackStructure`), since `FakeReplayRunner`
+ *  still resolves through real promises rather than answering synchronously. */
+function flushEntryImageCapture(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 function lastDelivered(sink: RecordingSink): SidFrame {
   const delivered = sink.deliveredFrames;
   return delivered[delivered.length - 1].frame;
@@ -402,6 +410,88 @@ describe('createSidPlayer', () => {
 
       expect(player.getSnapshot().transport).toBe('error');
       expect(() => run(clock, 1)).toThrow();
+    });
+  });
+
+  describe("a loop's entry image", () => {
+    // A wrap owes the stream a resync (`queueResync`'s `gateOffOwed`), which the tick immediately
+    // after a wrap spends delivering a gate-off frame instead of running the play routine — one
+    // tick with no `runFrame` call of its own, on every wrap, fast path or slow. Each case below
+    // ticks past that one first, so the batch it measures is unbroken real ticks throughout.
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("captures a newly armed loop's own re-entry image off-thread, so its first wrap restores instantly rather than replaying from the frame-0 seed", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500; // far enough in that a replay from frame 0 would run hundreds of frames
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      run(clock, 9); // up to, but not touching, the loop's end
+
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      run(clock, 1); // crosses the loop's end and re-enters its start on this same tick
+
+      // One call for the tick's own frame and nothing more — a seek along the anchor path would have
+      // cost extra calls proportional to how far back the newest usable anchor sat, and once this
+      // loop has laid long enough that only the frame-0 seed remains usable that cost is `deepStart`.
+      expect(runFrameSpy).toHaveBeenCalledTimes(1);
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
+    it('keeps re-entering instantly on every later lap, not only the first', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      run(clock, 10); // first wrap: 500 -> 510 -> back to 500
+      run(clock, 1); // the gate-off tick the first wrap owed the stream
+
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      run(clock, 10); // second wrap in full: every one of these ticks is a real one
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
+    it("reverts to the track's own loop's cached entry once a marker loop that borrowed the slot is cleared", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: frames(500),
+        loopPeriodFrames: frames(50),
+        endedAtFrame: null,
+      });
+      player.setRepeatTrack(true);
+      await player.play();
+      await flushEntryImageCapture(); // lets the track's own loop capture its entry image
+
+      run(clock, 550); // plays through the track's own end and wraps back to its start
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 500, endFrame: 550 });
+      expect(player.getPosition()).toBe(500);
+
+      // Borrow the tracker's entry-image slot for a marker loop, then hand it back before the
+      // marker loop's own capture has any chance to resolve.
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      player.setActiveLoop(null);
+      run(clock, 1); // the gate-off tick the earlier wrap owed the stream
+
+      const runFrameSpy = vi.spyOn(C64Machine.prototype, 'runFrame');
+      run(clock, 50); // back around to the track loop's own end again
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(50);
+      expect(player.getPosition()).toBe(500);
     });
   });
 

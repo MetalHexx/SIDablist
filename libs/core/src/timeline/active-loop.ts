@@ -31,12 +31,15 @@ export interface ActiveLoopTracker {
   set(loop: ActiveLoop): void;
   /**
    * The image a lap re-enters through in place of a replay along the anchor path — a snapshot
-   * taken exactly at the active loop's start frame. Null falls back to `seekToFrame`.
+   * taken exactly at the presently active loop's start frame, whichever loop that is: the track's
+   * own or a performer's marker loop alike, this tracker enforces either one identically once it
+   * holds an image for it. Null falls back to `seekToFrame`.
    *
    * Invalidated by a subtune re-init or a new detection landing — both machine-level events core
    * has no other signal of here, so the caller owns clearing it when either happens. Dropping it at
    * the wrong moment costs a click at the loop point; holding it past either event restores a
-   * machine that no longer exists.
+   * machine that no longer exists. The caller also owns re-capturing it when the active loop itself
+   * changes — this tracker only ever holds the one image it was handed, never fetches its own.
    */
   setEntryImage(entry: PositionAnchor | null): void;
   /**
