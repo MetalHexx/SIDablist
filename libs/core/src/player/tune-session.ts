@@ -63,11 +63,111 @@ function sanitizePositiveFrame(value: Frames | null): Frames | null {
 /**
  * Owns the loaded tune, the live `C64Machine`/`RegisterFrame` pair it plays through, the position
  * counter, and the off-thread replay a scrub or a cue hands to the worker.
- *
- * Rebuilds the machine and frame on every `load()`, exactly as the engine did before the split —
- * this class is the one place that constructs them.
  */
-export class TuneSession {
+export interface TuneSession {
+  readonly currentSubtune: number;
+  readonly subtuneCount: number;
+
+  /** Frames in the fixed jump ceiling at the current nominal interval and play rate: seconds of
+   *  music times play calls per second, so a callsPerFrame 2 tune gets twice the frame count of the
+   *  same nominal interval at callsPerFrame 1 — the same 300 seconds of music either way. Recomputed
+   *  on every read rather than cached, so it can never go stale behind a rate change. */
+  readonly ceilingFrames: Frames;
+
+  /** What a position percentage is measured against, in both directions. Recomputed on every read
+   *  rather than snapshotted at load time, so a record landing mid-play moves the playhead's meaning
+   *  on the next read with no further wiring. */
+  readonly positionBasisFrames: Frames;
+
+  readonly file: SidFile | null;
+  readonly machine: C64Machine | null;
+  readonly frame: RegisterFrame | null;
+  framesRendered: Frames;
+
+  /** Rebuilds the machine and register frame for `file`. Does not initialise a subtune — the
+   *  coordinator calls `initSubtune()` once it has decided what else a fresh load resets. */
+  load(file: SidFile): void;
+
+  /** Zeroes the position counter — what a fresh play run or a fresh load starts from. */
+  resetPosition(): void;
+
+  /** Stores the tune-index's measured length as the position basis. Anything that is not a finite
+   *  number greater than zero is stored as null instead — a zero or negative basis would divide the
+   *  playhead by nothing — which makes `positionBasisFrames` fall back to `ceilingFrames`. */
+  setIndexedLengthFrames(lengthFrames: Frames | null): void;
+
+  /** Re-inits the machine and marks every register dirty, so the chip cannot inherit the old state. */
+  initSubtune(song: number): boolean;
+
+  /** Moves to `song`, clamped to the tune's range. A no-op when it is already the current one, so a
+   *  caller can hand it whatever the operator asked for without checking first. */
+  selectSubtune(song: number): void;
+
+  /** Moves to the next subtune, clamped to the tune's range. */
+  nextSubtune(): void;
+
+  /** Moves to the previous subtune, clamped to the tune's range. */
+  previousSubtune(): void;
+
+  /**
+   * Asks for `percent` of `positionBasisFrames`. The position does not move as soon as this returns
+   * — the replay runs off this thread and lands a moment later, and a second scrub issued in the
+   * meantime supersedes this one. The returned promise resolves once this request has settled —
+   * landed, failed, or been superseded/discarded.
+   */
+  scrubTo(percent: number): Promise<void>;
+
+  /**
+   * The shared silent-replay primitive: hands the rebuild to the replay runner and returns at once,
+   * so the frame clock keeps ticking and a frame still goes out on every tick while the replay
+   * runs. The landing happens later, off-thread.
+   *
+   * Only the newest request may land. A response carrying any other id is dropped — a second jump
+   * supersedes the first rather than queueing behind it.
+   */
+  jumpToFrame(targetFrame: Frames): Promise<void>;
+
+  /**
+   * Replays off-thread to `targetFrame` and hands the result back instead of adopting it onto the
+   * live pair. Shares the jump's runner but none of its outstanding-id gating: nothing about the live
+   * machine changes, so a scrub in flight is neither superseded by this nor supersedes it.
+   *
+   * Null with no file loaded, or when the replay could not complete — the caller is asking for an
+   * image it can do without, so a failure degrades rather than failing the engine.
+   */
+  replayImage(targetFrame: Frames): Promise<ReplayResult | null>;
+
+  /**
+   * Puts an image back onto the live pair: restore, adopt its frame number, resync. Shared by a cue
+   * or loop re-entry (via `MarkerHost.restoreState`) and by a landing jump.
+   *
+   * No emulation, so the main thread never stalls and the frame clock keeps ticking straight
+   * through. That stall is what made a deep cue hop — and a loop with a deep entry — hold its last
+   * note: with the thread blocked, no packets went out and the SID simply kept sounding whatever it
+   * was last told.
+   */
+  restoreState(
+    machine: MachineSnapshot,
+    registers: RegisterValuesSnapshot,
+    frameNumber: Frames,
+  ): void;
+
+  /** Drops whatever jump is in flight, so its result is discarded rather than applied. */
+  discardOutstandingJump(): void;
+
+  /** Releases the replay thread — nothing else holds the runner, and it outlives this session
+   *  otherwise. */
+  dispose(): void;
+}
+
+/** Builds a `TuneSession` over `replayRunner`, coordinated through `host`. */
+export function createTuneSession(replayRunner: ReplayRunner, host: TuneSessionHost): TuneSession {
+  return new TuneSessionImpl(replayRunner, host);
+}
+
+/** Rebuilds the machine and frame on every `load()`, exactly as the engine did before the split —
+ *  this class is the one place that constructs them. */
+class TuneSessionImpl implements TuneSession {
   constructor(
     private readonly replayRunner: ReplayRunner,
     private readonly host: TuneSessionHost,
@@ -84,10 +184,6 @@ export class TuneSession {
     return this._subtuneCount;
   }
 
-  /** Frames in the fixed jump ceiling at the current nominal interval and play rate: seconds of
-   *  music times play calls per second, so a callsPerFrame 2 tune gets twice the frame count of the
-   *  same nominal interval at callsPerFrame 1 — the same 300 seconds of music either way. Recomputed
-   *  on every read rather than cached, so it can never go stale behind a rate change. */
   get ceilingFrames(): Frames {
     return frames(
       Math.round(
@@ -97,12 +193,8 @@ export class TuneSession {
     );
   }
 
-  /** The indexed length, when one was found and is usable; null falls back to the fixed ceiling. */
   private _indexedLengthFrames: Frames | null = null;
 
-  /** What a position percentage is measured against, in both directions. Recomputed on every read
-   *  rather than snapshotted at load time, so a record landing mid-play moves the playhead's meaning
-   *  on the next read with no further wiring. */
   get positionBasisFrames(): Frames {
     return this._indexedLengthFrames ?? this.ceilingFrames;
   }
@@ -145,8 +237,6 @@ export class TuneSession {
     this._framesRendered = value;
   }
 
-  /** Rebuilds the machine and register frame for `file`. Does not initialise a subtune — the
-   *  coordinator calls `initSubtune()` once it has decided what else a fresh load resets. */
   load(file: SidFile): void {
     this._file = file;
     this._frame = new RegisterFrame();
@@ -158,20 +248,15 @@ export class TuneSession {
     this.host.markDirty();
   }
 
-  /** Zeroes the position counter — what a fresh play run or a fresh load starts from. */
   resetPosition(): void {
     this._framesRendered = frames(0);
   }
 
-  /** Stores the tune-index's measured length as the position basis. Anything that is not a finite
-   *  number greater than zero is stored as null instead — a zero or negative basis would divide the
-   *  playhead by nothing — which makes `positionBasisFrames` fall back to `ceilingFrames`. */
   setIndexedLengthFrames(lengthFrames: Frames | null): void {
     this._indexedLengthFrames = sanitizePositiveFrame(lengthFrames);
     this.host.markDirty();
   }
 
-  /** Re-inits the machine and marks every register dirty, so the chip cannot inherit the old state. */
   initSubtune(song: number): boolean {
     const machine = this._machine;
     const frame = this._frame;
@@ -209,8 +294,6 @@ export class TuneSession {
     return true;
   }
 
-  /** Moves to `song`, clamped to the tune's range. A no-op when it is already the current one, so a
-   *  caller can hand it whatever the operator asked for without checking first. */
   selectSubtune(song: number): void {
     if (this._machine === null) {
       return;
@@ -236,12 +319,6 @@ export class TuneSession {
     this.selectSubtune(this._currentSubtune - 1);
   }
 
-  /**
-   * Asks for `percent` of `positionBasisFrames`. The position does not move as soon as this returns
-   * — the replay runs off this thread and lands a moment later, and a second scrub issued in the
-   * meantime supersedes this one. The returned promise resolves once this request has settled —
-   * landed, failed, or been superseded/discarded.
-   */
   scrubTo(percent: number): Promise<void> {
     if (this._machine === null) return Promise.resolve();
     return this.jumpToFrame(this.frameForPercent(percent));
@@ -252,15 +329,6 @@ export class TuneSession {
     return frames(Math.round((clamped / 100) * this.positionBasisFrames));
   }
 
-  /**
-   * The shared silent-replay primitive: hands the rebuild to the replay runner and returns at once,
-   * so the frame clock keeps ticking and a frame still goes out on every tick while the replay
-   * runs. The landing happens later, in `awaitJump`.
-   *
-   * Only the newest request may land. The id stamped here is recorded as the outstanding one, and a
-   * response carrying any other id is dropped — a second jump supersedes the first rather than
-   * queueing behind it.
-   */
   jumpToFrame(targetFrame: Frames): Promise<void> {
     const file = this._file;
     if (file === null || this._machine === null || this._frame === null) return Promise.resolve();
@@ -278,14 +346,6 @@ export class TuneSession {
     return this.awaitJump(request);
   }
 
-  /**
-   * Replays off-thread to `targetFrame` and hands the result back instead of adopting it onto the
-   * live pair. Shares the jump's runner but none of its outstanding-id gating: nothing about the live
-   * machine changes, so a scrub in flight is neither superseded by this nor supersedes it.
-   *
-   * Null with no file loaded, or when the replay could not complete — the caller is asking for an
-   * image it can do without, so a failure degrades rather than failing the engine.
-   */
   async replayImage(targetFrame: Frames): Promise<ReplayResult | null> {
     const file = this._file;
     if (file === null) return null;
@@ -349,15 +409,6 @@ export class TuneSession {
     this.restoreState(response.result.machine, response.result.registers, response.result.frame);
   }
 
-  /**
-   * Puts an image back onto the live pair: restore, adopt its frame number, resync. Shared by a cue
-   * or loop re-entry (via `MarkerHost.restoreState`) and by a landing jump.
-   *
-   * No emulation, so the main thread never stalls and the frame clock keeps ticking straight
-   * through. That stall is what made a deep cue hop — and a loop with a deep entry — hold its last
-   * note: with the thread blocked, no packets went out and the SID simply kept sounding whatever it
-   * was last told.
-   */
   restoreState(
     machine: MachineSnapshot,
     registers: RegisterValuesSnapshot,
@@ -371,13 +422,10 @@ export class TuneSession {
     this.host.queueResync();
   }
 
-  /** Drops whatever jump is in flight, so its result is discarded rather than applied. */
   discardOutstandingJump(): void {
     this.outstandingJumpId = null;
   }
 
-  /** Releases the replay thread — nothing else holds the runner, and it outlives this session
-   *  otherwise. */
   dispose(): void {
     this.replayRunner.dispose();
   }

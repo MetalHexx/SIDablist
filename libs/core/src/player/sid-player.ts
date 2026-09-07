@@ -34,6 +34,10 @@ export interface SidPlayer {
   stop(): void;
   seek(frame: Frames): Promise<void>;
   selectSubtune(song: number): void;
+  /** Selects the next subtune, clamped to the tune's range. A no-op at the last subtune. */
+  nextSubtune(): void;
+  /** Selects the previous subtune, clamped to the tune's range. A no-op at the first subtune. */
+  previousSubtune(): void;
   setActiveLoop(loop: { startFrame: Frames; endFrame: Frames } | null): void;
   /** What detection found about this tune: its loop, its end, its measured length. The
    *  application supplies it; core turns it into the position basis and the end behaviour. */

@@ -5,7 +5,7 @@ import type { RegisterFrame } from '../registers/register-frame.js';
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import { replayToFrame } from '../replay/replay-to-frame.js';
 import { frames } from '../units.js';
-import { JUMP_CEILING_SECONDS, TuneSession } from './tune-session.js';
+import { JUMP_CEILING_SECONDS, createTuneSession } from './tune-session.js';
 import type { TuneSessionHost } from './tune-session.js';
 import type { PlayRate } from '../clock/play-rate.js';
 
@@ -216,7 +216,7 @@ describe('TuneSession', () => {
 
   describe('load and subtune init', () => {
     it('builds a machine and frame, and clamps the subtune count to at least 1', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
 
       session.load(tune({ songs: 0, blocks: [{ at: 0x1000, bytes: [RTS] }] }));
 
@@ -226,7 +226,7 @@ describe('TuneSession', () => {
 
     it('resets the position counter, records a fresh anchor, adopts the subtune and clears the error on success', () => {
       const host = fakeHost();
-      const session = new TuneSession(new FakeReplayRunner(), host);
+      const session = createTuneSession(new FakeReplayRunner(), host);
       session.load(silentTune(2));
       session.framesRendered = frames(40);
       let recordedFrames = -1;
@@ -243,7 +243,7 @@ describe('TuneSession', () => {
     });
 
     it('clamps the requested subtune to the tune range', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune(2));
 
       session.initSubtune(99);
@@ -253,7 +253,7 @@ describe('TuneSession', () => {
 
     it('fails the host and returns false when a subtune cannot be initialised', () => {
       const host = fakeHost();
-      const session = new TuneSession(new FakeReplayRunner(), host);
+      const session = createTuneSession(new FakeReplayRunner(), host);
       session.load(unplayableTune());
 
       const ok = session.initSubtune(1);
@@ -264,7 +264,7 @@ describe('TuneSession', () => {
 
     it('marks the store dirty on a load and on a successful subtune init', () => {
       const host = fakeHost();
-      const session = new TuneSession(new FakeReplayRunner(), host);
+      const session = createTuneSession(new FakeReplayRunner(), host);
 
       session.load(silentTune(2));
       expect(host.dirtyCount.count).toBe(1);
@@ -276,7 +276,7 @@ describe('TuneSession', () => {
 
   describe('subtune stepping', () => {
     it('steps forward and back, clamped to the tune range', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune(2));
       session.initSubtune(1);
 
@@ -292,7 +292,7 @@ describe('TuneSession', () => {
 
     it('re-resolves the clock interval only when the subtune actually changed', () => {
       const applyIntervalChange = vi.fn();
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost({ applyIntervalChange }));
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost({ applyIntervalChange }));
       session.load(silentTune(2));
       session.initSubtune(1);
 
@@ -307,14 +307,14 @@ describe('TuneSession', () => {
 
   describe('positionBasisFrames', () => {
     it('keeps the fixed ceiling as the basis when no indexed length has been set', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune());
 
       expect(session.positionBasisFrames).toBe(session.ceilingFrames);
     });
 
     it('keeps the fixed ceiling when a length is set back to null', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune());
       session.setIndexedLengthFrames(frames(2_500));
 
@@ -324,7 +324,7 @@ describe('TuneSession', () => {
     });
 
     it('adopts a usable indexed length as the basis', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune());
 
       session.setIndexedLengthFrames(frames(2_500));
@@ -333,7 +333,7 @@ describe('TuneSession', () => {
     });
 
     it('rejects a zero or negative length, falling back to the ceiling', () => {
-      const session = new TuneSession(new FakeReplayRunner(), fakeHost());
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
       session.load(silentTune());
 
       session.setIndexedLengthFrames(frames(0));
@@ -347,12 +347,12 @@ describe('TuneSession', () => {
   describe('ceilingFrames and the play rate', () => {
     it('doubles for a callsPerFrame 2 tune versus a callsPerFrame 1 tune at the same nominal interval', () => {
       const host1x = fakeHost();
-      const session1x = new TuneSession(new FakeReplayRunner(), host1x);
+      const session1x = createTuneSession(new FakeReplayRunner(), host1x);
       session1x.load(silentTune());
       session1x.initSubtune(1);
 
       const host2x = fakeHost();
-      const session2x = new TuneSession(new FakeReplayRunner(), host2x);
+      const session2x = createTuneSession(new FakeReplayRunner(), host2x);
       session2x.load(doubleSpeedTune());
       session2x.initSubtune(1);
 
@@ -361,7 +361,7 @@ describe('TuneSession', () => {
 
     it('stays current after a subtune init that changes the rate without the nominal interval changing', () => {
       const host = fakeHost();
-      const session = new TuneSession(new FakeReplayRunner(), host);
+      const session = createTuneSession(new FakeReplayRunner(), host);
       session.load(silentTune());
       session.initSubtune(1);
       const before = session.ceilingFrames;
@@ -380,7 +380,7 @@ describe('TuneSession', () => {
     it('lands on the requested percentage of the jump ceiling and queues a resync', async () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
 
@@ -396,7 +396,7 @@ describe('TuneSession', () => {
     it('lands on the requested percentage of an indexed basis rather than the ceiling', async () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
       session.setIndexedLengthFrames(frames(2_500));
@@ -408,7 +408,7 @@ describe('TuneSession', () => {
 
     it('resolves without a request when no machine is loaded', async () => {
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, fakeHost());
+      const session = createTuneSession(replay, fakeHost());
 
       await session.scrubTo(50);
 
@@ -419,7 +419,7 @@ describe('TuneSession', () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
       replay.manual = true;
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
 
@@ -436,7 +436,7 @@ describe('TuneSession', () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
       replay.manual = true;
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
 
@@ -453,7 +453,7 @@ describe('TuneSession', () => {
     it('fails the host rather than throwing when the replay cannot complete', async () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(runawayTune());
       session.initSubtune(1);
 
@@ -467,7 +467,7 @@ describe('TuneSession', () => {
     it('hands the image back at the requested frame, leaving the live pair exactly where it was', async () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
       session.framesRendered = frames(40);
@@ -481,7 +481,7 @@ describe('TuneSession', () => {
 
     it('resolves to null without asking the runner when no file is loaded', async () => {
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, fakeHost());
+      const session = createTuneSession(replay, fakeHost());
 
       expect(await session.replayImage(frames(10))).toBeNull();
       expect(replay.requests).toHaveLength(0);
@@ -490,7 +490,7 @@ describe('TuneSession', () => {
     it('degrades to null rather than failing the engine when the replay cannot complete', async () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(runawayTune());
       session.initSubtune(1);
 
@@ -502,7 +502,7 @@ describe('TuneSession', () => {
       const host = fakeHost();
       replay = new FakeReplayRunner();
       replay.manual = true;
-      const session = new TuneSession(replay, host);
+      const session = createTuneSession(replay, host);
       session.load(counterTune());
       session.initSubtune(1);
       session.setIndexedLengthFrames(frames(100));
@@ -521,7 +521,7 @@ describe('TuneSession', () => {
   describe('restoreState', () => {
     it('adopts the frame number and queues a resync', () => {
       const host = fakeHost();
-      const session = new TuneSession(new FakeReplayRunner(), host);
+      const session = createTuneSession(new FakeReplayRunner(), host);
       session.load(silentTune());
       session.initSubtune(1);
       const snapshot = (session.machine as C64Machine).snapshot();
@@ -537,7 +537,7 @@ describe('TuneSession', () => {
   describe('dispose', () => {
     it('releases the replay runner', () => {
       const runner = new FakeReplayRunner();
-      const session = new TuneSession(runner, fakeHost());
+      const session = createTuneSession(runner, fakeHost());
 
       session.dispose();
 

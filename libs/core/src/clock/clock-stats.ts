@@ -16,25 +16,9 @@ export const LATE_CALLBACK_FACTOR = 2;
  * gaps ran later than `lateThresholdMs`, the measured mean interval, and drift against the nominal
  * grid — split out so it exercises without a timing source in the way.
  */
-export class ClockStats {
-  // Running sums rather than a kept list of samples: a concrete clock updates this on its own
-  // callback, where allocating per tick is exactly the jitter it is trying to measure.
-  private gapCount = 0;
-  private gapSumMs = 0;
-  private gapSumSqMs = 0;
-  private worstGapMsValue = 0;
-  private lateCallbacksCount = 0;
-
-  constructor(private readonly lateThresholdMs: Milliseconds) {}
-
+export interface ClockStats {
   /** Records one callback-to-callback gap, in milliseconds. */
-  recordGap(gapMs: Milliseconds): void {
-    this.gapCount++;
-    this.gapSumMs += gapMs;
-    this.gapSumSqMs += gapMs * gapMs;
-    if (gapMs > this.worstGapMsValue) this.worstGapMsValue = gapMs;
-    if (gapMs > this.lateThresholdMs) this.lateCallbacksCount++;
-  }
+  recordGap(gapMs: Milliseconds): void;
 
   /**
    * Standard deviation of the recorded gaps.
@@ -46,11 +30,7 @@ export class ClockStats {
    *
    * Population standard deviation from the running sums, floored at 0 against float cancellation.
    */
-  get jitterMs(): Milliseconds {
-    if (this.gapCount < 2) return milliseconds(0);
-    const mean = this.gapSumMs / this.gapCount;
-    return milliseconds(Math.sqrt(Math.max(0, this.gapSumSqMs / this.gapCount - mean * mean)));
-  }
+  readonly jitterMs: Milliseconds;
 
   /**
    * The longest single recorded gap.
@@ -58,9 +38,7 @@ export class ClockStats {
    * The number that actually catches a rare dropout: one stall barely moves the standard
    * deviation but empties any buffer outright.
    */
-  get worstGapMs(): Milliseconds {
-    return milliseconds(this.worstGapMsValue);
-  }
+  readonly worstGapMs: Milliseconds;
 
   /**
    * How many gaps ran later than `lateThresholdMs`.
@@ -68,9 +46,7 @@ export class ClockStats {
    * `worstGapMs` is a running maximum that never decays, so a single spike sets it for the session
    * and cannot be told apart from a constant problem. This is the frequency alongside it.
    */
-  get lateCallbacks(): number {
-    return this.lateCallbacksCount;
-  }
+  readonly lateCallbacks: number;
 
   /**
    * Assembles the full `FrameClockStats` snapshot: the gap-based figures above, plus the measured
@@ -81,6 +57,50 @@ export class ClockStats {
    * against the wall clock, so a healthy stream holds it near zero. A figure that climbs steadily
    * means the engine is emitting at a different rate from the one it advertises downstream.
    */
+  toFrameClockStats(
+    accumulator: FrameAccumulator,
+    measuredElapsedUs: Microseconds,
+  ): FrameClockStats;
+}
+
+/** Builds a `ClockStats` that counts a gap later than `lateThresholdMs` as late. */
+export function createClockStats(lateThresholdMs: Milliseconds): ClockStats {
+  return new ClockStatsImpl(lateThresholdMs);
+}
+
+class ClockStatsImpl implements ClockStats {
+  // Running sums rather than a kept list of samples: a concrete clock updates this on its own
+  // callback, where allocating per tick is exactly the jitter it is trying to measure.
+  private gapCount = 0;
+  private gapSumMs = 0;
+  private gapSumSqMs = 0;
+  private worstGapMsValue = 0;
+  private lateCallbacksCount = 0;
+
+  constructor(private readonly lateThresholdMs: Milliseconds) {}
+
+  recordGap(gapMs: Milliseconds): void {
+    this.gapCount++;
+    this.gapSumMs += gapMs;
+    this.gapSumSqMs += gapMs * gapMs;
+    if (gapMs > this.worstGapMsValue) this.worstGapMsValue = gapMs;
+    if (gapMs > this.lateThresholdMs) this.lateCallbacksCount++;
+  }
+
+  get jitterMs(): Milliseconds {
+    if (this.gapCount < 2) return milliseconds(0);
+    const mean = this.gapSumMs / this.gapCount;
+    return milliseconds(Math.sqrt(Math.max(0, this.gapSumSqMs / this.gapCount - mean * mean)));
+  }
+
+  get worstGapMs(): Milliseconds {
+    return milliseconds(this.worstGapMsValue);
+  }
+
+  get lateCallbacks(): number {
+    return this.lateCallbacksCount;
+  }
+
   toFrameClockStats(
     accumulator: FrameAccumulator,
     measuredElapsedUs: Microseconds,

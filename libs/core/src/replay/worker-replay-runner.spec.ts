@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ReplayRequest, ReplayResponse } from './replay-runner.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames } from '../units.js';
-import { WorkerReplayRunner } from './worker-replay-runner.js';
+import { createWorkerReplayRunner } from './worker-replay-runner.js';
 
 /** Everything `WorkerReplayRunner` actually touches on a `Worker` — enough to stand in for the
  *  real thing without a DOM, since `postMessage`/`onmessage`/`onerror`/`terminate` are the whole
@@ -76,7 +76,7 @@ function okResponse(id: number): ReplayResponse {
 describe('WorkerReplayRunner', () => {
   it('round-trips a request through an injected fake worker', async () => {
     const worker = createFakeWorker();
-    const runner = new WorkerReplayRunner(() => worker as unknown as Worker);
+    const runner = createWorkerReplayRunner(() => worker as unknown as Worker);
 
     const pending = runner.run(request(1));
     deliver(worker, okResponse(1));
@@ -87,7 +87,7 @@ describe('WorkerReplayRunner', () => {
 
   it('builds the worker once and reuses it across requests', () => {
     const factory = vi.fn(() => createFakeWorker() as unknown as Worker);
-    const runner = new WorkerReplayRunner(factory);
+    const runner = createWorkerReplayRunner(factory);
 
     runner.run(request(1));
     runner.run(request(2));
@@ -97,7 +97,7 @@ describe('WorkerReplayRunner', () => {
 
   it('fans a worker error out to every pending promise, leaving none permanently unresolved', async () => {
     const worker = createFakeWorker();
-    const runner = new WorkerReplayRunner(() => worker as unknown as Worker);
+    const runner = createWorkerReplayRunner(() => worker as unknown as Worker);
 
     const first = runner.run(request(1));
     const second = runner.run(request(2));
@@ -118,7 +118,7 @@ describe('WorkerReplayRunner', () => {
 
   it('discards a response for an id that is no longer awaited, without disturbing what is', async () => {
     const worker = createFakeWorker();
-    const runner = new WorkerReplayRunner(() => worker as unknown as Worker);
+    const runner = createWorkerReplayRunner(() => worker as unknown as Worker);
 
     const pending = runner.run(request(1));
 
@@ -130,7 +130,7 @@ describe('WorkerReplayRunner', () => {
 
   it('leaves a request outstanding when disposed while it is in flight', async () => {
     const worker = createFakeWorker();
-    const runner = new WorkerReplayRunner(() => worker as unknown as Worker);
+    const runner = createWorkerReplayRunner(() => worker as unknown as Worker);
 
     const pending = runner.run(request(1));
     runner.dispose();
@@ -146,7 +146,7 @@ describe('WorkerReplayRunner', () => {
 
   it('builds a fresh worker for the next request after dispose', () => {
     const factory = vi.fn(() => createFakeWorker() as unknown as Worker);
-    const runner = new WorkerReplayRunner(factory);
+    const runner = createWorkerReplayRunner(factory);
 
     runner.run(request(1));
     runner.dispose();

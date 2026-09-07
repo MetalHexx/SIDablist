@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { ClockStats } from './clock-stats.js';
-import { FrameAccumulator } from './frame-accumulator.js';
+import { createClockStats } from './clock-stats.js';
+import { createFrameAccumulator } from './frame-accumulator.js';
 import { microseconds, milliseconds } from '../units.js';
 
 describe('ClockStats', () => {
   describe('jitterMs', () => {
     it('reports zero rather than dividing by zero before two gaps have landed', () => {
-      const stats = new ClockStats(milliseconds(100));
+      const stats = createClockStats(milliseconds(100));
 
       expect(stats.jitterMs).toBe(0);
       expect(stats.worstGapMs).toBe(0);
@@ -17,7 +17,7 @@ describe('ClockStats', () => {
     });
 
     it('reports no scatter when every gap is the same width', () => {
-      const stats = new ClockStats(milliseconds(100));
+      const stats = createClockStats(milliseconds(100));
 
       for (let i = 0; i < 10; i++) stats.recordGap(milliseconds(5));
 
@@ -26,11 +26,11 @@ describe('ClockStats', () => {
     });
 
     it('rises when a stall widens the scatter, without the worst gap losing the spike to the average', () => {
-      const evenOnly = new ClockStats(milliseconds(1000));
+      const evenOnly = createClockStats(milliseconds(1000));
       for (let i = 0; i < 100; i++) evenOnly.recordGap(milliseconds(5));
       const evenJitter = evenOnly.jitterMs;
 
-      const withStall = new ClockStats(milliseconds(1000));
+      const withStall = createClockStats(milliseconds(1000));
       for (let i = 0; i < 50; i++) withStall.recordGap(milliseconds(5));
       withStall.recordGap(milliseconds(200));
       for (let i = 0; i < 50; i++) withStall.recordGap(milliseconds(5));
@@ -42,7 +42,7 @@ describe('ClockStats', () => {
     });
 
     it('never decays once the worst gap has been set, unlike jitter which is an average', () => {
-      const stats = new ClockStats(milliseconds(1000));
+      const stats = createClockStats(milliseconds(1000));
       for (let i = 0; i < 20; i++) stats.recordGap(milliseconds(5));
       stats.recordGap(milliseconds(300));
       const worstAfterSpike = stats.worstGapMs;
@@ -55,7 +55,7 @@ describe('ClockStats', () => {
 
   describe('lateCallbacks', () => {
     it('counts only gaps past the threshold, separating a spike from a recurring one', () => {
-      const stats = new ClockStats(milliseconds(10));
+      const stats = createClockStats(milliseconds(10));
 
       stats.recordGap(milliseconds(5));
       expect(stats.lateCallbacks).toBe(0);
@@ -69,9 +69,9 @@ describe('ClockStats', () => {
 
   describe('toFrameClockStats', () => {
     it('reports drift near zero when measured time tracks the nominal grid', () => {
-      const accumulator = new FrameAccumulator(microseconds(20000));
+      const accumulator = createFrameAccumulator(microseconds(20000));
       accumulator.advance(microseconds(60000), () => undefined);
-      const stats = new ClockStats(milliseconds(1000));
+      const stats = createClockStats(milliseconds(1000));
 
       const snapshot = stats.toFrameClockStats(accumulator, microseconds(60000));
 
@@ -81,8 +81,8 @@ describe('ClockStats', () => {
     });
 
     it('holds drift bounded rather than letting it accumulate with runtime', () => {
-      const accumulator = new FrameAccumulator(microseconds(20000));
-      const stats = new ClockStats(milliseconds(1000));
+      const accumulator = createFrameAccumulator(microseconds(20000));
+      const stats = createClockStats(milliseconds(1000));
       const gapUs = 7000; // does not divide the interval evenly, so a remainder is always in flight
       let measuredElapsedUs = 0;
 
@@ -109,9 +109,9 @@ describe('ClockStats', () => {
     });
 
     it('reports the measured mean interval as measured elapsed time over frames emitted', () => {
-      const accumulator = new FrameAccumulator(microseconds(20000));
+      const accumulator = createFrameAccumulator(microseconds(20000));
       accumulator.advance(microseconds(100000), () => undefined);
-      const stats = new ClockStats(milliseconds(1000));
+      const stats = createClockStats(milliseconds(1000));
 
       const snapshot = stats.toFrameClockStats(accumulator, microseconds(100000));
 
@@ -119,8 +119,8 @@ describe('ClockStats', () => {
     });
 
     it('reports a zero mean interval rather than dividing by zero before any frame has fallen due', () => {
-      const accumulator = new FrameAccumulator(microseconds(20000));
-      const stats = new ClockStats(milliseconds(1000));
+      const accumulator = createFrameAccumulator(microseconds(20000));
+      const stats = createClockStats(milliseconds(1000));
 
       const snapshot = stats.toFrameClockStats(accumulator, microseconds(500));
 

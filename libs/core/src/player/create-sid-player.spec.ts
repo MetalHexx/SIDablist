@@ -678,6 +678,18 @@ describe('createSidPlayer', () => {
 
       expect(lastDelivered(sink).count).toBe(25);
     });
+
+    it('steps to the next and previous subtune, clamped to the tune range', () => {
+      const { player } = harness();
+      player.loadTune(silentTune(3));
+
+      player.nextSubtune();
+      expect(player.getSnapshot().tune?.subtune).toBe(2);
+
+      player.previousSubtune();
+      player.previousSubtune(); // already at the bottom — clamps rather than wrapping
+      expect(player.getSnapshot().tune?.subtune).toBe(1);
+    });
   });
 
   describe('delivery measurement', () => {

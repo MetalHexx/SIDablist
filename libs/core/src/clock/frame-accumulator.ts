@@ -24,7 +24,40 @@ export const MAX_CATCH_UP_US: Microseconds = microseconds(250_000);
  * Split out from any concrete clock because this is the arithmetic that decides how many frames
  * an elapsed span owes, and it is worth exercising without a timing source in the way.
  */
-export class FrameAccumulator {
+export interface FrameAccumulator {
+  readonly nominalIntervalUs: Microseconds;
+  readonly framesEmitted: Frames;
+  /** The time the emitted frames were supposed to take, summed at the interval in force for each. */
+  readonly nominalElapsedUs: Microseconds;
+  /** @throws {RangeError} when `intervalUs` is not a positive finite number. */
+  setIntervalUs(intervalUs: Microseconds): void;
+  /**
+   * Adds `elapsedUs` of time, clamped to `MAX_CATCH_UP_US`, and fires every frame that now falls
+   * due.
+   *
+   * More than one frame can fall inside a single advance at short intervals, or after a caller
+   * hands over a long measured gap, and they must all fire — so this bursts several ticks back to
+   * back. Absorbing bursts is exactly what a downstream queue is for.
+   *
+   * Each frame reports `lagUs`: how long before the end of the credited span it fell due. That is
+   * exactly what remains in the accumulator once the frame's interval has come out of it, so a
+   * caller holding the time the span ended can place every frame in the burst — one interval apart
+   * rather than all at the instant the advance happened to run.
+   *
+   * Returns whether this call's elapsed time was clamped by `MAX_CATCH_UP_US`. The flag describes
+   * the whole advance rather than any one frame in it, since every frame it releases came from the
+   * same clamped span.
+   */
+  advance(elapsedUs: Microseconds, onFrame: (lagUs: Microseconds) => void): boolean;
+}
+
+/** Builds a `FrameAccumulator` over `intervalUs`. @throws {RangeError} when `intervalUs` is not a
+ *  positive finite number. */
+export function createFrameAccumulator(intervalUs: Microseconds): FrameAccumulator {
+  return new FrameAccumulatorImpl(intervalUs);
+}
+
+class FrameAccumulatorImpl implements FrameAccumulator {
   private intervalUs: Microseconds;
   private accumulatorUs = 0;
   private frameCount = 0;
@@ -43,34 +76,15 @@ export class FrameAccumulator {
     return frames(this.frameCount);
   }
 
-  /** The time the emitted frames were supposed to take, summed at the interval in force for each. */
   get nominalElapsedUs(): Microseconds {
     return microseconds(this.nominalUsEmitted);
   }
 
-  /** @throws {RangeError} when `intervalUs` is not a positive finite number. */
   setIntervalUs(intervalUs: Microseconds): void {
     assertPositiveInterval(intervalUs);
     this.intervalUs = intervalUs;
   }
 
-  /**
-   * Adds `elapsedUs` of time, clamped to `MAX_CATCH_UP_US`, and fires every frame that now falls
-   * due.
-   *
-   * More than one frame can fall inside a single advance at short intervals, or after a caller
-   * hands over a long measured gap, and they must all fire — so this bursts several ticks back to
-   * back. Absorbing bursts is exactly what a downstream queue is for.
-   *
-   * Each frame reports `lagUs`: how long before the end of the credited span it fell due. That is
-   * exactly what remains in the accumulator once the frame's interval has come out of it, so a
-   * caller holding the time the span ended can place every frame in the burst — one interval apart
-   * rather than all at the instant the advance happened to run.
-   *
-   * Returns whether this call's elapsed time was clamped by `MAX_CATCH_UP_US`. The flag describes
-   * the whole advance rather than any one frame in it, since every frame it releases came from the
-   * same clamped span.
-   */
   advance(elapsedUs: Microseconds, onFrame: (lagUs: Microseconds) => void): boolean {
     const catchUpClamped = elapsedUs > MAX_CATCH_UP_US;
     this.accumulatorUs += Math.min(elapsedUs, MAX_CATCH_UP_US);

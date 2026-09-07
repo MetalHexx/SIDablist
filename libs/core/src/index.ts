@@ -36,8 +36,12 @@ export { describeError } from './common/errors.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';
-export { FrameAccumulator, MAX_CATCH_UP_US } from './clock/frame-accumulator.js';
-export { ClockStats, LATE_CALLBACK_FACTOR } from './clock/clock-stats.js';
+export {
+  type FrameAccumulator,
+  MAX_CATCH_UP_US,
+  createFrameAccumulator,
+} from './clock/frame-accumulator.js';
+export { type ClockStats, LATE_CALLBACK_FACTOR, createClockStats } from './clock/clock-stats.js';
 export {
   type PlayRate,
   type TimingMode,
@@ -57,7 +61,7 @@ export {
 } from './replay/replay-runner.js';
 export { type ReplayResult, replayToFrame } from './replay/replay-to-frame.js';
 export { FrameBudgetExceededError, runFramesTo } from './replay/run-frames.js';
-export { WorkerReplayRunner } from './replay/worker-replay-runner.js';
+export { createWorkerReplayRunner } from './replay/worker-replay-runner.js';
 export { type AnchorRing, type PositionAnchor, createAnchorRing } from './timeline/anchor-ring.js';
 export { seekToFrame } from './timeline/seek.js';
 export {
@@ -74,5 +78,10 @@ export {
 export { type SidPlayer } from './player/sid-player.js';
 export { type PlayerSnapshot, type PlayerStats } from './player/snapshot.js';
 export { type PlayerSnapshotStore, createPlayerSnapshotStore } from './player/store.js';
-export { JUMP_CEILING_SECONDS, TuneSession, type TuneSessionHost } from './player/tune-session.js';
+export {
+  JUMP_CEILING_SECONDS,
+  type TuneSession,
+  type TuneSessionHost,
+  createTuneSession,
+} from './player/tune-session.js';
 export { createSidPlayer, type SidPlayerCollaborators } from './player/create-sid-player.js';

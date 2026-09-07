@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { FrameAccumulator, MAX_CATCH_UP_US } from './frame-accumulator.js';
+import { createFrameAccumulator, MAX_CATCH_UP_US } from './frame-accumulator.js';
 import { microseconds } from '../units.js';
 
 describe('FrameAccumulator', () => {
   it('emits nothing until a whole interval has accumulated', () => {
-    const accumulator = new FrameAccumulator(microseconds(20000));
+    const accumulator = createFrameAccumulator(microseconds(20000));
     let frames = 0;
 
     accumulator.advance(microseconds(19999), () => frames++);
@@ -14,7 +14,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('emits every frame that falls inside one span when the interval is the shorter of the two', () => {
-    const accumulator = new FrameAccumulator(microseconds(1000));
+    const accumulator = createFrameAccumulator(microseconds(1000));
     let frames = 0;
 
     accumulator.advance(microseconds(5333), () => frames++);
@@ -24,7 +24,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('carries the remainder across advances rather than resetting it', () => {
-    const accumulator = new FrameAccumulator(microseconds(20000));
+    const accumulator = createFrameAccumulator(microseconds(20000));
     let frames = 0;
     const tick = () => frames++;
 
@@ -40,7 +40,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('applies a new interval on the next advance without dropping the accumulator', () => {
-    const accumulator = new FrameAccumulator(microseconds(1000));
+    const accumulator = createFrameAccumulator(microseconds(1000));
     let frames = 0;
     const tick = () => frames++;
 
@@ -56,7 +56,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('accounts nominal elapsed time at the interval in force for each frame', () => {
-    const accumulator = new FrameAccumulator(microseconds(1000));
+    const accumulator = createFrameAccumulator(microseconds(1000));
     const tick = () => undefined;
 
     accumulator.advance(microseconds(2000), tick);
@@ -68,7 +68,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('reports a frame that lands on the end of the credited span as due right then', () => {
-    const accumulator = new FrameAccumulator(microseconds(20000));
+    const accumulator = createFrameAccumulator(microseconds(20000));
     const lags: number[] = [];
 
     accumulator.advance(microseconds(20000), (lagUs) => lags.push(lagUs));
@@ -77,7 +77,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('reports how late a frame already was when the advance that released it ran', () => {
-    const accumulator = new FrameAccumulator(microseconds(20000));
+    const accumulator = createFrameAccumulator(microseconds(20000));
     const lags: number[] = [];
 
     accumulator.advance(microseconds(25000), (lagUs) => lags.push(lagUs));
@@ -86,7 +86,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('spaces two frames released by one advance an interval apart, both in the past', () => {
-    const accumulator = new FrameAccumulator(microseconds(20000));
+    const accumulator = createFrameAccumulator(microseconds(20000));
     const lags: number[] = [];
 
     // 45 ms banked at a 20 ms interval: the first frame fell due 25 ms before this advance ran, the
@@ -98,7 +98,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('measures lag against the interval in force when each frame fell due', () => {
-    const accumulator = new FrameAccumulator(microseconds(1000));
+    const accumulator = createFrameAccumulator(microseconds(1000));
     const lags: number[] = [];
     const record = (lagUs: number) => lags.push(lagUs);
 
@@ -111,7 +111,7 @@ describe('FrameAccumulator', () => {
   });
 
   it('spreads the catch-up a stall owes across the gap instead of stacking it at the end', () => {
-    const accumulator = new FrameAccumulator(microseconds(10000));
+    const accumulator = createFrameAccumulator(microseconds(10000));
     const lags: number[] = [];
 
     // The shape a long callback gap hands over: four frames owed, oldest first, evenly spaced and
@@ -122,15 +122,15 @@ describe('FrameAccumulator', () => {
   });
 
   it('rejects an interval that would never elapse', () => {
-    expect(() => new FrameAccumulator(microseconds(0))).toThrow(RangeError);
+    expect(() => createFrameAccumulator(microseconds(0))).toThrow(RangeError);
     expect(() =>
-      new FrameAccumulator(microseconds(1000)).setIntervalUs(microseconds(Number.NaN)),
+      createFrameAccumulator(microseconds(1000)).setIntervalUs(microseconds(Number.NaN)),
     ).toThrow(RangeError);
   });
 
   describe('catch-up clamp', () => {
     it('does not clamp elapsed time within the ceiling', () => {
-      const accumulator = new FrameAccumulator(microseconds(10000));
+      const accumulator = createFrameAccumulator(microseconds(10000));
 
       const clamped = accumulator.advance(microseconds(45000), () => undefined);
 
@@ -138,7 +138,7 @@ describe('FrameAccumulator', () => {
     });
 
     it('caps a very long stall to the ceiling rather than flooding the burst with frames', () => {
-      const accumulator = new FrameAccumulator(microseconds(10000));
+      const accumulator = createFrameAccumulator(microseconds(10000));
       let frames = 0;
 
       // Five seconds of elapsed time: only MAX_CATCH_UP_US of it may be credited.
@@ -149,7 +149,7 @@ describe('FrameAccumulator', () => {
     });
 
     it('is trustworthy again on the next advance once the stall has passed', () => {
-      const accumulator = new FrameAccumulator(microseconds(10000));
+      const accumulator = createFrameAccumulator(microseconds(10000));
 
       const stalled = accumulator.advance(microseconds(5_000_000), () => undefined);
       const healthy = accumulator.advance(microseconds(10000), () => undefined);

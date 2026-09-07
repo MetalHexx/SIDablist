@@ -32,7 +32,8 @@ import type { SidPlayer } from './sid-player.js';
 import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
-import { TuneSession } from './tune-session.js';
+import { createTuneSession } from './tune-session.js';
+import type { TuneSession } from './tune-session.js';
 
 /**
  * The widest backward walk a seek target can carry, in real time — what the anchor ring is spaced
@@ -138,7 +139,7 @@ class SidPlayerCoordinator implements SidPlayer {
   constructor(collaborators: SidPlayerCollaborators) {
     this.sink = collaborators.sink;
     this.clock = collaborators.clock;
-    this.session = new TuneSession(collaborators.replayRunner, {
+    this.session = createTuneSession(collaborators.replayRunner, {
       nominalIntervalUs: () => this.nominalIntervalUs,
       playRate: () => this.playRate(),
       syncPlayRate: (machine) => {
@@ -329,6 +330,16 @@ class SidPlayerCoordinator implements SidPlayer {
     // The entry image describes a machine the re-init has just replaced.
     this.dropTrackLoopEntry();
     void this.captureTrackLoopEntry();
+  }
+
+  /** Routes through `selectSubtune` rather than `session.nextSubtune()` directly, so a step still
+   *  drops and recaptures the track loop's entry image exactly as any other subtune change does. */
+  nextSubtune(): void {
+    this.selectSubtune(this.session.currentSubtune + 1);
+  }
+
+  previousSubtune(): void {
+    this.selectSubtune(this.session.currentSubtune - 1);
   }
 
   setActiveLoop(loop: ActiveLoop): void {

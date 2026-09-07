@@ -12,11 +12,17 @@ const defaultWorkerFactory = (): Worker =>
  * be in flight and only the newest one is wanted. The worker is constructed through
  * `workerFactory`, so a Node test never touches `Worker`.
  */
-export class WorkerReplayRunner implements ReplayRunner {
+export function createWorkerReplayRunner(
+  workerFactory: () => Worker = defaultWorkerFactory,
+): ReplayRunner {
+  return new WorkerReplayRunnerImpl(workerFactory);
+}
+
+class WorkerReplayRunnerImpl implements ReplayRunner {
   private worker: Worker | null = null;
   private readonly pending = new Map<number, (response: ReplayResponse) => void>();
 
-  constructor(private readonly workerFactory: () => Worker = defaultWorkerFactory) {}
+  constructor(private readonly workerFactory: () => Worker) {}
 
   run(request: ReplayRequest): Promise<ReplayResponse> {
     const worker = this.ensureWorker();
