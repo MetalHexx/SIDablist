@@ -73,6 +73,9 @@ pnpm --filter @sidablist/asid typecheck
 
 - [`docs/architecture.md`](../../docs/architecture.md) — the sink/transport seam and why the
   contract is shaped the way it is.
+- [`docs/writing-a-sink.md`](../../docs/writing-a-sink.md) — the `SidSink` contract this sink
+  implements, member by member, with this package's own `sink/conformance.spec.ts` as the worked
+  example. Read it before adding a second sink, or before changing what this one promises core.
 - [`AGENTS.md`](../../AGENTS.md) — the root map and the invariants no single library owns.
 - [`libs/core/AGENTS.md`](../core/AGENTS.md) — the timeline engine this sink implements a contract
   for.

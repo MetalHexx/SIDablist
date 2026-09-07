@@ -104,6 +104,12 @@ pnpm --filter @sidablist/core typecheck
 
 - [`docs/architecture.md`](../../docs/architecture.md) — the _why_ behind every hazard and
   convention above.
+- [`docs/writing-a-sink.md`](../../docs/writing-a-sink.md) — the `SidSink` contract member by
+  member. Read it before changing `ports/sink.ts` or `conformance/cases.ts`, or when a capability
+  gap surfaces that `SinkCapabilities` does not yet describe.
+- [`docs/pal-ntsc.md`](../../docs/pal-ntsc.md) — the pitch-correction derivation and the high-byte
+  trap. Read it before touching `registers/clock-ratio.ts` or the frequency-scaling path in
+  `registers/register-frame.ts`.
 - [`AGENTS.md`](../../AGENTS.md) — the root map and the invariants no single library owns.
 - [`libs/asid/AGENTS.md`](../asid/AGENTS.md) — the sink that implements a contract against this
   library.
