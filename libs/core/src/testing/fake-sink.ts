@@ -7,6 +7,7 @@ const DEFAULT_CAPABILITIES: SinkCapabilities = {
   perWriteOffsets: false,
   cancellation: false,
   scheduleAheadMs: null,
+  preservesWriteOrder: false,
 };
 
 /** One call to `deliver`, recorded with the frame copied out of its reused buffers. */

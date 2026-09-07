@@ -8,6 +8,9 @@ const REFERENCE_CAPABILITIES: SinkCapabilities = {
   perWriteOffsets: false,
   cancellation: false,
   scheduleAheadMs: null,
+  // `SchedulingFakeSink.deliver` unrolls a frame straight onto its wire in arrival order, so it
+  // genuinely earns this claim — unlike ASID's slot-packed wire, which cannot.
+  preservesWriteOrder: true,
 };
 
 interface Write {

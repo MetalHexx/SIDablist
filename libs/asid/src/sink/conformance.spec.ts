@@ -103,27 +103,14 @@ function makeHarness(): ConformanceHarness {
   const sink = createAsidSink(port);
   let lastResetIndex = 0; // Track which packets were sent after the last reset
 
-  // Wrap deliver to send individual writes as separate packets to preserve write order.
-  // This ensures the conformance suite can verify that write ordering is preserved.
-  const originalDeliver = sink.deliver.bind(sink);
-  sink.deliver = function (frame, frameNumber, dueAtMs, catchUpClamped) {
-    // Send each write as a separate single-write frame packet to preserve order
-    for (let i = 0; i < frame.count; i++) {
-      const singleWriteFrame = {
-        count: 1,
-        registers: Uint8Array.from([frame.registers[i]]),
-        values: Uint8Array.from([frame.values[i]]),
-        offsetsUs: new Int32Array(1),
-      };
-      originalDeliver(singleWriteFrame, frameNumber, dueAtMs, catchUpClamped);
-    }
-  };
-
-  // Wrap reset to clear pending scheduled packets
+  // `reset()` runs unmodified; this only tracks, for `emitted()`, which of the fake port's
+  // already-recorded sends belong to the run started after the last reset. A real transport has
+  // no equivalent "forget what you already logged" operation, so this bookkeeping is the
+  // harness's alone — it does not change what `AsidSinkImpl.reset()` does.
   const originalReset = sink.reset.bind(sink);
   sink.reset = function () {
     originalReset();
-    lastResetIndex = port.sent.length; // Future packets start from here
+    lastResetIndex = port.sent.length;
   };
 
   return {

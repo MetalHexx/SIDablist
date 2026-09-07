@@ -2,7 +2,7 @@ import type { SidSink } from '../ports/sink.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import { SID_VOLUME_REGISTER, VOICE_CONTROL_REGISTERS } from '../registers/sid-constants.js';
 import { frames, microseconds, milliseconds } from '../units.js';
-import { assertEqual, assertOrdered } from './assert.js';
+import { assertEqual, assertOrdered, assertSameMultiset } from './assert.js';
 
 /** What a consumer hands the suite: a fresh sink, plus a reader for what it has emitted.
  *  `emitted()` returns one entry per write the sink actually put on its wire, in order —
@@ -44,6 +44,11 @@ const preservesWriteOrdering: ConformanceCase = {
   run(makeHarness) {
     const harness = makeHarness();
     harness.sink.begin({ chipModel: 'mos6581' });
+    // A sink that packs a whole frame into one fixed-layout snapshot cannot represent
+    // cross-register arrival order on its wire at all — nothing to prove here for it. Its own
+    // specs are where a slot-based encoding proves the narrower, protocol-specific guarantee this
+    // case bundles in for a streaming sink: that a register written twice keeps its two values.
+    if (!harness.sink.capabilities.preservesWriteOrder) return;
     const writes: Write[] = [
       { register: GATE_REGISTER, value: 0x21 },
       { register: SID_VOLUME_REGISTER, value: 0x0f },
@@ -153,7 +158,13 @@ const honorsNoPerWriteOffsetsOnDeliver: ConformanceCase = {
     ];
     harness.sink.deliver(frame(writes), frames(0), milliseconds(0), false);
     harness.advanceMs(100);
-    assertEqual(
+    // Exact order is only meaningful for a sink that can represent cross-register arrival order
+    // on its wire in the first place (see `preservesWriteOrdering`); either way, none of the
+    // writes may go missing.
+    const assertDelivered = harness.sink.capabilities.preservesWriteOrder
+      ? assertEqual
+      : assertSameMultiset;
+    assertDelivered(
       harness.emitted(),
       writes,
       'a sink without per-write-offset support must still deliver every write in the frame',

@@ -45,6 +45,21 @@ export function assertOrdered(
   }
 }
 
+/** Throws unless `actual` and `expected` contain the same items, counting duplicates, regardless
+ *  of order. For a sink that reports it cannot preserve cross-register write order — only that
+ *  every write still reached the wire, not in what sequence. */
+export function assertSameMultiset(actual: unknown, expected: unknown, message?: string): void {
+  if (!Array.isArray(actual) || !Array.isArray(expected)) {
+    throw new Error(
+      message ??
+        `expected two arrays, got ${JSON.stringify(actual)} and ${JSON.stringify(expected)}`,
+    );
+  }
+  const sorted = (items: readonly unknown[]) =>
+    [...items].map((item) => JSON.stringify(item)).sort();
+  assertEqual(sorted(actual), sorted(expected), message);
+}
+
 /** Throws unless calling `fn` itself throws. */
 export function assertThrows(fn: () => unknown, message?: string): void {
   try {

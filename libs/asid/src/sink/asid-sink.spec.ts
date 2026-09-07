@@ -127,6 +127,7 @@ describe('createAsidSink', () => {
         perWriteOffsets: false,
         cancellation: true,
         scheduleAheadMs: 150,
+        preservesWriteOrder: false,
       });
     });
   });

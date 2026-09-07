@@ -759,7 +759,12 @@ describe('createSidPlayer', () => {
     it("reads the sink's own counters through instead of recounting them", async () => {
       const { player, sink, clock } = harness();
       sink.setConsumption({ kind: 'known', consumedThroughFrame: frames(2), inFlight: 4 });
-      sink.setCapabilities({ perWriteOffsets: true, cancellation: true, scheduleAheadMs: null });
+      sink.setCapabilities({
+        perWriteOffsets: true,
+        cancellation: true,
+        scheduleAheadMs: null,
+        preservesWriteOrder: true,
+      });
       player.loadTune(silentTune());
       await player.play();
       run(clock, 3);

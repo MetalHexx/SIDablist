@@ -82,6 +82,10 @@ class AsidSinkImpl implements AsidSink {
       perWriteOffsets: false, // ASID has no per-write time offset on the wire
       cancellation: this.port.supportsCancel, // can flip on a port swap or reconnect
       scheduleAheadMs: this.effectiveScheduleAheadMs(), // the clamped value, not the requested one
+      // One SID_DATA packet carries a whole frame's present/value slots in the firmware's fixed
+      // slot order (`ASID_SLOT_TO_REGISTER`) — the far end applies them in that order regardless
+      // of the order the writes arrived in, so cross-register arrival order never reaches the wire.
+      preservesWriteOrder: false,
     };
   }
 

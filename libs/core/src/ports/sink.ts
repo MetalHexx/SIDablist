@@ -12,6 +12,12 @@ export interface SinkCapabilities {
   readonly cancellation: boolean;
   /** How far ahead the sink will accept frames, if it has an opinion. */
   readonly scheduleAheadMs: Milliseconds | null;
+  /** Whether the sink preserves the arrival order of writes to two *different* registers made
+   *  within one delivered frame. A sink that streams one wire message per write can; one that
+   *  packs a whole frame into a single fixed-layout snapshot — ASID's present/value slots, applied
+   *  by the far end in the layout's own slot order — cannot, because cross-register arrival order
+   *  is simply not representable on that wire. */
+  readonly preservesWriteOrder: boolean;
 }
 
 /** What the far end has consumed. `'unknown'` is a legitimate answer, not a failure —
