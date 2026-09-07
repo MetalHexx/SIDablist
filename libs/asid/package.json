@@ -12,6 +12,15 @@
       "import": "./dist/web-midi/index.js"
     }
   },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "web-midi": [
+        "./dist/web-midi/index.d.ts"
+      ]
+    }
+  },
   "files": [
     "dist"
   ],
