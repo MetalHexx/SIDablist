@@ -12,9 +12,10 @@ the writes. Nothing here synthesizes sound.
 
 Filled in as libraries land — a module missing from this table is a module no agent will route to.
 
-| Module | Owns | Detail |
-|---|---|---|
-| _none yet_ | | |
+| Module      | Owns                                                                                                  | Detail                                         |
+| ----------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `libs/core` | The timeline engine: running a tune's own 6502 code and turning its register writes into `SidFrame`s. | [`libs/core/AGENTS.md`](./libs/core/AGENTS.md) |
+| `libs/asid` | The ASID wire format and its MIDI scheduling — one `SidSink` implementation.                          | [`libs/asid/AGENTS.md`](./libs/asid/AGENTS.md) |
 
 ## Invariants
 
@@ -22,7 +23,7 @@ These hold across every module, and no single module can own them.
 
 ### `libs/core` has zero runtime dependencies
 
-Not an aspiration — a checked property. CI builds *and tests* `core` with nothing else installed.
+Not an aspiration — a checked property. CI builds _and tests_ `core` with nothing else installed.
 If a change to core seems to need a package, either the change is wrong or the boundary moved, and
 moving the boundary is a decision rather than an import.
 
@@ -64,13 +65,12 @@ and states that it has been modified — so nobody attributes our bugs upstream.
 
 ## Commands
 
-Land with the first library.
-
 ```
 pnpm install
 pnpm build
 pnpm test
 pnpm lint
+pnpm typecheck
 ```
 
 ## Commits
@@ -80,11 +80,11 @@ pnpm lint
 
 ## Instruction files
 
-| File | Role |
-|---|---|
-| `AGENTS.md` | This file, plus one per library. Authoritative. |
-| `CLAUDE.md` | Thin — surfaces the essentials and points here. |
-| `docs/` | Long-form explanation: architecture, writing a sink, the PAL/NTSC correction. |
+| File        | Role                                                                          |
+| ----------- | ----------------------------------------------------------------------------- |
+| `AGENTS.md` | This file, plus one per library. Authoritative.                               |
+| `CLAUDE.md` | Thin — surfaces the essentials and points here.                               |
+| `docs/`     | Long-form explanation: architecture, writing a sink, the PAL/NTSC correction. |
 
 Creating or restructuring any `AGENTS.md`, standing up a new library, or sweeping the set for
 drift follows [`.claude/skills/agents-md/SKILL.md`](./.claude/skills/agents-md/SKILL.md). Do not
@@ -92,7 +92,7 @@ improvise the format.
 
 ## Further reading
 
-- [`docs/architecture.md`](./docs/architecture.md) — the *why* behind every invariant above: the
+- [`docs/architecture.md`](./docs/architecture.md) — the _why_ behind every invariant above: the
   premise, why the dependency arrows point one way, the two seams, how a consumer reads core, and
   the PAL/NTSC correction. Read it before restructuring a library, adding one, or drawing a new
   boundary — not for a routine edit.
