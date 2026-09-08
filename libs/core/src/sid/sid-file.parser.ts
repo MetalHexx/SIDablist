@@ -2,6 +2,12 @@ import type { SidClock, SidFile, SidModel } from './sid-file.model.js';
 import { SidParseError } from './sid-file.model.js';
 
 const MIN_HEADER_BYTES = 0x08; // magic(4) + version(2) + dataOffset(2) — enough to locate the rest
+// The fixed numeric fields (load/init/play address, songs, startSong, speed) are read unconditionally
+// for every version and end at 0x16 — a file shorter than this throws a native RangeError out of
+// DataView, not the documented SidParseError, if only the 8-byte check above gates it.
+const MIN_HEADER_BYTES_V1 = 0x16;
+// Version 2+ additionally reads the flags field, ending at 0x78.
+const MIN_HEADER_BYTES_V2 = 0x78;
 
 const OFFSET_VERSION = 0x04;
 const OFFSET_DATA_OFFSET = 0x06;
@@ -35,6 +41,13 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
   const version = view.getUint16(OFFSET_VERSION, false);
   if (version < 1 || version > 4) {
     throw new SidParseError(`unsupported SID version ${version} — expected 1-4`);
+  }
+
+  const minHeaderBytes = version >= 2 ? MIN_HEADER_BYTES_V2 : MIN_HEADER_BYTES_V1;
+  if (bytes.length < minHeaderBytes) {
+    throw new SidParseError(
+      `truncated SID file: a version ${version} header needs at least ${minHeaderBytes} bytes but the file is only ${bytes.length} bytes`,
+    );
   }
 
   const dataOffset = view.getUint16(OFFSET_DATA_OFFSET, false);

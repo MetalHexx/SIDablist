@@ -9,8 +9,8 @@
     "test:ui": "pnpm -r run test:ui",
     "lint": "eslint .",
     "typecheck": "pnpm -r run typecheck",
-    "format": "pnpm -r run format",
-    "format:check": "pnpm -r run format:check",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "prepare": "husky"
   },
   "devDependencies": {

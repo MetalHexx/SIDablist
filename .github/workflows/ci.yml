@@ -34,6 +34,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build before validating: asid resolves @sidablist/core through package exports that point at
+      # dist/, which is gitignored and does not exist on a fresh checkout. Typecheck and test both
+      # cross that resolution, so they cannot run first. pnpm -r run build is dependency-ordered, so
+      # core always builds before asid regardless of package.json listing order.
+      - name: Build
+        run: pnpm run build
+
       - name: Lint
         run: pnpm run lint
 
@@ -42,9 +49,6 @@ jobs:
 
       - name: Test
         run: pnpm run test
-
-      - name: Build
-        run: pnpm run build
 
       - name: Lint package publish contents (publint)
         run: pnpm -r exec publint run .

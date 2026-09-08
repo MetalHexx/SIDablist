@@ -77,8 +77,10 @@ export interface SidSink {
   /** Re-times or withdraws whatever is still outstanding after a tempo change.
    *  A sink with no scheduling of its own implements this as a no-op. */
   retime(intervalUs: Microseconds): void;
-  /** Drops everything outstanding without playing it. Does not itself stop the far end —
-   *  that is `end()`, and the two are separate because a seek resets without stopping. */
+  /** Drops everything outstanding without playing it, best-effort: a sink whose transport cannot
+   *  withdraw an already-handed-over send has no way to make it not arrive, and reports it as no
+   *  longer in-flight rather than claim a withdrawal that did not happen. Does not itself stop the
+   *  far end — that is `end()`, and the two are separate because a seek resets without stopping. */
   reset(): void;
   readAt(): FarEndConsumption;
 }

@@ -578,7 +578,13 @@ class SidPlayerCoordinator implements SidPlayer {
     }
   }
 
+  /** Gain is documented as 0…1; a non-finite or out-of-range value would scale a register to NaN,
+   *  which a typed-array write silently coerces to 0 and mutes the channel instead of erroring. */
   setOutputGain(gain: number): void {
+    if (!Number.isFinite(gain) || gain < 0 || gain > 1) {
+      console.warn(`SID player: ignoring an output gain of ${gain} (must be 0…1).`);
+      return;
+    }
     this.outputGain = gain;
     this.session.frame?.setOutputGain(gain);
   }

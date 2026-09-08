@@ -116,6 +116,43 @@ describe('WorkerReplayRunner', () => {
     });
   });
 
+  it('retires a worker that errors, terminating it and building a fresh one for the next request', () => {
+    const workers: FakeWorker[] = [];
+    const factory = vi.fn(() => {
+      const worker = createFakeWorker();
+      workers.push(worker);
+      return worker as unknown as Worker;
+    });
+    const runner = createWorkerReplayRunner(factory);
+
+    runner.run(request(1));
+    workers[0].onerror?.({} as ErrorEvent);
+    expect(workers[0].terminate).toHaveBeenCalledTimes(1);
+
+    runner.run(request(2));
+
+    expect(factory).toHaveBeenCalledTimes(2);
+  });
+
+  it('never lets a request after a worker error hang on the dead worker', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = vi.fn(() => {
+      const worker = createFakeWorker();
+      workers.push(worker);
+      return worker as unknown as Worker;
+    });
+    const runner = createWorkerReplayRunner(factory);
+
+    runner.run(request(1));
+    workers[0].onerror?.({} as ErrorEvent);
+
+    const second = runner.run(request(2));
+    deliver(workers[1], okResponse(2));
+
+    await expect(second).resolves.toEqual(okResponse(2));
+    expect(workers[1].postMessage).toHaveBeenCalledWith(request(2));
+  });
+
   it('discards a response for an id that is no longer awaited, without disturbing what is', async () => {
     const worker = createFakeWorker();
     const runner = createWorkerReplayRunner(() => worker as unknown as Worker);

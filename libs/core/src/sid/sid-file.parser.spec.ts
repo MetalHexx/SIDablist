@@ -195,6 +195,39 @@ describe('parseSidFile', () => {
     expect(() => parseSidFile(new Uint8Array([0x50, 0x53, 0x49]))).toThrow(SidParseError);
   });
 
+  it('rejects a truncated file whose declared dataOffset is small enough to pass that check alone', () => {
+    // 8 bytes: valid magic/version/dataOffset, but far short of the fixed fields the parser reads
+    // unconditionally (through 0x16). Without a version-aware minimum, this reaches DataView reads
+    // past the buffer and throws a native RangeError instead of the documented SidParseError.
+    const bytes = new Uint8Array(8);
+    writeAscii(bytes, 0x00, 'PSID');
+    new DataView(bytes.buffer).setUint16(0x04, 2, false); // version 2
+    new DataView(bytes.buffer).setUint16(0x06, 8, false); // dataOffset == bytes.length
+    expect(() => parseSidFile(bytes)).toThrow(SidParseError);
+  });
+
+  it('rejects a v2+ file too short for the flags field even though the fixed fields fit', () => {
+    // 0x16 bytes covers load/init/play/songs/startSong/speed, but version 2 also reads flags at
+    // 0x76, which this buffer doesn't reach.
+    const bytes = new Uint8Array(0x16);
+    writeAscii(bytes, 0x00, 'PSID');
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0x04, 2, false); // version 2
+    view.setUint16(0x06, 0x16, false); // dataOffset == bytes.length
+    expect(() => parseSidFile(bytes)).toThrow(SidParseError);
+  });
+
+  it('accepts a v1 file with no more than the fixed fields (v1 never reads the flags field)', () => {
+    const bytes = new Uint8Array(0x16 + 3);
+    writeAscii(bytes, 0x00, 'PSID');
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0x04, 1, false); // version 1
+    view.setUint16(0x06, 0x16, false); // dataOffset == header size, 3-byte payload follows
+    view.setUint16(0x08, 0x1000, false); // loadAddress
+    bytes.set([0xa9, 0x00, 0x60], 0x16);
+    expect(() => parseSidFile(bytes)).not.toThrow();
+  });
+
   it('rejects an embedded-load-address file whose payload is too short to hold the address', () => {
     const bytes = buildSidFileBytes({ loadAddress: 0, payload: [] });
     expect(() => parseSidFile(bytes)).toThrow(SidParseError);

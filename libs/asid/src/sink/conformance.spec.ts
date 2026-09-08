@@ -15,18 +15,28 @@ interface SentPacket {
   readonly timestampMs: number | undefined;
 }
 
-/** Fake MIDI port for conformance testing. */
+/** Fake MIDI port for conformance testing. `supportsCancel` is true so the suite exercises the
+ *  real withdrawal path `AsidSink.reset()`/`retime()` depend on — `cancelPending()` here actually
+ *  removes not-yet-due sends rather than merely reporting success, so a sink that skipped calling
+ *  it would still show the stale packet once its due time passed. */
 class FakeMidiOutputPort implements MidiOutputPort {
   portId: string | null = 'port-1';
-  supportsCancel = false;
-  readonly sent: SentPacket[] = [];
+  supportsCancel = true;
+  sent: SentPacket[] = [];
+
+  constructor(private readonly nowMs: () => number) {}
 
   send(bytes: Uint8Array, timestampMs?: number): void {
     this.sent.push({ bytes: Uint8Array.from(bytes), timestampMs });
   }
 
   cancelPending(): boolean {
-    return false;
+    const now = this.nowMs();
+    const before = this.sent.length;
+    this.sent = this.sent.filter(
+      (packet) => packet.timestampMs === undefined || packet.timestampMs <= now,
+    );
+    return this.sent.length < before;
   }
 }
 
@@ -99,27 +109,17 @@ function decodeSidDataPacket(
 let mockNow = 0;
 
 function makeHarness(): ConformanceHarness {
-  const port = new FakeMidiOutputPort();
+  const port = new FakeMidiOutputPort(() => mockNow);
   const sink = createAsidSink(port);
-  let lastResetIndex = 0; // Track which packets were sent after the last reset
-
-  // `reset()` runs unmodified; this only tracks, for `emitted()`, which of the fake port's
-  // already-recorded sends belong to the run started after the last reset. A real transport has
-  // no equivalent "forget what you already logged" operation, so this bookkeeping is the
-  // harness's alone — it does not change what `AsidSinkImpl.reset()` does.
-  const originalReset = sink.reset.bind(sink);
-  sink.reset = function () {
-    originalReset();
-    lastResetIndex = port.sent.length;
-  };
 
   return {
     sink,
     emitted: () => {
-      // Filter to only SID data packets that have been delivered by current time,
-      // excluding packets sent before the last reset.
+      // Filter to only SID data packets that have been delivered by current time. A reset or a
+      // successful cancel actually removes not-yet-due entries from `port.sent` (see
+      // `FakeMidiOutputPort.cancelPending`), so no separate "since the last reset" bookkeeping is
+      // needed here — what's left in `port.sent` is what the transport genuinely still holds.
       return port.sent
-        .slice(lastResetIndex)
         .filter(
           (packet) =>
             packet.bytes.length >= 12 &&

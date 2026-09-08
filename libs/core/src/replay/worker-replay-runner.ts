@@ -57,6 +57,13 @@ class WorkerReplayRunnerImpl implements ReplayRunner {
         resolve({ id, ok: false, error: 'the replay worker stopped responding' });
       }
       this.pending.clear();
+      // Retire this instance — otherwise the next run() reuses a worker that already failed, and
+      // its promise can be left unresolved forever, the exact failure mode this handler exists to
+      // prevent.
+      worker.terminate();
+      if (this.worker === worker) {
+        this.worker = null;
+      }
     };
     this.worker = worker;
     return worker;

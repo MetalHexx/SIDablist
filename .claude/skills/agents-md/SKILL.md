@@ -20,14 +20,14 @@ pre-standard and will teach you the wrong shape.
 **If the code changed, would this sentence need to change?**
 
 - **Yes** → it describes behavior. The code is the better source. Cut it, or move it to
-  `docs/internals/` if the *why* is worth preserving.
+  `docs/internals/` if the _why_ is worth preserving.
 - **No** → it is a convention, a boundary, or a hazard. It belongs here.
 
 Conventions outlive implementations. Behavior descriptions do not — they rot silently, and nothing
 tests them.
 
-Stated from the reader's side: an `AGENTS.md` answers ***"what would I get wrong?"***, never
-***"what does this do?"***
+Stated from the reader's side: an `AGENTS.md` answers _**"what would I get wrong?"**_, never
+_**"what does this do?"**_
 
 The failure this prevents is specific and it has already happened here. `ui/AGENTS.md` accumulated
 feature write-ups — one section ran seventy lines describing a UI feature that has its own
@@ -41,19 +41,19 @@ not need loaded, duplicating a page that explains it better.
 Four surfaces. Getting this wrong is the most common mistake, and it produces the same content in
 two places, which then disagree.
 
-| Surface | Addressing | Holds |
-|---|---|---|
-| Root `AGENTS.md` | Positional, **always-on** | The map, and invariants no single module can own |
-| Module `AGENTS.md` | Positional, when working in that module | Local conventions, hazards, commands, **co-change edges** |
-| `docs/internals/` | Referential, on demand | How and why a subsystem is shaped this way. Cites source paths freely |
-| `CONTRIBUTING.md` | Referential, on demand | Process — how a change moves from idea to merged and released |
+| Surface            | Addressing                              | Holds                                                                 |
+| ------------------ | --------------------------------------- | --------------------------------------------------------------------- |
+| Root `AGENTS.md`   | Positional, **always-on**               | The map, and invariants no single module can own                      |
+| Module `AGENTS.md` | Positional, when working in that module | Local conventions, hazards, commands, **co-change edges**             |
+| `docs/internals/`  | Referential, on demand                  | How and why a subsystem is shaped this way. Cites source paths freely |
+| `CONTRIBUTING.md`  | Referential, on demand                  | Process — how a change moves from idea to merged and released         |
 
 The test between the two `AGENTS.md` rows: **can any single module own this rule?** If yes it goes in
 that module. If it only makes sense across modules, root owns it.
 
-The test between `AGENTS.md` and `docs/internals/`: **prescriptive or descriptive?** *"Never import
-`cli/` from `ui/`"* is prescriptive — module file. *"The dashboard shells out to the CLI because the
-engine has not been extracted into a library yet"* is descriptive — internals.
+The test between `AGENTS.md` and `docs/internals/`: **prescriptive or descriptive?** _"Never import
+`cli/` from `ui/`"_ is prescriptive — module file. _"The dashboard shells out to the CLI because the
+engine has not been extracted into a library yet"_ is descriptive — internals.
 
 **Never restate across the boundary.** If a sentence would be equally at home in the module's
 `AGENTS.md`, it belongs there and the internals page should link to it instead.
@@ -69,15 +69,15 @@ links the other — and that link is not decoration.
 was worth keeping at all, is on that page. Cut the explanation and drop the link and you have not
 moved the content, you have deleted it: the next agent has no signal it ever existed.
 
-- **Name it at the top**, directly under the purpose sentence, not only in *Further reading*. The
+- **Name it at the top**, directly under the purpose sentence, not only in _Further reading_. The
   reader who needs it most is the one who just noticed the explanation is not here — and they are at
   the top of the file.
 - **Say when to follow it** — before restructuring the module, or for a change that spans modules;
   not for a routine edit. Without that clause the link is either ignored or treated as mandatory
   reading, and both are wrong.
-- **The page names the module file back**, in its *Module contracts* section. That half usually
+- **The page names the module file back**, in its _Module contracts_ section. That half usually
   already exists.
-- **Check root's map.** The Modules table's *Detail* column is the third route in. A page reachable
+- **Check root's map.** The Modules table's _Detail_ column is the third route in. A page reachable
   only from the module file is invisible to an agent still deciding where to go.
 
 **A link is not a load.** Module `AGENTS.md` files are positional — they cost context only while you
@@ -128,8 +128,8 @@ on a `docs/internals/` page.
 
 **Never trim to hit a number.** These earn their space at any length, and cutting them is the worse
 failure: hazards that already bit someone; co-change edges, consequence clause included; the
-`docs/internals/` link and its when-to-follow clause; and recorded known deviations — *"the idiom is
-X; `a.ts` and `b.ts` do Y"* — which read like cruft and are load-bearing.
+`docs/internals/` link and its when-to-follow clause; and recorded known deviations — _"the idiom is
+X; `a.ts` and `b.ts` do Y"_ — which read like cruft and are load-bearing.
 
 The test that works at any length: **what fraction of this file would need editing in the same PR as
 a code change?** Near zero is healthy. High is rotting, at ninety lines or three hundred.
@@ -145,12 +145,12 @@ file and will keep it current.
 
 Every edge has four parts:
 
-| Part | Job |
-|---|---|
-| **Trigger** | The specific kind of change that fires this. Not "changes here" |
+| Part            | Job                                                             |
+| --------------- | --------------------------------------------------------------- |
+| **Trigger**     | The specific kind of change that fires this. Not "changes here" |
 | **Consequence** | What breaks if it is ignored. **This is the load-bearing part** |
-| **Action** | The concrete thing to do |
-| **Link** | Where to go for detail |
+| **Action**      | The concrete thing to do                                        |
+| **Link**        | Where to go for detail                                          |
 
 The consequence clause is what converts a pointer into a requirement. Without it an agent reads a
 cross-reference, weighs the cost of another file read, and moves on.
@@ -190,14 +190,14 @@ not real co-change relationships — they are just things that are nearby.
 2. **Declare its outbound edges** — what must move when this module moves.
 3. **Add a row to root `AGENTS.md`'s Modules table.** A module missing from the map is a module no
    agent will route to.
-4. **Ask who needs an edge pointing *at* the new module.** This is the step that gets skipped, and
+4. **Ask who needs an edge pointing _at_ the new module.** This is the step that gets skipped, and
    skipping it is the whole failure mode of an outbound-only design: a new module is orphaned by
    construction until an existing module declares an edge to it. Walk the modules that will now
    depend on it, or that it changes the behavior of, and add the edge **in their files**.
 5. If the module participates in a feature that spans several modules, add or update the row in root
    `AGENTS.md`'s **Surfaces** table.
 6. If the module warrants explanation beyond conventions and hazards, write the `docs/internals/`
-   page and wire the pair — see *The module file and its internals page* above. A page reachable
+   page and wire the pair — see _The module file and its internals page_ above. A page reachable
    from nowhere a reader starts is an orphan.
 
 Step 4 is not optional. Both times this repo shipped a one-directional link, it was caught by the
@@ -213,7 +213,7 @@ Removing content carries the same co-change obligation as adding it, and it is e
 because nothing looks broken afterwards.
 
 **Grep for inbound references to this file before you cut.** `docs/internals/` pages cite module
-files *by the section they own* — `communication-style.md` points at `ui/AGENTS.md` for "the
+files _by the section they own_ — `communication-style.md` points at `ui/AGENTS.md` for "the
 dashboard's Communication Style accordion" — so evicting that section silently orphans the pointer.
 
 ```
@@ -221,17 +221,17 @@ grep -rn "<module>/AGENTS.md" docs/ *.md
 ```
 
 For each hit, ask whether the sentence still describes what this file holds. If not, repoint it in
-the same change. This is the mirror of *Standing up a new module* step 4: that step asks who needs
+the same change. This is the mirror of _Standing up a new module_ step 4: that step asks who needs
 an edge pointing **at** something new, this one asks who is already pointing at what you are about
 to remove.
 
 Then decide where each evicted block actually goes. There are three outcomes, not two:
 
-| The block is | Do |
-|---|---|
-| A convention, boundary, or hazard | Keep it |
+| The block is                           | Do                                                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| A convention, boundary, or hazard      | Keep it                                                                                            |
 | Valid explanation on the wrong surface | Relocate to `docs/internals/` — **unless the destination already covers it**, in which case delete |
-| An answer to *"what does this do"* | Delete. The code is the better source |
+| An answer to _"what does this do"_     | Delete. The code is the better source                                                              |
 
 ### When you change a module
 
@@ -256,8 +256,8 @@ Root `AGENTS.md` is authoritative on all of these; they are repeated here only b
 hardest while authoring instruction files.
 
 - **Name the members, do not count them.** Never write a count of things the repo contains — nothing
-  tests it and it rots the moment anything is added. *"The hooks that ship: `session-preamble`,
-  `telemetry-capture`."* The list is the count.
+  tests it and it rots the moment anything is added. _"The hooks that ship: `session-preamble`,
+  `telemetry-capture`."_ The list is the count.
 - **Plain code fences** for shell commands, no language tag, unless the snippet uses shell-specific
   syntax.
 - **No requirement identifiers** (`FR-N`, `NFR-N`, `AD-N`, `DD-N`, `R-N`, or any planning

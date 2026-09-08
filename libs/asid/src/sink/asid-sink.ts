@@ -178,13 +178,26 @@ class AsidSinkImpl implements AsidSink {
     for (const { packet } of outstanding) {
       this.port.send(packet, scheduledAtMs);
       this.committedHostSends.push({ packet, scheduledAtMs: milliseconds(scheduledAtMs) });
+      this.packetsSent++;
+      this.bytesSent += packet.length;
       scheduledAtMs += newIntervalMs;
     }
   }
 
-  /** Drops what is outstanding without sending a stop packet. Stopping the far end is `end()`, and
-   *  the two are separate because a seek resets without stopping. */
+  /**
+   * Drops what is outstanding without sending a stop packet. Stopping the far end is `end()`, and
+   * the two are separate because a seek resets without stopping.
+   *
+   * Withdraws from the port itself, not only from local bookkeeping — otherwise a stale frame the
+   * port already holds still lands after the reset, while `stats.inFlight` reports 0 the whole time.
+   * A port that cannot cancel has no way to satisfy "drops everything outstanding": the packet is
+   * already irrevocably in the port's hands, so the best this can do is stop counting it as
+   * in-flight rather than claim a withdrawal that did not happen.
+   */
   reset(): void {
+    if (this.port.supportsCancel) {
+      this.port.cancelPending();
+    }
     this.committedHostSends = [];
   }
 

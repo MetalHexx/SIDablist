@@ -1241,6 +1241,23 @@ describe('createSidPlayer', () => {
       expect(emitted.sent[0]).toBe(emitted.written[0]); // untouched by gain — unchanged
     });
 
+    it('ignores a non-finite or out-of-0…1-range gain rather than let it corrupt the scaled byte', async () => {
+      const { player, clock } = harness();
+      player.loadTune(volumeTune(0x2f));
+      player.setOutputGain(0.5);
+
+      player.setOutputGain(Number.NaN);
+      player.setOutputGain(-0.1);
+      player.setOutputGain(1.1);
+      player.setOutputGain(Number.POSITIVE_INFINITY);
+
+      await player.play();
+      run(clock, 1);
+
+      const { emitted } = player.getStats();
+      expect(emitted.sent[24]).toBe(0x20 | Math.round(0x0f * 0.5)); // still the last valid gain
+    });
+
     it('matches written and sent, 25 registers wide, before any tune has loaded', () => {
       const { player } = harness();
 

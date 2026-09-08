@@ -247,6 +247,22 @@ describe('createAsidSink', () => {
       expect(sink.stats.lastCancelLatencyMs).toBeLessThan(300);
     });
 
+    it('counts every re-sent packet toward packetsSent and bytesSent, not only the original sends', () => {
+      port.supportsCancel = true;
+      port.cancelPendingReturns = true;
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(1_000_000), false);
+      sink.deliver(frame([1], [0x22]), frames(1), milliseconds(1_000_020), false);
+      const statsBefore = sink.stats;
+
+      sink.retime(microseconds(ONE_INTERVAL_US));
+
+      const resent = port.sent.slice(-2);
+      expect(sink.stats.packetsSent).toBe(statsBefore.packetsSent + resent.length);
+      expect(sink.stats.bytesSent).toBe(
+        statsBefore.bytesSent + resent.reduce((sum, p) => sum + p.bytes.length, 0),
+      );
+    });
+
     it('falls back to -1 on a mid-session swap to a port that cannot cancel', () => {
       port.supportsCancel = true;
       port.cancelPendingReturns = true;
@@ -262,7 +278,7 @@ describe('createAsidSink', () => {
   });
 
   describe('reset', () => {
-    it('drops everything outstanding, without sending a stop packet or leaving anything for a later retime to catch', () => {
+    it('cancels whatever the port still holds, without sending a stop packet or leaving anything for a later retime to catch', () => {
       port.supportsCancel = true;
       port.cancelPendingReturns = true;
       sink.deliver(frame([0], [0x11]), frames(0), milliseconds(1_000_000), false);
@@ -270,10 +286,21 @@ describe('createAsidSink', () => {
 
       sink.reset();
 
+      expect(port.cancelPendingCallCount).toBe(1);
       expect(sink.readAt().inFlight).toBe(0);
       sink.retime(microseconds(ONE_INTERVAL_US)); // nothing left to retime
-      expect(port.cancelPendingCallCount).toBe(0);
+      expect(port.cancelPendingCallCount).toBe(1); // retime found nothing outstanding — no second call
       expect(port.sent.length).toBe(sentBefore);
+    });
+
+    it('never calls cancelPending on a port that cannot cancel, but still clears local bookkeeping', () => {
+      port.supportsCancel = false;
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(1_000_000), false);
+
+      sink.reset();
+
+      expect(port.cancelPendingCallCount).toBe(0);
+      expect(sink.readAt().inFlight).toBe(0);
     });
   });
 
