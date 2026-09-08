@@ -6,8 +6,14 @@ const MIN_HEADER_BYTES = 0x08; // magic(4) + version(2) + dataOffset(2) — enou
 // for every version and end at 0x16 — a file shorter than this throws a native RangeError out of
 // DataView, not the documented SidParseError, if only the 8-byte check above gates it.
 const MIN_HEADER_BYTES_V1 = 0x16;
-// Version 2+ additionally reads the flags field, ending at 0x78.
+// Version 2 additionally reads the flags field, ending at 0x78.
 const MIN_HEADER_BYTES_V2 = 0x78;
+// Version 3 additionally reads the secondSidAddress byte at 0x7a, ending at 0x7b. Below this, the
+// plain (non-DataView) byte index reads undefined rather than throwing, which decodeExtraSidAddress
+// would otherwise turn into a fabricated non-null address instead of the truncation it actually is.
+const MIN_HEADER_BYTES_V3 = 0x7b;
+// Version 4 additionally reads the thirdSidAddress byte at 0x7b, ending at 0x7c.
+const MIN_HEADER_BYTES_V4 = 0x7c;
 
 const OFFSET_VERSION = 0x04;
 const OFFSET_DATA_OFFSET = 0x06;
@@ -43,7 +49,13 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
     throw new SidParseError(`unsupported SID version ${version} — expected 1-4`);
   }
 
-  const minHeaderBytes = version >= 2 ? MIN_HEADER_BYTES_V2 : MIN_HEADER_BYTES_V1;
+  const minHeaderBytesByVersion = [
+    MIN_HEADER_BYTES_V1,
+    MIN_HEADER_BYTES_V2,
+    MIN_HEADER_BYTES_V3,
+    MIN_HEADER_BYTES_V4,
+  ];
+  const minHeaderBytes = minHeaderBytesByVersion[version - 1];
   if (bytes.length < minHeaderBytes) {
     throw new SidParseError(
       `truncated SID file: a version ${version} header needs at least ${minHeaderBytes} bytes but the file is only ${bytes.length} bytes`,

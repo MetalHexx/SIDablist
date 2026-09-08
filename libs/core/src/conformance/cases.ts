@@ -185,11 +185,21 @@ const resetDropsOutstandingAndReopens: ConformanceCase = {
     );
     harness.sink.reset();
     harness.advanceMs(2000);
-    assertEqual(
-      harness.emitted(),
-      [],
-      'reset must drop a frame before its due time, not merely delay it',
-    );
+    // What actually survived, rather than a guess from `capabilities.cancellation`: a sink whose own
+    // reset() has full control over its queue (nothing external to consult) can honour "drops
+    // everything" regardless of what it reports there, so this reads the real outcome instead of
+    // predicting it — see `SidSink.reset()`'s own doc for why a transport that cannot withdraw an
+    // already-handed-over send is exempt from the strict half below. Copied rather than held live:
+    // a harness's `emitted()` is free to return its backing array by reference, which the next
+    // `deliver()` would then mutate out from under this snapshot.
+    const survivedReset = [...harness.emitted()];
+    if (harness.sink.capabilities.cancellation) {
+      assertEqual(
+        survivedReset,
+        [],
+        'a sink that can cancel must drop a frame before its due time, not merely delay it',
+      );
+    }
     harness.sink.deliver(
       frame([{ register: SID_VOLUME_REGISTER, value: 0x0f }]),
       frames(1),
@@ -199,8 +209,8 @@ const resetDropsOutstandingAndReopens: ConformanceCase = {
     harness.advanceMs(30);
     assertEqual(
       harness.emitted(),
-      [{ register: SID_VOLUME_REGISTER, value: 0x0f }],
-      'a sink must accept and deliver new frames after a reset',
+      [...survivedReset, { register: SID_VOLUME_REGISTER, value: 0x0f }],
+      'a sink must accept and deliver new frames after a reset, on top of whatever reset itself could not withdraw',
     );
   },
 };

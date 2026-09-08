@@ -15,22 +15,27 @@ interface SentPacket {
   readonly timestampMs: number | undefined;
 }
 
-/** Fake MIDI port for conformance testing. `supportsCancel` is true so the suite exercises the
- *  real withdrawal path `AsidSink.reset()`/`retime()` depend on — `cancelPending()` here actually
- *  removes not-yet-due sends rather than merely reporting success, so a sink that skipped calling
- *  it would still show the stale packet once its due time passed. */
+/** Fake MIDI port for conformance testing. `cancelPending()` actually removes not-yet-due sends
+ *  rather than merely reporting success, so a sink that skipped calling it would still show the
+ *  stale packet once its due time passed — real enough to prove `AsidSink.reset()`/`retime()`
+ *  genuinely withdraw, not just report that they did. */
 class FakeMidiOutputPort implements MidiOutputPort {
   portId: string | null = 'port-1';
-  supportsCancel = true;
   sent: SentPacket[] = [];
 
-  constructor(private readonly nowMs: () => number) {}
+  constructor(
+    public readonly supportsCancel: boolean,
+    private readonly nowMs: () => number,
+  ) {}
 
   send(bytes: Uint8Array, timestampMs?: number): void {
     this.sent.push({ bytes: Uint8Array.from(bytes), timestampMs });
   }
 
   cancelPending(): boolean {
+    if (!this.supportsCancel) {
+      return false; // matches MidiOutputPort's contract: no cancel support at all reports false
+    }
     const now = this.nowMs();
     const before = this.sent.length;
     this.sent = this.sent.filter(
@@ -108,8 +113,8 @@ function decodeSidDataPacket(
 
 let mockNow = 0;
 
-function makeHarness(): ConformanceHarness {
-  const port = new FakeMidiOutputPort(() => mockNow);
+function makeHarness(supportsCancel: boolean): ConformanceHarness {
+  const port = new FakeMidiOutputPort(supportsCancel, () => mockNow);
   const sink = createAsidSink(port);
 
   return {
@@ -136,7 +141,14 @@ function makeHarness(): ConformanceHarness {
   };
 }
 
-describe('ASID sink conformance', () => {
+// Run against both a cancelling and a non-cancelling port: `AsidSink.capabilities.cancellation`
+// mirrors `port.supportsCancel` directly, and several cases (`honorsNoCancellationOnRetime`,
+// `resetDropsOutstandingAndReopens`) branch on it — a suite that only ever ran one value would
+// silently stop proving the other.
+describe.each([
+  ['a port that can cancel', true],
+  ['a port that cannot cancel', false],
+] as const)('ASID sink conformance, %s', (_label, supportsCancel) => {
   beforeEach(() => {
     mockNow = 0;
     vi.spyOn(performance, 'now').mockImplementation(() => mockNow);
@@ -148,7 +160,7 @@ describe('ASID sink conformance', () => {
 
   for (const c of SINK_CONFORMANCE_CASES) {
     it(c.name, async () => {
-      await c.run(makeHarness);
+      await c.run(() => makeHarness(supportsCancel));
     });
   }
 });

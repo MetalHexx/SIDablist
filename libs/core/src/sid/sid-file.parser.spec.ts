@@ -206,7 +206,7 @@ describe('parseSidFile', () => {
     expect(() => parseSidFile(bytes)).toThrow(SidParseError);
   });
 
-  it('rejects a v2+ file too short for the flags field even though the fixed fields fit', () => {
+  it('rejects a v2 file too short for the flags field even though the fixed fields fit', () => {
     // 0x16 bytes covers load/init/play/songs/startSong/speed, but version 2 also reads flags at
     // 0x76, which this buffer doesn't reach.
     const bytes = new Uint8Array(0x16);
@@ -214,6 +214,29 @@ describe('parseSidFile', () => {
     const view = new DataView(bytes.buffer);
     view.setUint16(0x04, 2, false); // version 2
     view.setUint16(0x06, 0x16, false); // dataOffset == bytes.length
+    expect(() => parseSidFile(bytes)).toThrow(SidParseError);
+  });
+
+  it('rejects a v3 file too short for the secondSidAddress byte even though the flags field fits', () => {
+    // Below MIN_HEADER_BYTES_V3 (0x7b), `bytes[OFFSET_SECOND_SID]` (plain indexing, not DataView)
+    // would read undefined instead of throwing, and decodeExtraSidAddress(undefined) fabricates
+    // 0xd000 instead of surfacing the truncation.
+    const bytes = new Uint8Array(0x78);
+    writeAscii(bytes, 0x00, 'PSID');
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0x04, 3, false); // version 3
+    view.setUint16(0x06, 0x78, false); // dataOffset == bytes.length
+    view.setUint16(0x08, 0x1000, false); // nonzero loadAddress
+    expect(() => parseSidFile(bytes)).toThrow(SidParseError);
+  });
+
+  it('rejects a v4 file too short for the thirdSidAddress byte even though secondSidAddress fits', () => {
+    const bytes = new Uint8Array(0x7b);
+    writeAscii(bytes, 0x00, 'PSID');
+    const view = new DataView(bytes.buffer);
+    view.setUint16(0x04, 4, false); // version 4
+    view.setUint16(0x06, 0x7b, false); // dataOffset == bytes.length
+    view.setUint16(0x08, 0x1000, false); // nonzero loadAddress
     expect(() => parseSidFile(bytes)).toThrow(SidParseError);
   });
 
