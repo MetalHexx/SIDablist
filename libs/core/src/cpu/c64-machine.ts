@@ -1,0 +1,527 @@
+import type { SidFile } from '../sid/sid-file.model.js';
+import { cycles, type Cycles } from '../units.js';
+import { createVendorCpu } from './vendor-cpu.js';
+import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
+import {
+  CIA1_INTERRUPT_CONTROL,
+  CIA1_TIMER_A_LATCH_HIGH,
+  CIA1_TIMER_A_LATCH_LOW,
+  CIA2_INTERRUPT_CONTROL,
+  CIA_INTERRUPT_TIMER_A_SET,
+  FIRST_RELOCATABLE_PAGE,
+  INIT_BUDGET_FRAMES,
+  IO_FIRST_PAGE,
+  IO_LAST_PAGE,
+  IRQ_HANDLER_STUB,
+  IRQ_VECTOR_HARDWARE,
+  IRQ_VECTOR_KERNAL,
+  KERNAL_STUB_ADDRESSES,
+  LAST_RELOCATABLE_PAGE,
+  MAX_CALLS_PER_FRAME,
+  MEMORY_SIZE,
+  NTSC_CYCLES_PER_FRAME,
+  NTSC_CYCLES_PER_RASTER_LINE,
+  NTSC_RASTER_LINES,
+  OPCODE_JMP_ABSOLUTE,
+  OPCODE_JSR_ABSOLUTE,
+  OPCODE_LDA_IMMEDIATE,
+  OPCODE_RTI,
+  OPCODE_RTS,
+  PAL_CYCLES_PER_FRAME,
+  PAL_CYCLES_PER_RASTER_LINE,
+  PAL_RASTER_LINES,
+  PLAY_BUDGET_FRAMES,
+  RESET_VECTOR,
+  SID_LAST_AUDIBLE_REGISTER,
+  SID_RANGE_END,
+  SID_RANGE_START,
+  SID_REGISTER_MASK,
+  TRAMPOLINE_BASE,
+  TRAMPOLINE_IDLE_OFFSET,
+  TRAMPOLINE_INIT_OFFSET,
+  TRAMPOLINE_LENGTH,
+  TRAMPOLINE_PLAY_OFFSET,
+  TRAMPOLINE_PLAY_TARGET_OFFSET,
+  VIC_CONTROL_IDLE_BITS,
+  VIC_CONTROL_REGISTER,
+  VIC_RASTER_REGISTER,
+} from './cpu-constants.js';
+
+/** Receives every write a tune makes into the SID's address range. */
+export interface SidWriteSink {
+  /** `register` is 0..24 — the audible registers. Writes to 25..31 never reach here. */
+  onSidWrite(register: number, value: number): void;
+}
+
+/** The outcome of one emulated routine call. */
+export interface FrameResult {
+  readonly cyclesUsed: number;
+  /** `false` means the cycle budget ran out before the routine returned — the tune is broken. */
+  readonly completed: boolean;
+}
+
+/** Thrown when a tune exposes no usable play address, so there is nothing to call each frame. */
+export class UnplayableTuneError extends Error {}
+
+/** One entry per opcode byte, 1 where the core's decoder falls through to its 2-cycle no-op. */
+function buildIllegalOpcodeTable(cpu: Cpu6502): Uint8Array {
+  const table = new Uint8Array(256);
+  for (let opcode = 0; opcode < table.length; opcode++) {
+    table[opcode] = cpu.decode(opcode).illegal ? 1 : 0;
+  }
+  return table;
+}
+
+/**
+ * Everything about a running machine that changes as it runs.
+ *
+ * Configuration fixed at construction — the file, the sink, the clock-derived cycle counts — is
+ * deliberately absent: a snapshot is only ever restored into the machine it was taken from.
+ */
+export interface MachineSnapshot {
+  readonly memory: Uint8Array;
+  readonly cpu: CpuState;
+  readonly trampoline: number;
+  readonly idleAddress: number;
+  readonly playAddress: number;
+  readonly timerALatch: number | null;
+  readonly cyclesThisCall: number;
+  readonly reachedIdle: boolean;
+  readonly expectingOpcodeFetch: boolean;
+  readonly illegalOpcodes: number;
+}
+
+/**
+ * A 64 KB address space with just enough faked C64 hardware — CIA timers, a moving raster counter
+ * and ROM vector stubs — for a tune's `init` and `play` routines to run to completion. Every write
+ * the tune makes to the SID's address range is handed to the sink.
+ */
+export interface C64Machine {
+  /** Cycles between play calls when the tune programmed CIA 1 timer A; `null` for a frame-rate tune. */
+  readonly cyclesPerPlayCall: number | null;
+
+  /**
+   * How many play calls a second of this tune wants per frame, 1..16. This is advice for the
+   * caller's clock — `runFrame` still calls the play routine exactly once.
+   */
+  readonly callsPerFrame: number;
+
+  /**
+   * The same rate as `callsPerFrame`, but unrounded — the fractional play rate the CIA timer latch
+   * actually describes.
+   *
+   * A tune programs timer A to whatever period it wants, and that period is under no obligation to
+   * divide the frame evenly: rates like 2.4 calls per frame are ordinary. `callsPerFrame` rounds,
+   * which is right for the integer "how many calls does a frame want" question its name asks, but
+   * wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow, and
+   * the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock; use
+   * `callsPerFrame` only where an integer count is genuinely what is wanted.
+   */
+  readonly exactCallsPerFrame: number;
+
+  /**
+   * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
+   * NTSC depending on this tune's own clock. What a headroom figure divides `FrameResult.cyclesUsed`
+   * against.
+   */
+  readonly frameCycleBudget: Cycles;
+
+  /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
+  readonly resolvedPlayAddress: number;
+
+  /** Where the entry trampoline was written — moved off the default page when the tune covers it. */
+  readonly trampolineBase: number;
+
+  /** Undocumented opcodes executed since the last `initSubtune`; each ran as a 2-cycle no-op. */
+  readonly illegalOpcodeCount: number;
+
+  /**
+   * A complete, detached copy of the machine's mutable state: 64 KB of address space, the CPU's
+   * execution state, and this class's own bookkeeping.
+   *
+   * The point of it is `restore` — a position captured here can be returned to in constant time
+   * rather than by re-emulating the tune from `init`, which is what makes a cue hop free of the
+   * main-thread stall that a replay of the same distance costs.
+   */
+  snapshot(): MachineSnapshot;
+
+  /**
+   * Puts the machine back exactly where `snapshot` was taken.
+   *
+   * Restoring the entire address space is what makes this safe to run on the *live* machine rather
+   * than a throwaway one: nothing of wherever playback currently is survives the call, so there is no
+   * RAM left to bleed into the restored position.
+   */
+  restore(snapshot: MachineSnapshot): void;
+
+  /**
+   * Resets the address space, reloads the tune and runs its init routine for the given 1-based
+   * subtune, then resolves the play address an RSID installs during init.
+   *
+   * @throws {RangeError} when `song` is outside the tune's subtune range.
+   * @throws {UnplayableTuneError} when init finished but left no play address to call.
+   */
+  initSubtune(song: number): FrameResult;
+
+  /**
+   * Runs the play routine exactly once. Batching several calls into one frame would collapse them
+   * downstream, which is precisely the data a multispeed tune exists to deliver.
+   *
+   * @throws {UnplayableTuneError} when no play address has been resolved.
+   */
+  runFrame(): FrameResult;
+}
+
+/** Builds a `C64Machine` for `file`, streaming every SID write it makes to `sink`. */
+export function createC64Machine(file: SidFile, sink: SidWriteSink): C64Machine {
+  return new C64MachineImpl(file, sink);
+}
+
+class C64MachineImpl implements C64Machine {
+  private readonly file: SidFile;
+  private readonly sink: SidWriteSink;
+  private readonly memory: Uint8Array;
+  private readonly cpu: Cpu6502;
+  private readonly illegalOpcodeTable: Uint8Array;
+  private readonly cyclesPerFrame: number;
+  private readonly cyclesPerRasterLine: number;
+  private readonly rasterLineCount: number;
+
+  private trampoline = TRAMPOLINE_BASE;
+  private idleAddress = TRAMPOLINE_BASE + TRAMPOLINE_IDLE_OFFSET;
+  private playAddress = 0;
+  private timerALatch: number | null = null;
+  private cyclesThisCall = 0;
+  private reachedIdle = false;
+  private expectingOpcodeFetch = false;
+  private illegalOpcodes = 0;
+
+  constructor(file: SidFile, sink: SidWriteSink) {
+    this.file = file;
+    this.sink = sink;
+    this.memory = new Uint8Array(MEMORY_SIZE);
+
+    const ntsc = file.clock === 'ntsc';
+    this.cyclesPerFrame = ntsc ? NTSC_CYCLES_PER_FRAME : PAL_CYCLES_PER_FRAME;
+    this.cyclesPerRasterLine = ntsc ? NTSC_CYCLES_PER_RASTER_LINE : PAL_CYCLES_PER_RASTER_LINE;
+    this.rasterLineCount = ntsc ? NTSC_RASTER_LINES : PAL_RASTER_LINES;
+
+    // The core resets inside its own constructor, reading $FFFC/$FFFD back through this callback,
+    // so the address space has to exist first. The PC it lands on is meaningless — every entry
+    // re-points the reset vector and resets again.
+    const bus: Cpu6502Bus = {
+      read: (address: number): number => this.read(address),
+      write: (address: number, value: number): void => this.write(address, value),
+    };
+    this.cpu = createVendorCpu(bus);
+    this.illegalOpcodeTable = buildIllegalOpcodeTable(this.cpu);
+  }
+
+  snapshot(): MachineSnapshot {
+    return {
+      memory: this.memory.slice(),
+      cpu: this.cpu.getState(),
+      trampoline: this.trampoline,
+      idleAddress: this.idleAddress,
+      playAddress: this.playAddress,
+      timerALatch: this.timerALatch,
+      cyclesThisCall: this.cyclesThisCall,
+      reachedIdle: this.reachedIdle,
+      expectingOpcodeFetch: this.expectingOpcodeFetch,
+      illegalOpcodes: this.illegalOpcodes,
+    };
+  }
+
+  restore(snapshot: MachineSnapshot): void {
+    this.memory.set(snapshot.memory);
+    this.cpu.setState(snapshot.cpu);
+    this.trampoline = snapshot.trampoline;
+    this.idleAddress = snapshot.idleAddress;
+    this.playAddress = snapshot.playAddress;
+    this.timerALatch = snapshot.timerALatch;
+    this.cyclesThisCall = snapshot.cyclesThisCall;
+    this.reachedIdle = snapshot.reachedIdle;
+    this.expectingOpcodeFetch = snapshot.expectingOpcodeFetch;
+    this.illegalOpcodes = snapshot.illegalOpcodes;
+  }
+
+  get cyclesPerPlayCall(): number | null {
+    return this.timerALatch === null ? null : this.timerALatch + 1;
+  }
+
+  get callsPerFrame(): number {
+    const rate = this.cyclesPerPlayCall;
+    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+      return 1;
+    }
+    return Math.min(MAX_CALLS_PER_FRAME, Math.max(1, Math.round(this.cyclesPerFrame / rate)));
+  }
+
+  get exactCallsPerFrame(): number {
+    const rate = this.cyclesPerPlayCall;
+    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+      return 1;
+    }
+    return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / rate);
+  }
+
+  get frameCycleBudget(): Cycles {
+    return cycles(this.cyclesPerFrame * PLAY_BUDGET_FRAMES);
+  }
+
+  get resolvedPlayAddress(): number {
+    return this.playAddress;
+  }
+
+  get trampolineBase(): number {
+    return this.trampoline;
+  }
+
+  get illegalOpcodeCount(): number {
+    return this.illegalOpcodes;
+  }
+
+  initSubtune(song: number): FrameResult {
+    const subtunes = Math.max(1, this.file.songs);
+    if (!Number.isInteger(song) || song < 1 || song > subtunes) {
+      throw new RangeError(`subtune ${song} is outside 1..${subtunes}`);
+    }
+
+    this.memory.fill(0);
+    this.timerALatch = null;
+    this.illegalOpcodes = 0;
+
+    this.installRomStubs();
+    this.loadTune();
+    this.writeTrampoline(song);
+
+    const result = this.runRoutine(
+      this.trampoline + TRAMPOLINE_INIT_OFFSET,
+      this.cyclesPerFrame * INIT_BUDGET_FRAMES,
+    );
+
+    this.playAddress = this.resolvePlayAddress();
+    this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
+
+    if (result.completed && this.playAddress === 0) {
+      throw new UnplayableTuneError(
+        'the tune installed no interrupt vector during init, so it exposes no play routine',
+      );
+    }
+    return result;
+  }
+
+  runFrame(): FrameResult {
+    if (this.playAddress === 0) {
+      throw new UnplayableTuneError('no play address has been resolved — run initSubtune first');
+    }
+    return this.runRoutine(
+      this.trampoline + TRAMPOLINE_PLAY_OFFSET,
+      this.cyclesPerFrame * PLAY_BUDGET_FRAMES,
+    );
+  }
+
+  private runRoutine(entryAddress: number, budget: number): FrameResult {
+    this.writeWord(RESET_VECTOR, entryAddress);
+    this.cyclesThisCall = 0;
+    this.reachedIdle = false;
+    this.expectingOpcodeFetch = false;
+    this.cpu.reset();
+
+    while (!this.reachedIdle && this.cyclesThisCall < budget) {
+      // Every read the core makes on a given cycle either starts an instruction or belongs to one
+      // already decoded, and only the first read of a cycle can be the opcode fetch.
+      this.expectingOpcodeFetch = true;
+      this.cpu.emulate();
+      this.cyclesThisCall++;
+    }
+
+    return { cyclesUsed: this.cyclesThisCall, completed: this.reachedIdle };
+  }
+
+  /**
+   * The read side of the CPU's bus.
+   *
+   * The `$01` banking register is stored as ordinary RAM and ignored for decoding: the ranges below
+   * always decode as I/O whatever a tune banks in. That is a deliberate simplification, not an
+   * oversight — no KERNAL or BASIC ROM image ships here, so there is nothing else to bank to.
+   */
+  private read(address: number): number {
+    const fetchingOpcode = this.expectingOpcodeFetch;
+    this.expectingOpcodeFetch = false;
+
+    if (address === this.idleAddress) {
+      // The only reason the CPU ever fetches from the idle block is that the routine returned.
+      // Detecting it here keeps the hot loop free of the allocations `getState()` would cost.
+      this.reachedIdle = true;
+    }
+
+    const value = this.readBus(address);
+    if (fetchingOpcode && this.illegalOpcodeTable[value] === 1) {
+      this.illegalOpcodes++;
+    }
+    return value;
+  }
+
+  private readBus(address: number): number {
+    switch (address) {
+      case VIC_CONTROL_REGISTER:
+        return VIC_CONTROL_IDLE_BITS | ((this.rasterLine() & 0x100) >> 1);
+      case VIC_RASTER_REGISTER:
+        return this.rasterLine() & 0xff;
+      case CIA1_INTERRUPT_CONTROL:
+      case CIA2_INTERRUPT_CONTROL:
+        return CIA_INTERRUPT_TIMER_A_SET;
+      default:
+        return this.memory[address & 0xffff];
+    }
+  }
+
+  /** The write side of the CPU's bus. See `read` for why banking is ignored. */
+  private write(address: number, value: number): void {
+    const byte = value & 0xff;
+    this.memory[address & 0xffff] = byte;
+
+    if (address >= SID_RANGE_START && address <= SID_RANGE_END) {
+      if (!this.isSecondOrThirdSidAddress(address)) {
+        const register = address & SID_REGISTER_MASK;
+        if (register <= SID_LAST_AUDIBLE_REGISTER) {
+          this.sink.onSidWrite(register, byte);
+        }
+      }
+      return;
+    }
+
+    if (address === CIA1_TIMER_A_LATCH_LOW || address === CIA1_TIMER_A_LATCH_HIGH) {
+      this.timerALatch = this.readWord(CIA1_TIMER_A_LATCH_LOW);
+    }
+  }
+
+  /**
+   * Whether `address` falls in the 32-byte mirrored block of a v3/v4 header's second or third SID
+   * address. Those chips are reported to the caller, not emulated, so their writes still land in
+   * `this.memory` (above) but must never reach the sink alongside the first chip's registers.
+   */
+  private isSecondOrThirdSidAddress(address: number): boolean {
+    const block = address & ~SID_REGISTER_MASK;
+    const { secondSidAddress, thirdSidAddress } = this.file;
+    return (
+      (secondSidAddress !== null && block === (secondSidAddress & ~SID_REGISTER_MASK)) ||
+      (thirdSidAddress !== null && block === (thirdSidAddress & ~SID_REGISTER_MASK))
+    );
+  }
+
+  /** Players poll the raster in a spin loop, so a frozen value hangs them. */
+  private rasterLine(): number {
+    return ((this.cyclesThisCall / this.cyclesPerRasterLine) | 0) % this.rasterLineCount;
+  }
+
+  private installRomStubs(): void {
+    for (const address of KERNAL_STUB_ADDRESSES) {
+      this.memory[address] = OPCODE_RTS;
+    }
+    this.memory[IRQ_HANDLER_STUB] = OPCODE_RTI;
+    this.writeWord(IRQ_VECTOR_KERNAL, IRQ_HANDLER_STUB);
+    this.writeWord(IRQ_VECTOR_HARDWARE, IRQ_HANDLER_STUB);
+  }
+
+  /** Copies the payload over the stubs, so the tune wins any overlap. */
+  private loadTune(): void {
+    const available = MEMORY_SIZE - this.file.loadAddress;
+    const length = Math.min(this.file.data.length, Math.max(0, available));
+    this.memory.set(this.file.data.subarray(0, length), this.file.loadAddress);
+  }
+
+  /**
+   * Writes the entry trampoline the CPU takes out of reset. The core keeps its registers private,
+   * so the accumulator's subtune number and the entry addresses have to come from real code:
+   *
+   * ```
+   * base+0x00:  LDA #(song - 1)   ; the PSID convention is zero-based in A
+   * base+0x02:  JSR initAddress
+   * base+0x05:  JMP idle
+   * base+0x08:  JSR playAddress   ; target patched once an RSID's vector is known
+   * base+0x0B:  JMP idle
+   * base+0x0E:  JMP idle          ; branches to itself
+   * ```
+   */
+  private writeTrampoline(song: number): void {
+    this.trampoline = this.chooseTrampolineBase();
+    this.idleAddress = this.trampoline + TRAMPOLINE_IDLE_OFFSET;
+
+    const idleLow = this.idleAddress & 0xff;
+    const idleHigh = (this.idleAddress >> 8) & 0xff;
+    const initLow = this.file.initAddress & 0xff;
+    const initHigh = (this.file.initAddress >> 8) & 0xff;
+
+    this.memory.set(
+      [
+        OPCODE_LDA_IMMEDIATE,
+        (song - 1) & 0xff,
+        OPCODE_JSR_ABSOLUTE,
+        initLow,
+        initHigh,
+        OPCODE_JMP_ABSOLUTE,
+        idleLow,
+        idleHigh,
+        OPCODE_JSR_ABSOLUTE,
+        0x00,
+        0x00,
+        OPCODE_JMP_ABSOLUTE,
+        idleLow,
+        idleHigh,
+        OPCODE_JMP_ABSOLUTE,
+        idleLow,
+        idleHigh,
+      ],
+      this.trampoline,
+    );
+  }
+
+  private chooseTrampolineBase(): number {
+    const start = this.file.loadAddress;
+    const end = Math.min(start + this.file.data.length, MEMORY_SIZE);
+    const overlapsTune = (base: number): boolean => base < end && start < base + TRAMPOLINE_LENGTH;
+
+    if (!overlapsTune(TRAMPOLINE_BASE)) {
+      return TRAMPOLINE_BASE;
+    }
+    for (let page = FIRST_RELOCATABLE_PAGE; page <= LAST_RELOCATABLE_PAGE; page++) {
+      if (page >= IO_FIRST_PAGE && page <= IO_LAST_PAGE) {
+        continue;
+      }
+      const base = page << 8;
+      if (!overlapsTune(base)) {
+        return base;
+      }
+    }
+    throw new UnplayableTuneError(
+      'the tune covers every page — there is nowhere for the trampoline',
+    );
+  }
+
+  /**
+   * A header play address of 0 means the tune installed its own interrupt handler during init.
+   * Returns 0 when neither vector moved off the RTI stub, rather than jumping to address 0.
+   */
+  private resolvePlayAddress(): number {
+    if (this.file.playAddress !== 0) {
+      return this.file.playAddress;
+    }
+    const kernalVector = this.readWord(IRQ_VECTOR_KERNAL);
+    if (kernalVector !== IRQ_HANDLER_STUB) {
+      return kernalVector;
+    }
+    const hardwareVector = this.readWord(IRQ_VECTOR_HARDWARE);
+    return hardwareVector === IRQ_HANDLER_STUB ? 0 : hardwareVector;
+  }
+
+  private readWord(address: number): number {
+    return this.memory[address] | (this.memory[address + 1] << 8);
+  }
+
+  private writeWord(address: number, value: number): void {
+    this.memory[address] = value & 0xff;
+    this.memory[address + 1] = (value >> 8) & 0xff;
+  }
+}

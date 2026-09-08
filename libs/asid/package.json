@@ -1,0 +1,39 @@
+{
+  "name": "@sidablist/asid",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./web-midi": {
+      "types": "./dist/web-midi/index.d.ts",
+      "import": "./dist/web-midi/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "web-midi": [
+        "./dist/web-midi/index.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@sidablist/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.lib.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.lib.json --noEmit"
+  }
+}

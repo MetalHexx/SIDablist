@@ -1,6 +1,6 @@
 # Architecture
 
-Explanation, not rules. The rules live in [`AGENTS.md`](../AGENTS.md); this page is the *why*
+Explanation, not rules. The rules live in [`AGENTS.md`](../AGENTS.md); this page is the _why_
 behind them. Read it before restructuring a library, adding one, or drawing a new boundary — not
 for a routine edit.
 
@@ -72,21 +72,21 @@ bytes physically go.
 The corollary that catches most cases: **core owns the operations, the application owns the
 collections.**
 
-- Core holds the *active* loop, because it has to enforce it on every frame.
+- Core holds the _active_ loop, because it has to enforce it on every frame.
 - The application holds the list of saved cues and loops, their names, their pad assignments, and
   whether they survive a reload.
-- A cue is a loop without an end marker. Both are *a frame number someone remembered* plus *an
-  operation core performs*. The remembering is application; the performing is core.
+- A cue is a loop without an end marker. Both are _a frame number someone remembered_ plus _an
+  operation core performs_. The remembering is application; the performing is core.
 
 Worked examples of the same test:
 
-| Thing | Where | Why |
-|---|---|---|
-| Seek, tempo, active loop, voice control | core | Timeline operations |
-| Web MIDI access | application | Bytes to a device; knows nothing about position |
-| Persistence | application | A preference, not a timeline fact |
-| Crossfader position | application | Intent |
-| Applying gain and filter scaling to registers | core | Register state on the frame path |
+| Thing                                         | Where       | Why                                             |
+| --------------------------------------------- | ----------- | ----------------------------------------------- |
+| Seek, tempo, active loop, voice control       | core        | Timeline operations                             |
+| Web MIDI access                               | application | Bytes to a device; knows nothing about position |
+| Persistence                                   | application | A preference, not a timeline fact               |
+| Crossfader position                           | application | Intent                                          |
+| Applying gain and filter scaling to registers | core        | Register state on the frame path                |
 
 ## The two seams
 
@@ -98,13 +98,39 @@ frame ──▶│ SINK SEAM │──▶ wire format ──▶│ TRANSPORT SEA
          protocol semantics               bytes reaching a device
 ```
 
-- The **sink seam** is about *what a register write means on the wire*. ASID encodes it as a SysEx
+- The **sink seam** is about _what a register write means on the wire_. ASID encodes it as a SysEx
   packet; a DMA sink writes it into a ring buffer in the machine's memory.
-- The **transport seam** is about *bytes reaching a device*. Web MIDI, a native MIDI binding,
+- The **transport seam** is about _bytes reaching a device_. Web MIDI, a native MIDI binding,
   serial, a network hop.
 
 They are independent: a DMA sink can ride serial or a network without changing the protocol above
 it, and ASID's wire format is the same whether the bytes leave through a browser or Node.
+
+### The frame that crosses the sink seam
+
+What actually crosses the sink seam is not a slot mask, a packet or anything wire-shaped — it is
+`SidFrame`, an ordered list of the register writes one play call made, in the order it made them:
+
+```
+interface SidFrame {
+  readonly count: number;
+  readonly registers: Uint8Array; // [0, count) — register 0..24
+  readonly values: Uint8Array;    // [0, count) — the byte to write
+  readonly offsetsUs: Int32Array; // [0, count) — always 0 today
+}
+```
+
+Struct-of-arrays rather than an array of `{ register, value }` records, because **the hot path does
+not allocate**: frame delivery runs fifty times a second per deck, and a fresh record per write, on
+every write, on that path, is exactly the allocation pressure a garbage collector would have to
+absorb where a pause is audible rather than merely visible. The three arrays are reused between
+frames — a sink that needs to keep one past the call that handed it over must copy it.
+
+Deliberately not an ASID slot mask, or any other sink's own layout. Where a given register lands —
+ASID's 28-slot present/value table, a DMA sink's offset into a ring buffer — is protocol semantics,
+and protocol semantics belongs on the sink's side of the seam. Core hands over what the tune actually
+did; packing that onto a specific wire is the sink's job; for ASID that is `libs/asid`'s
+`wire/slot-map.ts`, not anything upstream of it.
 
 ### The sink contract is shaped for the richer transport
 
@@ -117,20 +143,43 @@ contract pretending the question was never asked.
 
 ### Timing authority is not the same on every sink
 
-| Sink | Who keeps time | What the host clock must provide |
-|---|---|---|
-| ASID | The host, reconstructed by the OS MIDI stack | Low instantaneous variance |
-| DMA | The C64-side player, on the machine's own timer | A correct average rate only |
+| Sink | Who keeps time                                  | What the host clock must provide |
+| ---- | ----------------------------------------------- | -------------------------------- |
+| ASID | The host, reconstructed by the OS MIDI stack    | Low instantaneous variance       |
+| DMA  | The C64-side player, on the machine's own timer | A correct average rate only      |
 
 This is why the clock port must not assume the strictest case. Designing for ASID's requirement
 would impose a browser-grade audio clock on a sink that does not need one, for no benefit.
 
-It is also why *scheduling* lives in the sink rather than in core. Timestamping is how Web MIDI
+It is also why _scheduling_ lives in the sink rather than in core. Timestamping is how Web MIDI
 keeps time; serial has no timestamp mechanism at all. The clearest illustration: on a tempo change
 ASID cancels its outstanding packets and re-sends them at the new spacing, while a DMA sink writes
 one new timer value and flushes nothing, because nothing needs re-declaring.
 
-Core's half is only ever *this frame is due at T*.
+Core's half is only ever _this frame is due at T_.
+
+### The clock port is split the same way
+
+`FrameClock`, the port core depends on, states only _this frame is due at T_ and leaves precision to
+whoever implements it — deliberately, since ASID wants host-clock precision and a DMA far end needs
+only a correct average rate.
+
+Two pieces sit behind that one interface, and only one of them ships in this repository:
+
+- `FrameAccumulator` is the arithmetic: given an elapsed span, how many frame ticks does it owe, and
+  what due time does each one report. It has no timing source of its own — nothing to measure it
+  against but a number — which is why it lives in core and is exercised without a real clock in the
+  way.
+- A concrete `FrameClock` — an audio-graph clock riding `AudioContext.currentTime`, a
+  `requestAnimationFrame` loop, a plain interval — is an application adapter. Core ships none: the
+  precision a clock needs to hit is a property of whatever environment hosts it, not of the timeline
+  driving it, and core has zero runtime dependencies to build one against in the first place.
+
+A host wires the two together itself: its own `FrameClock` implementation holds a `FrameAccumulator`
+internally and calls its `advance()` off whichever timing source that host actually has.
+
+See [`writing-a-sink.md`](./writing-a-sink.md) for the `SidSink` contract itself, member by member,
+and how to run the shared conformance suite against a new sink.
 
 ## How a consumer reads core
 
@@ -140,11 +189,11 @@ and Angular wraps it in a signal updated from an effect.
 
 Everything is a plain read. The only distinction is **whether a change notifies you**:
 
-| Read | Notifies | Carries |
-|---|---|---|
-| `getSnapshot()` | yes | Transport state, tune, tempo, the active loop, voices, error |
-| `getPosition()` | no | The playhead frame |
-| `getStats()` | no | Drift, jitter, lag, cycle headroom, in-flight depth |
+| Read            | Notifies | Carries                                                      |
+| --------------- | -------- | ------------------------------------------------------------ |
+| `getSnapshot()` | yes      | Transport state, tune, tempo, the active loop, voices, error |
+| `getPosition()` | no       | The playhead frame                                           |
+| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth          |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 
@@ -159,10 +208,10 @@ at all.
 Playing a tune on a machine it was not written for goes wrong in two independent ways. They have
 different causes and different fixes, which is the whole reason they are separable.
 
-| Effect | Cause | Size |
-|---|---|---|
-| Tempo | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC | +19.36% |
-| Pitch | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804%, ≈ +64.6 cents |
+| Effect | Cause                                           | Size                   |
+| ------ | ----------------------------------------------- | ---------------------- |
+| Tempo  | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC  | +19.36%                |
+| Pitch  | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804%, ≈ +64.6 cents |
 
 The oscillator frequency is:
 
@@ -214,9 +263,14 @@ voice by one constant preserves the ratios they depend on.
 
 Scaling a 16-bit frequency value can change its **high byte even when the tune only wrote the low
 one**. A correct implementation keeps a per-voice shadow copy, recomputes the whole scaled value on
-every low-*or*-high write, and emits an extra high-byte write when it moved. Round once, at the
+every low-_or_-high write, and emits an extra high-byte write when it moved. Round once, at the
 end, per voice — and round rather than truncate, which halves the worst-case error.
+
+See [`pal-ntsc.md`](./pal-ntsc.md) for the full composition and a worked case of the trap above.
 
 ## Further reading
 
 - [`AGENTS.md`](../AGENTS.md) — the invariants this page explains, stated as rules.
+- [`writing-a-sink.md`](./writing-a-sink.md) — the `SidSink` contract member by member, for adding a
+  second sink.
+- [`pal-ntsc.md`](./pal-ntsc.md) — the pitch-correction derivation, in full, with a worked case.

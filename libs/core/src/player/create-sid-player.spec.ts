@@ -1,0 +1,1381 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  NTSC_CYCLES_PER_FRAME,
+  PAL_CYCLES_PER_FRAME,
+  PLAY_BUDGET_FRAMES,
+} from '../cpu/cpu-constants.js';
+import type { FrameClock, FrameClockStats } from '../ports/clock.js';
+import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
+import type { SidFrame } from '../registers/sid-frame.js';
+import {
+  PAL_FRAME_INTERVAL_US,
+  SID_REGISTER_COUNT,
+  VOICE_CONTROL_REGISTERS,
+} from '../registers/sid-constants.js';
+import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
+import { replayToFrame } from '../replay/replay-to-frame.js';
+import type { SidClock, SidFile, SidModel } from '../sid/sid-file.model.js';
+import { FakeClock } from '../testing/fake-clock.js';
+import { FakeSink } from '../testing/fake-sink.js';
+import { frames, microseconds, milliseconds } from '../units.js';
+import type { Microseconds, Milliseconds } from '../units.js';
+import { createSidPlayer } from './create-sid-player.js';
+import type { SidPlayer } from './sid-player.js';
+
+/**
+ * Counts every `runFrame()` call across every `C64Machine` this test file's code creates — the live
+ * ticking machine and any throwaway one a replay builds alike — the same cross-instance visibility
+ * `C64Machine.prototype` spying gave before the class became a factory-built, unexported internal.
+ * Reset with `runFrameSpy.mockClear()` at the point a test wants to start counting from.
+ */
+const { runFrameSpy } = vi.hoisted(() => ({ runFrameSpy: vi.fn() }));
+
+vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../cpu/c64-machine.js')>();
+  return {
+    ...actual,
+    createC64Machine: (
+      ...args: Parameters<typeof actual.createC64Machine>
+    ): ReturnType<typeof actual.createC64Machine> => {
+      const machine = actual.createC64Machine(...args);
+      return new Proxy(machine, {
+        get(target, prop) {
+          if (prop === 'runFrame') {
+            return () => {
+              runFrameSpy();
+              return target.runFrame();
+            };
+          }
+          return Reflect.get(target, prop, target);
+        },
+      });
+    },
+  };
+});
+
+/** Answers every request against the real `replayToFrame`, immediately — the landing is what these
+ *  tests are about, not the thread it crosses. */
+class FakeReplayRunner implements ReplayRunner {
+  disposed = false;
+
+  run(request: ReplayRequest): Promise<ReplayResponse> {
+    try {
+      return Promise.resolve({
+        id: request.id,
+        ok: true,
+        result: replayToFrame(request.file, request.subtune, request.targetFrame, request.mutes),
+      });
+    } catch (error) {
+      return Promise.resolve({
+        id: request.id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  dispose(): void {
+    this.disposed = true;
+  }
+}
+
+/** `FakeSink` plus the order the control path reached it in — the sequence is the contract for a
+ *  pause (gate-off, then end) and for a clock that fails after `begin` has gone out. */
+class RecordingSink extends FakeSink {
+  readonly calls: string[] = [];
+
+  override begin(tune: { readonly chipModel: SidModel }): void {
+    this.calls.push('begin');
+    super.begin(tune);
+  }
+
+  override end(): void {
+    this.calls.push('end');
+    super.end();
+  }
+
+  override deliver(
+    frame: SidFrame,
+    frameNumber: ReturnType<typeof frames>,
+    dueAtMs: Milliseconds,
+    catchUpClamped: boolean,
+  ): void {
+    this.calls.push('deliver');
+    super.deliver(frame, frameNumber, dueAtMs, catchUpClamped);
+  }
+
+  override deliverNow(frame: SidFrame): void {
+    this.calls.push('deliverNow');
+    super.deliverNow(frame);
+  }
+
+  override retime(intervalUs: Microseconds): void {
+    this.calls.push('retime');
+    super.retime(intervalUs);
+  }
+
+  override reset(): void {
+    this.calls.push('reset');
+    super.reset();
+  }
+}
+
+/** A clock whose `start` rejects, standing in for the audio graph a real clock rides refusing to
+ *  resume — the one path where `begin` has gone out and no frame ever will. */
+class FailingClock implements FrameClock {
+  start(): Promise<void> {
+    return Promise.reject(new Error('the audio context refused to resume'));
+  }
+  setIntervalUs(): void {
+    // never reached: nothing paces after a start that rejected
+  }
+  stop(): void {
+    // never reached
+  }
+  get stats(): FrameClockStats {
+    return {
+      framesEmitted: 0,
+      measuredMeanIntervalUs: microseconds(0),
+      nominalIntervalUs: microseconds(0),
+      driftMs: milliseconds(0),
+      jitterMs: milliseconds(0),
+      worstGapMs: milliseconds(0),
+      lateCallbacks: 0,
+    };
+  }
+}
+
+interface CodeBlock {
+  readonly at: number;
+  readonly bytes: readonly number[];
+}
+
+function tune(options: {
+  songs?: number;
+  clock?: SidClock;
+  model?: SidModel;
+  blocks: readonly CodeBlock[];
+}): SidFile {
+  const loadAddress = 0x1000;
+  const codeEnd = options.blocks.reduce(
+    (end, block) => Math.max(end, block.at + block.bytes.length),
+    loadAddress,
+  );
+  const data = new Uint8Array(codeEnd - loadAddress);
+  for (const block of options.blocks) {
+    data.set(block.bytes, block.at - loadAddress);
+  }
+  return {
+    format: 'PSID',
+    version: 2,
+    loadAddress,
+    initAddress: loadAddress,
+    playAddress: 0x1010,
+    songs: options.songs ?? 1,
+    startSong: 1,
+    speedFlags: 0,
+    name: '',
+    author: '',
+    released: '',
+    clock: options.clock ?? 'pal',
+    model: options.model ?? 'unknown',
+    secondSidAddress: null,
+    thirdSidAddress: null,
+    data,
+  };
+}
+
+const RTS = 0x60;
+
+/** init and play both return at once and touch no register. */
+function silentTune(songs = 1, model: SidModel = 'unknown'): SidFile {
+  return tune({
+    songs,
+    model,
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+  });
+}
+
+/** init increments a zero-page counter and stores it into $D400 every play call, so the frame a
+ *  replay landed on can be read back off the delivered frame. Its play routine costs the same
+ *  handful of cycles whichever clock it is told to run under — only the budget it is measured
+ *  against moves with `clock`. */
+function counterTune(clock: SidClock = 'pal'): SidFile {
+  return tune({
+    clock,
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+    ],
+  });
+}
+
+/** play writes `value` to $D418 (volume/filter-mode) every call, so a gain or a forced filter mode
+ *  scaling it is readable off `getStats().emitted`. */
+function volumeTune(value: number): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [0xa9, value, 0x8d, 0x18, 0xd4, RTS] }, // LDA #value; STA $D418; RTS
+    ],
+  });
+}
+
+/** init programs CIA 1 timer A to a latch of $1FFD, so 19656 / 8190 = 2.4 calls per frame — a rate
+ *  that does not divide the frame evenly, which is exactly the case `exactCallsPerFrame` exists to
+ *  report correctly and `callsPerFrame` rounds away. */
+function fractionalSpeedTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+  });
+}
+
+/** play holds voice 1's gate open every call — a tune whose voice control register is worth
+ *  reading, unlike one that never writes it. */
+function gateTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [0xa9, 0x41, 0x8d, 0x04, 0xd4, RTS] }, // LDA #$41; STA $D404; RTS
+    ],
+  });
+}
+
+/** play writes voice 0's frequency pair every call, so the bytes the correction rewrites are
+ *  readable off the delivered frame. */
+function frequencyTune(low: number, high: number): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      // LDA #low; STA $D400; LDA #high; STA $D401; RTS
+      { at: 0x1010, bytes: [0xa9, low, 0x8d, 0x00, 0xd4, 0xa9, high, 0x8d, 0x01, 0xd4, RTS] },
+    ],
+  });
+}
+
+/** init programs CIA 1 timer A for exactly two play calls per frame. */
+function doubleSpeedTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+  });
+}
+
+/** The play routine never returns, so the first frame burns its whole cycle budget. */
+function runawayTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      { at: 0x1010, bytes: [0x4c, 0x10, 0x10] }, // JMP $1010
+    ],
+  });
+}
+
+interface Harness {
+  readonly player: SidPlayer;
+  readonly sink: RecordingSink;
+  readonly clock: FakeClock;
+  readonly replay: FakeReplayRunner;
+}
+
+function harness(): Harness {
+  const sink = new RecordingSink();
+  const clock = new FakeClock();
+  const replay = new FakeReplayRunner();
+  return { player: createSidPlayer({ sink, clock, replayRunner: replay }), sink, clock, replay };
+}
+
+/** Ticks `count` frames, each one interval apart on the same rising timeline a real clock reports. */
+function run(clock: FakeClock, count: number, from = 0): void {
+  for (let index = 0; index < count; index++) {
+    clock.tick(milliseconds(performance.now() + from + index));
+  }
+}
+
+/** Drains every pending microtask, however deep the chain — what settles an entry-image capture
+ *  fired without being awaited (`setActiveLoop`, `setTrackStructure`), since `FakeReplayRunner`
+ *  still resolves through real promises rather than answering synchronously. */
+function flushEntryImageCapture(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function lastDelivered(sink: RecordingSink): SidFrame {
+  const delivered = sink.deliveredFrames;
+  return delivered[delivered.length - 1].frame;
+}
+
+function lastDeliveredNow(sink: RecordingSink): SidFrame {
+  const delivered = sink.deliveredNowFrames;
+  return delivered[delivered.length - 1];
+}
+
+/** The byte a frame carries for `register`, or undefined when it carries none — a frame holds the
+ *  writes that were made, in the order they were made, so a register is found by number. */
+function valueOf(frame: SidFrame, register: number): number | undefined {
+  for (let index = 0; index < frame.count; index++) {
+    if (frame.registers[index] === register) return frame.values[index];
+  }
+  return undefined;
+}
+
+describe('createSidPlayer', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  describe('the transport state machine', () => {
+    it('walks stopped, playing, paused, playing and back to stopped', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      expect(player.getSnapshot().transport).toBe('stopped');
+
+      await player.play();
+      expect(player.getSnapshot().transport).toBe('playing');
+
+      player.pause();
+      expect(player.getSnapshot().transport).toBe('paused');
+
+      await player.play();
+      run(clock, 1);
+      expect(player.getSnapshot().transport).toBe('playing');
+
+      player.stop();
+      expect(player.getSnapshot().transport).toBe('stopped');
+    });
+
+    it('reports ended rather than stopped when the track plays through with repeat off, leaving the playhead where it finished', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(3),
+      });
+      player.setRepeatTrack(false);
+
+      await player.play();
+      run(clock, 3);
+
+      expect(player.getSnapshot().transport).toBe('ended');
+      expect(player.getPosition()).toBe(3);
+    });
+
+    it('resets the playhead on stop, which reaching the end of the track deliberately does not', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(3),
+      });
+      await player.play();
+      run(clock, 3);
+
+      player.stop();
+
+      expect(player.getPosition()).toBe(0);
+    });
+
+    it('restarts from the top when play is pressed from ended', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(2),
+      });
+      await player.play();
+      run(clock, 2);
+      expect(player.getSnapshot().transport).toBe('ended');
+
+      await player.play();
+      run(clock, 1);
+
+      expect(player.getSnapshot().transport).toBe('playing');
+      expect(player.getPosition()).toBe(1);
+    });
+
+    it('wraps the track instead of ending it while repeat is on, arming the track loop as it goes', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: frames(0),
+        loopPeriodFrames: frames(3),
+        endedAtFrame: null,
+      });
+      player.setRepeatTrack(true);
+
+      await player.play();
+      run(clock, 3);
+
+      expect(player.getSnapshot().transport).toBe('playing');
+      expect(player.getPosition()).toBe(0);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 0, endFrame: 3 });
+    });
+
+    it('fails with no tune loaded, reporting why', async () => {
+      const { player } = harness();
+
+      await player.play();
+
+      expect(player.getSnapshot().transport).toBe('error');
+      expect(player.getSnapshot().error).toContain('no tune');
+    });
+
+    it('fails when the play routine never returns, and stops the clock behind it', async () => {
+      const { player, clock } = harness();
+      player.loadTune(runawayTune());
+
+      await player.play();
+      run(clock, 1);
+
+      expect(player.getSnapshot().transport).toBe('error');
+      expect(() => run(clock, 1)).toThrow();
+    });
+  });
+
+  describe("a loop's entry image", () => {
+    // A wrap owes the stream a resync (`queueResync`'s `gateOffOwed`), which the tick immediately
+    // after a wrap spends delivering a gate-off frame instead of running the play routine — one
+    // tick with no `runFrame` call of its own, on every wrap, fast path or slow. Each case below
+    // ticks past that one first, so the batch it measures is unbroken real ticks throughout.
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("captures a newly armed loop's own re-entry image off-thread, so its first wrap restores instantly rather than replaying from the frame-0 seed", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500; // far enough in that a replay from frame 0 would run hundreds of frames
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      run(clock, 9); // up to, but not touching, the loop's end
+
+      runFrameSpy.mockClear();
+      run(clock, 1); // crosses the loop's end and re-enters its start on this same tick
+
+      // One call for the tick's own frame and nothing more — a seek along the anchor path would have
+      // cost extra calls proportional to how far back the newest usable anchor sat, and once this
+      // loop has laid long enough that only the frame-0 seed remains usable that cost is `deepStart`.
+      expect(runFrameSpy).toHaveBeenCalledTimes(1);
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
+    it("costs nothing on a loop's very first trigger when capturePosition seeded its entry image before the loop was ever armed", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500; // far enough in that a replay from frame 0 would run hundreds of frames
+      run(clock, deepStart);
+      // The performer is already sitting here — capturing it is a memory copy, not a replay — and
+      // this loop has never been armed before, so there is no prior activity to have warmed the
+      // cache any other way.
+      player.capturePosition();
+
+      runFrameSpy.mockClear();
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await player.seek(frames(deepStart));
+
+      // Arming and seeking straight back to a loop's own start is exactly what a trigger does. With
+      // no eager capture this would fall back to `captureActiveLoopEntry`'s off-thread replay; with
+      // it, `setActiveLoop` finds the image already cached and `seek` restores from it directly.
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
+    it('keeps re-entering instantly on every later lap, not only the first', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      run(clock, 10); // first wrap: 500 -> 510 -> back to 500
+      run(clock, 1); // the gate-off tick the first wrap owed the stream
+
+      runFrameSpy.mockClear();
+      run(clock, 10); // second wrap in full: every one of these ticks is a real one
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(player.getPosition()).toBe(deepStart);
+    });
+
+    it("reverts to the track's own loop's cached entry once a marker loop that borrowed the slot is cleared", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: frames(500),
+        loopPeriodFrames: frames(50),
+        endedAtFrame: null,
+      });
+      player.setRepeatTrack(true);
+      await player.play();
+      await flushEntryImageCapture(); // lets the track's own loop capture its entry image
+
+      run(clock, 550); // plays through the track's own end and wraps back to its start
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 500, endFrame: 550 });
+      expect(player.getPosition()).toBe(500);
+
+      // Borrow the tracker's entry-image slot for a marker loop, then hand it back before the
+      // marker loop's own capture has any chance to resolve.
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      player.setActiveLoop(null);
+      run(clock, 1); // the gate-off tick the earlier wrap owed the stream
+
+      runFrameSpy.mockClear();
+      run(clock, 50); // back around to the track loop's own end again
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(50);
+      expect(player.getPosition()).toBe(500);
+    });
+
+    it('re-enters a loop it already holds an image for without replaying, and still owes the stream its gate-off and resync', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+      run(clock, 3); // a few frames into the lap, so the jump back is a real move
+
+      runFrameSpy.mockClear();
+      await player.seek(frames(deepStart));
+
+      // A trigger, a start audition and a queued hand-off all resolve to exactly this jump. Nothing
+      // is emulated for it: the generic path would have replayed from the frame-0 seed, since a loop
+      // that only ever revisits its own range keeps no usable anchor on the ring.
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart);
+
+      run(clock, 1);
+      expect(lastDelivered(sink).count).toBe(VOICE_CONTROL_REGISTERS.length);
+      run(clock, 1);
+      expect(lastDelivered(sink).count).toBe(25);
+    });
+
+    it('hands over to a loop engaged earlier without replaying, rather than keeping only the newest image', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const first = { startFrame: frames(400), endFrame: frames(410) };
+      const second = { startFrame: frames(600), endFrame: frames(610) };
+      run(clock, 700);
+      player.setActiveLoop(first);
+      await flushEntryImageCapture();
+      player.setActiveLoop(second);
+      await flushEntryImageCapture();
+
+      // Arming a loop and jumping to its own start is what a lap-boundary hand-off does; the loop
+      // handed back to here is the one whose image a single-image cache would have thrown away.
+      runFrameSpy.mockClear();
+      player.setActiveLoop(first);
+      await player.seek(first.startFrame);
+
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(400);
+    });
+
+    it('leaves a target that is not the image’s own frame on the generic path', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+
+      const deepStart = 500;
+      run(clock, deepStart);
+      player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
+      await flushEntryImageCapture();
+
+      // A scrub landing anywhere but that one frame — applying the image here would put the playhead
+      // ten frames from where it was asked for.
+      runFrameSpy.mockClear();
+      await player.seek(frames(deepStart + 10));
+
+      expect(runFrameSpy).toHaveBeenCalled();
+      expect(player.getPosition()).toBe(deepStart + 10);
+    });
+  });
+
+  describe('what a transport halt does to the loop', () => {
+    it('disarms the loop on stop, so a fresh play runs past where the lap used to wrap', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      run(clock, 5);
+
+      player.stop();
+
+      expect(player.getSnapshot().loop).toBeNull();
+
+      await player.play();
+      run(clock, 25);
+
+      expect(player.getPosition()).toBe(25);
+    });
+
+    it('keeps the loop armed across a pause, so a resume plays back into the same lap', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setActiveLoop({ startFrame: frames(2), endFrame: frames(6) });
+      run(clock, 3);
+
+      player.pause();
+
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 2, endFrame: 6 });
+
+      await player.play();
+      run(clock, 3); // reaches the loop's end and re-enters its start
+
+      expect(player.getPosition()).toBe(2);
+    });
+  });
+
+  describe("the sink's control path", () => {
+    it("begins the sink with the tune's own chip model, before the first frame", async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune(1, 'mos8580'));
+
+      await player.play();
+
+      expect(sink.beginCalls).toEqual([{ chipModel: 'mos8580' }]);
+      expect(sink.deliveredFrames).toHaveLength(0);
+
+      run(clock, 1);
+      expect(sink.deliveredFrames).toHaveLength(1);
+    });
+
+    it('gates every voice off immediately, then ends the sink, on pause', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(gateTune());
+      await player.play();
+      run(clock, 2);
+
+      player.pause();
+
+      const gateOff = lastDeliveredNow(sink);
+      expect(gateOff.count).toBe(VOICE_CONTROL_REGISTERS.length);
+      for (const register of VOICE_CONTROL_REGISTERS) {
+        expect(valueOf(gateOff, register)).toBe(0);
+      }
+      expect(sink.calls.slice(-2)).toEqual(['deliverNow', 'end']);
+    });
+
+    it('ends the sink exactly once on each of the paths that close a session', async () => {
+      for (const close of [
+        (player: SidPlayer): void => player.stop(),
+        (player: SidPlayer): void => player.dispose(),
+        (player: SidPlayer): void => player.loadTune(silentTune()),
+      ]) {
+        const { player, sink, clock } = harness();
+        player.loadTune(silentTune());
+        await player.play();
+        run(clock, 1);
+
+        close(player);
+
+        expect(sink.endCallCount).toBe(1);
+      }
+    });
+
+    it('ends the sink exactly once when the track plays through to its end', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(2),
+      });
+      await player.play();
+      run(clock, 2);
+
+      expect(player.getSnapshot().transport).toBe('ended');
+      expect(sink.endCallCount).toBe(1);
+    });
+
+    it('ends the sink when the clock fails to start, since begin has already gone out', async () => {
+      const sink = new RecordingSink();
+      const player = createSidPlayer({
+        sink,
+        clock: new FailingClock(),
+        replayRunner: new FakeReplayRunner(),
+      });
+      player.loadTune(silentTune());
+
+      await player.play();
+
+      expect(sink.calls.slice(-2)).toEqual(['begin', 'end']);
+      expect(player.getSnapshot().transport).toBe('error');
+    });
+
+    it('leaves the sink alone on a stop with no tune ever loaded', () => {
+      const { player, sink } = harness();
+
+      player.stop();
+
+      expect(sink.endCallCount).toBe(0);
+    });
+  });
+
+  describe('tempo and the clock', () => {
+    it('halves the interval at double tempo, on the clock and on the sink, while playing', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+
+      player.setTempo(2);
+
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US / 2);
+      expect(sink.retimeCalls).toEqual([PAL_FRAME_INTERVAL_US / 2]);
+    });
+
+    it('leaves the clock alone while stopped, and starts the next run at the tempo asked for', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune());
+
+      player.setTempo(0.5);
+
+      expect(sink.retimeCalls).toHaveLength(0);
+      await player.play();
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US / 0.5);
+    });
+
+    it('ignores a tempo that cannot be divided by', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+
+      player.setTempo(0);
+      player.setTempo(Number.NaN);
+
+      expect(player.getSnapshot().tempo.multiplier).toBe(1);
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+    });
+
+    it('ticks a multispeed tune faster rather than batching its play calls', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(doubleSpeedTune());
+
+      await player.play();
+      run(clock, 1);
+
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US / 2);
+      expect(sink.deliveredFrames).toHaveLength(1);
+      expect(player.getSnapshot().tempo.callsPerFrame).toBe(2);
+    });
+
+    it('re-resolves the running clock when the timing mode changes, with no reload', async () => {
+      const { player, clock } = harness();
+      player.loadTune(doubleSpeedTune());
+      await player.play();
+
+      player.setTimingMode('rounded');
+
+      expect(player.getSnapshot().tempo.timingMode).toBe('rounded');
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US / 2);
+    });
+  });
+
+  describe('seeking', () => {
+    it('lands the playhead while playing, then owes the stream a gate-off and a resync', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 2);
+
+      await player.seek(frames(10));
+
+      expect(player.getPosition()).toBe(10);
+
+      run(clock, 1);
+      const gateOff = lastDelivered(sink);
+      expect(gateOff.count).toBe(VOICE_CONTROL_REGISTERS.length);
+
+      run(clock, 1);
+      const resync = lastDelivered(sink);
+      expect(resync.count).toBe(25);
+      expect(valueOf(resync, 0)).toBe(11); // the counter ran one frame past the landing
+    });
+
+    it('resyncs at once with the voice gates forced off when it lands while paused', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(gateTune());
+      await player.play();
+      run(clock, 2);
+      player.pause();
+
+      await player.seek(frames(10));
+
+      const resync = lastDeliveredNow(sink);
+      expect(resync.count).toBe(25);
+      expect(valueOf(resync, VOICE_CONTROL_REGISTERS[0])).toBe(0);
+    });
+
+    it('resyncs at once with the true voice state when it lands while stopped', async () => {
+      const { player, sink } = harness();
+      player.loadTune(gateTune());
+
+      await player.seek(frames(10));
+
+      const resync = lastDeliveredNow(sink);
+      expect(resync.count).toBe(25);
+      expect(valueOf(resync, VOICE_CONTROL_REGISTERS[0])).toBe(0x41);
+    });
+
+    it('resolves a target before the start of the tune to frame 0 rather than erroring', async () => {
+      const { player } = harness();
+      player.loadTune(counterTune());
+
+      await player.seek(frames(-40));
+
+      expect(player.getPosition()).toBe(0);
+      expect(player.getSnapshot().transport).not.toBe('error');
+    });
+  });
+
+  describe('voices', () => {
+    it('composes the latched and held states as an exclusive-or, in both directions', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(gateTune());
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 4)).toBe(0x41);
+
+      // The mute forces the control register to 0 once, then drops every further write to it.
+      player.setVoiceMuted(0, true);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 4)).toBe(0);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 4)).toBeUndefined();
+
+      // Held on top of latched cancels back out: the tune's write reaches the chip again.
+      player.setVoiceHeld(0, true);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 4)).toBe(0x41);
+
+      player.setVoiceHeld(0, false);
+      run(clock, 2);
+      expect(valueOf(lastDelivered(sink), 4)).toBeUndefined();
+
+      expect(player.getSnapshot().voices[0]).toEqual({ muted: true, held: false });
+    });
+
+    it('clears the latched mutes without disturbing a held voice', () => {
+      const { player } = harness();
+      player.loadTune(gateTune());
+      player.setVoiceMuted(0, true);
+      player.setVoiceMuted(1, true);
+      player.setVoiceHeld(1, true);
+
+      player.clearVoiceMutes();
+
+      expect(player.getSnapshot().voices).toEqual([
+        { muted: false, held: false },
+        { muted: false, held: true },
+        { muted: false, held: false },
+      ]);
+    });
+
+    it('ignores a voice outside the chip', () => {
+      const { player } = harness();
+      player.loadTune(gateTune());
+
+      player.setVoiceMuted(-1, true);
+      player.setVoiceHeld(3, true);
+
+      expect(player.getSnapshot().voices).toEqual([
+        { muted: false, held: false },
+        { muted: false, held: false },
+        { muted: false, held: false },
+      ]);
+    });
+
+    it('starts a fresh tune unmuted and unheld', async () => {
+      const { player, clock } = harness();
+      player.loadTune(gateTune());
+      await player.play();
+      run(clock, 1);
+      player.setVoiceMuted(0, true);
+      player.setVoiceHeld(1, true);
+
+      player.loadTune(gateTune());
+
+      expect(player.getSnapshot().voices).toEqual([
+        { muted: false, held: false },
+        { muted: false, held: false },
+        { muted: false, held: false },
+      ]);
+    });
+  });
+
+  describe('pitch correction', () => {
+    it('carries a target clock through to the register shadow', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x89); // 0x1189
+      expect(valueOf(frame, 1)).toBe(0x11);
+    });
+
+    it('survives a tune load, which starts a register shadow at home', async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setVoicePitch(0, 2);
+
+      player.loadTune(frequencyTune(0x34, 0x12));
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x12); // 0x2312
+      expect(valueOf(frame, 1)).toBe(0x23);
+    });
+
+    it('composes a voice pitch with the correction without either disturbing the other', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      await player.play();
+
+      player.setVoicePitch(0, 2);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x23);
+
+      // The pitch comes home; the correction it never touched is still in force.
+      player.setVoicePitch(0, 1);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x11);
+    });
+
+    it('leaves the tunes own bytes alone with the clocks matched and the pitch at 1', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setVoicePitch(0, 1);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it('ignores a clock pair it cannot divide and a voice outside the chip', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+
+      player.setTargetClock(0, NTSC_PHI2_HZ);
+      player.setTargetClock(PAL_PHI2_HZ, Number.NaN);
+      player.setVoicePitch(3, 0.5);
+      player.setVoicePitch(0, 0);
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+  });
+
+  describe('subtunes', () => {
+    it('resets the playhead and adopts the subtune, leaving repeat-track alone', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune(3));
+      player.setRepeatTrack(true);
+      await player.play();
+      run(clock, 5);
+      expect(player.getPosition()).toBe(5);
+
+      player.selectSubtune(2);
+
+      expect(player.getPosition()).toBe(0);
+      expect(player.getSnapshot().tune).toEqual({
+        subtune: 2,
+        subtuneCount: 3,
+        lengthFrames: null,
+      });
+      expect(player.getSnapshot().repeatTrack).toBe(true);
+    });
+
+    it("clamps a subtune to the tune's own range", () => {
+      const { player } = harness();
+      player.loadTune(silentTune(2));
+
+      player.selectSubtune(9);
+      expect(player.getSnapshot().tune?.subtune).toBe(2);
+
+      player.selectSubtune(0);
+      expect(player.getSnapshot().tune?.subtune).toBe(1);
+    });
+
+    it('carries every register again on the first frame after a subtune change', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune(3));
+      await player.play();
+      run(clock, 2);
+      expect(lastDelivered(sink).count).toBe(0);
+
+      player.selectSubtune(2);
+      run(clock, 1);
+
+      expect(lastDelivered(sink).count).toBe(25);
+    });
+
+    it('steps to the next and previous subtune, clamped to the tune range', () => {
+      const { player } = harness();
+      player.loadTune(silentTune(3));
+
+      player.nextSubtune();
+      expect(player.getSnapshot().tune?.subtune).toBe(2);
+
+      player.previousSubtune();
+      player.previousSubtune(); // already at the bottom — clamps rather than wrapping
+      expect(player.getSnapshot().tune?.subtune).toBe(1);
+    });
+  });
+
+  describe('delivery measurement', () => {
+    it('counts a clamped frame as clamped, and still counts its lag', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+
+      clock.tick(milliseconds(performance.now()), true);
+      clock.tick(milliseconds(performance.now()), false);
+
+      const { delivery } = player.getStats();
+      expect(delivery.clampedFrames).toBe(1);
+      expect(delivery.scheduledFrames).toBe(2);
+    });
+
+    it('counts a frame due earlier than its predecessor as reordered', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+
+      clock.tick(milliseconds(1000));
+      clock.tick(milliseconds(500));
+      clock.tick(milliseconds(1500));
+
+      expect(player.getStats().delivery.reorderedFrames).toBe(1);
+    });
+
+    it('counts a frame handed over more than one interval past due as late, and one handed over on time as not', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+
+      clock.tick(milliseconds(performance.now()));
+      expect(player.getStats().delivery.lateFrames).toBe(0);
+
+      clock.tick(milliseconds(performance.now() - 500));
+      expect(player.getStats().delivery.lateFrames).toBe(1);
+    });
+
+    it('reports the lag in milliseconds, with the worst reading never under the mean', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+
+      clock.tick(milliseconds(performance.now() - 40));
+      clock.tick(milliseconds(performance.now()));
+
+      const { delivery } = player.getStats();
+      expect(delivery.meanLagMs).toBeGreaterThan(0);
+      expect(delivery.worstLagMs).toBeGreaterThanOrEqual(delivery.meanLagMs);
+      expect(delivery.worstLagMs).toBeGreaterThan(30); // ms, not µs
+    });
+
+    it('zeroes the delivery counters for a fresh run rather than carrying the last one forward', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+      run(clock, 3);
+      player.stop();
+
+      await player.play();
+
+      expect(player.getStats().delivery.scheduledFrames).toBe(0);
+    });
+
+    it("reads the sink's own counters through instead of recounting them", async () => {
+      const { player, sink, clock } = harness();
+      sink.setConsumption({ kind: 'known', consumedThroughFrame: frames(2), inFlight: 4 });
+      sink.setCapabilities({
+        perWriteOffsets: true,
+        cancellation: true,
+        scheduleAheadMs: null,
+        preservesWriteOrder: true,
+      });
+      player.loadTune(silentTune());
+      await player.play();
+      run(clock, 3);
+
+      const stats = player.getStats();
+      expect(stats.sink.farEnd).toEqual({
+        kind: 'known',
+        consumedThroughFrame: 2,
+        inFlight: 4,
+      });
+      expect(stats.sink.capabilities.cancellation).toBe(true);
+      expect(stats.framesRendered).toBe(3);
+    });
+
+    it('leaves the frames a pause or a landed jump sends immediately out of the schedule', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+      run(clock, 2);
+
+      player.pause();
+
+      expect(player.getStats().delivery.scheduledFrames).toBe(2);
+    });
+  });
+
+  describe('cpu headroom', () => {
+    it("computes headroom against the tune's own PAL or NTSC cycle budget", async () => {
+      const pal = harness();
+      pal.player.loadTune(counterTune('pal'));
+      await pal.player.play();
+      run(pal.clock, 1);
+      const palStats = pal.player.getStats();
+      const palBudget = PAL_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES;
+
+      const ntsc = harness();
+      ntsc.player.loadTune(counterTune('ntsc'));
+      await ntsc.player.play();
+      run(ntsc.clock, 1);
+      const ntscStats = ntsc.player.getStats();
+      const ntscBudget = NTSC_CYCLES_PER_FRAME * PLAY_BUDGET_FRAMES;
+
+      // The same play routine costs the same cycles under either clock — only the budget the
+      // headroom figure divides it against should differ.
+      expect(palStats.cpu.cyclesUsed).toBe(ntscStats.cpu.cyclesUsed);
+      expect(palStats.cpu.headroom).toBeCloseTo(1 - palStats.cpu.cyclesUsed / palBudget, 10);
+      expect(ntscStats.cpu.headroom).toBeCloseTo(1 - ntscStats.cpu.cyclesUsed / ntscBudget, 10);
+      expect(palStats.cpu.headroom).not.toBe(ntscStats.cpu.headroom);
+    });
+
+    it('reports full headroom and no cycles spent before any frame has run', () => {
+      const { player } = harness();
+
+      expect(player.getStats().cpu).toEqual({ cyclesUsed: 0, headroom: 1 });
+    });
+
+    it('reports zero headroom when the play routine burns its whole cycle budget', async () => {
+      const { player, clock } = harness();
+      player.loadTune(runawayTune());
+      await player.play();
+
+      run(clock, 1);
+
+      expect(player.getStats().cpu.headroom).toBe(0);
+    });
+  });
+
+  describe('voice register stats', () => {
+    it('decodes gate and waveform off the live register shadow', async () => {
+      const { player, clock } = harness();
+      player.loadTune(gateTune()); // writes 0x41 to $D404 every play call — waveform 4, gate on
+      await player.play();
+      run(clock, 1);
+
+      const { voices } = player.getStats();
+      expect(voices[0]).toEqual({ gate: true, waveform: 0x4, frequency: 0, envelope: 0 });
+      expect(voices[1]).toEqual({ gate: false, waveform: 0, frequency: 0, envelope: 0 });
+      expect(voices[2]).toEqual({ gate: false, waveform: 0, frequency: 0, envelope: 0 });
+    });
+
+    it('reports three silent voices before any tune has loaded', () => {
+      const { player } = harness();
+
+      expect(player.getStats().voices).toEqual([
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+        { gate: false, waveform: 0, frequency: 0, envelope: 0 },
+      ]);
+    });
+  });
+
+  describe('emitted register bytes', () => {
+    it("reports the tune's raw volume byte as written and the gain-scaled one as sent", async () => {
+      const { player, clock } = harness();
+      player.loadTune(volumeTune(0x2f));
+      player.setOutputGain(0.5);
+      await player.play();
+      run(clock, 1);
+
+      const { emitted } = player.getStats();
+      expect(emitted.written[24]).toBe(0x2f);
+      expect(emitted.sent[24]).toBe(0x20 | Math.round(0x0f * 0.5));
+      expect(emitted.sent[0]).toBe(emitted.written[0]); // untouched by gain — unchanged
+    });
+
+    it('ignores a non-finite or out-of-0…1-range gain rather than let it corrupt the scaled byte', async () => {
+      const { player, clock } = harness();
+      player.loadTune(volumeTune(0x2f));
+      player.setOutputGain(0.5);
+
+      player.setOutputGain(Number.NaN);
+      player.setOutputGain(-0.1);
+      player.setOutputGain(1.1);
+      player.setOutputGain(Number.POSITIVE_INFINITY);
+
+      await player.play();
+      run(clock, 1);
+
+      const { emitted } = player.getStats();
+      expect(emitted.sent[24]).toBe(0x20 | Math.round(0x0f * 0.5)); // still the last valid gain
+    });
+
+    it('matches written and sent, 25 registers wide, before any tune has loaded', () => {
+      const { player } = harness();
+
+      const { emitted } = player.getStats();
+      expect(emitted.written).toHaveLength(SID_REGISTER_COUNT);
+      expect(emitted.sent).toEqual(emitted.written);
+    });
+  });
+
+  describe('resync in-flight depth', () => {
+    it("reports 1 while a landed jump's gate-off is still owed to the stream, 0 once it has gone out", async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 2);
+
+      await player.seek(frames(10));
+      expect(player.getStats().resync.inFlightDepth).toBe(1);
+
+      run(clock, 1); // delivers the gate-off, clearing what was owed
+      expect(player.getStats().resync.inFlightDepth).toBe(0);
+    });
+
+    it('reports 0 before any jump or loop has ever queued a resync', () => {
+      const { player } = harness();
+
+      expect(player.getStats().resync.inFlightDepth).toBe(0);
+    });
+  });
+
+  describe('the exact play-call rate', () => {
+    it('reports the unrounded rate alongside the rounded one once they genuinely disagree', () => {
+      const { player } = harness();
+      player.loadTune(fractionalSpeedTune());
+
+      const { rate } = player.getStats();
+      expect(rate.exactCallsPerFrame).toBeCloseTo(2.4, 5);
+      expect(rate.roundedCallsPerFrame).toBe(2);
+    });
+  });
+
+  describe('the read side', () => {
+    it('notifies on a discrete change and stays quiet while the playhead moves', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune());
+      await player.play();
+      let notifications = 0;
+      const unsubscribe = player.subscribe(() => {
+        notifications++;
+      });
+
+      run(clock, 5);
+      expect(notifications).toBe(0);
+      expect(player.getPosition()).toBe(5);
+
+      player.pause();
+      expect(notifications).toBe(1);
+
+      unsubscribe();
+      player.stop();
+      expect(notifications).toBe(1);
+    });
+
+    it('holds snapshot identity across a change that changes nothing', () => {
+      const { player } = harness();
+      player.loadTune(silentTune());
+      const before = player.getSnapshot();
+
+      player.setRepeatTrack(false);
+
+      expect(player.getSnapshot()).toBe(before);
+    });
+
+    it("publishes the tune's measured length, its basis and the loop the application set", () => {
+      const { player } = harness();
+      player.loadTune(counterTune());
+
+      player.setTrackStructure({
+        loopStartFrame: frames(100),
+        loopPeriodFrames: frames(400),
+        endedAtFrame: null,
+      });
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+
+      const snapshot = player.getSnapshot();
+      expect(snapshot.tune?.lengthFrames).toBe(500);
+      expect(snapshot.basis.trackEndFrame).toBe(500);
+      expect(snapshot.basis.positionBasisFrames).toBe(500);
+      expect(snapshot.loop).toEqual({ startFrame: 10, endFrame: 20 });
+    });
+
+    it('falls back to the fixed ceiling as the basis when detection answered nothing', () => {
+      const { player } = harness();
+      player.loadTune(counterTune());
+
+      const snapshot = player.getSnapshot();
+      expect(snapshot.tune?.lengthFrames).toBeNull();
+      expect(snapshot.basis.positionBasisFrames).toBe(snapshot.basis.ceilingFrames);
+    });
+
+    it('reports no tune before one is loaded', () => {
+      const { player } = harness();
+
+      expect(player.getSnapshot().tune).toBeNull();
+      expect(player.getStats().effectiveIntervalUs).toBe(0);
+    });
+  });
+
+  it('releases the replay thread and closes the session when disposed mid-playback', async () => {
+    const { player, sink, clock, replay } = harness();
+    player.loadTune(silentTune());
+    await player.play();
+    run(clock, 1);
+
+    player.dispose();
+
+    expect(replay.disposed).toBe(true);
+    expect(sink.endCallCount).toBe(1);
+    expect(() => run(clock, 1)).toThrow();
+  });
+});

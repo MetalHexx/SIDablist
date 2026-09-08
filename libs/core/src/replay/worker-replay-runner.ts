@@ -1,0 +1,71 @@
+import type { ReplayRequest, ReplayResponse, ReplayRunner } from './replay-runner.js';
+
+const defaultWorkerFactory = (): Worker =>
+  new Worker(new URL('./replay.worker.js', import.meta.url), { type: 'module' });
+
+/**
+ * The real runner: a dedicated worker thread that keeps a deep jump's emulation off the main one, so
+ * a frame clock keeps ticking and a packet stream stays unbroken while the replay runs.
+ *
+ * The worker is built on first use rather than in the constructor — a session that never scrubs
+ * never pays for it — and every response is matched back to its request by `id`, since several can
+ * be in flight and only the newest one is wanted. The worker is constructed through
+ * `workerFactory`, so a Node test never touches `Worker`.
+ */
+export function createWorkerReplayRunner(
+  workerFactory: () => Worker = defaultWorkerFactory,
+): ReplayRunner {
+  return new WorkerReplayRunnerImpl(workerFactory);
+}
+
+class WorkerReplayRunnerImpl implements ReplayRunner {
+  private worker: Worker | null = null;
+  private readonly pending = new Map<number, (response: ReplayResponse) => void>();
+
+  constructor(private readonly workerFactory: () => Worker) {}
+
+  run(request: ReplayRequest): Promise<ReplayResponse> {
+    const worker = this.ensureWorker();
+    return new Promise<ReplayResponse>((resolve) => {
+      this.pending.set(request.id, resolve);
+      worker.postMessage(request);
+    });
+  }
+
+  dispose(): void {
+    this.worker?.terminate();
+    this.worker = null;
+    this.pending.clear();
+  }
+
+  private ensureWorker(): Worker {
+    const existing = this.worker;
+    if (existing !== null) {
+      return existing;
+    }
+
+    const worker = this.workerFactory();
+    worker.onmessage = (event: MessageEvent<ReplayResponse>): void => {
+      const resolve = this.pending.get(event.data.id);
+      this.pending.delete(event.data.id);
+      resolve?.(event.data);
+    };
+    // A worker that dies takes every promise waiting on it with it, which would leave the caller
+    // holding an outstanding jump id forever and silently drop every jump after it.
+    worker.onerror = (): void => {
+      for (const [id, resolve] of this.pending) {
+        resolve({ id, ok: false, error: 'the replay worker stopped responding' });
+      }
+      this.pending.clear();
+      // Retire this instance — otherwise the next run() reuses a worker that already failed, and
+      // its promise can be left unresolved forever, the exact failure mode this handler exists to
+      // prevent.
+      worker.terminate();
+      if (this.worker === worker) {
+        this.worker = null;
+      }
+    };
+    this.worker = worker;
+    return worker;
+  }
+}
