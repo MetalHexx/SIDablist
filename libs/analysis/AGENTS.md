@@ -56,11 +56,11 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 
 ## When a change here ripples
 
-- **Changed `TuneIndexRecord`'s fields, or bumped `TUNE_INDEX_FORMAT_VERSION`?** The `libs/tunes`
-  package (not yet standing) resolves a tune's cached scan by comparing this version on every hit,
-  and the consuming application stores the record itself — a bump invalidates every stored scan.
-  Confirm the new shape and version are what the resolver and the application's storage migration
-  actually expect before shipping the bump.
+- **Changed `TuneIndexRecord`'s fields, or bumped `TUNE_INDEX_FORMAT_VERSION`?** `libs/tunes`'s
+  resolver reads a tune's cached scan by comparing this version on every hit, and the consuming
+  application stores the record itself — a bump invalidates every stored scan. Confirm the new
+  shape and version are what the resolver and the application's storage migration actually expect
+  before shipping the bump. Detail: [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
 
 ## Commands
 
