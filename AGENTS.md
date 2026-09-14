@@ -12,10 +12,11 @@ the writes. Nothing here synthesizes sound.
 
 Filled in as libraries land — a module missing from this table is a module no agent will route to.
 
-| Module      | Owns                                                                                                  | Detail                                         |
-| ----------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| `libs/core` | The timeline engine: running a tune's own 6502 code and turning its register writes into `SidFrame`s. | [`libs/core/AGENTS.md`](./libs/core/AGENTS.md) |
-| `libs/asid` | The ASID wire format and its MIDI scheduling — one `SidSink` implementation.                          | [`libs/asid/AGENTS.md`](./libs/asid/AGENTS.md) |
+| Module          | Owns                                                                                                                                             | Detail                                                 |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------ |
+| `libs/core`     | The timeline engine: running a tune's own 6502 code and turning its register writes into `SidFrame`s.                                            | [`libs/core/AGENTS.md`](./libs/core/AGENTS.md)         |
+| `libs/asid`     | The ASID wire format and its MIDI scheduling — one `SidSink` implementation.                                                                     | [`libs/asid/AGENTS.md`](./libs/asid/AGENTS.md)         |
+| `libs/analysis` | Turns a scanned tune's register stream into its persisted `TuneIndexRecord` — the detectors, plus the scan ladder that decides how deep to scan. | [`libs/analysis/AGENTS.md`](./libs/analysis/AGENTS.md) |
 
 ## Invariants
 
