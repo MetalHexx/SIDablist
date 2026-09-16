@@ -109,7 +109,7 @@ async function resolveOnce(
   }
 
   const file = parseSidFile(bytes);
-  if (subtune < 1 || subtune > file.songs) {
+  if (!Number.isInteger(subtune) || subtune < 1 || subtune > file.songs) {
     throw new RangeError(
       `subtune ${subtune} is out of range for ${sidHash} (file has ${file.songs} subtune(s))`,
     );

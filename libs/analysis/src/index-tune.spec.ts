@@ -89,6 +89,30 @@ function loopingOutput(frames: number, period: number): ScanOutput {
   };
 }
 
+/** Voice 0's gate toggling every 120 frames at a multispeed rate (`callsPerFrame: 2`,
+ *  `exactCallsPerFrame: 2.4`) — the reviewer's own example: a 2.4-calls/frame tune with a 60 BPM
+ *  pulse. Frequency stays 0 throughout, so `segmentNotes` never opens a note and key detection stays
+ *  out of this fixture's way; `frames` is short enough that `detectLoop` never verifies it (its tail
+ *  always undershoots `minTailFrames`, computed off the rounded rate), so the ladder runs to
+ *  exhaustion and `pulse`/`nativeTempo` are computed from this same data every rung. */
+function multispeedPulseOutput(): ScanOutput {
+  const halfPeriodFrames = 120;
+  const frames = halfPeriodFrames * 6;
+  const registerValues = new Uint8Array(frames * SID_REGISTER_COUNT);
+  for (let f = 0; f < frames; f++) {
+    const gateOn = Math.floor(f / halfPeriodFrames) % 2 === 0;
+    // Voice 0's control register: triangle waveform, gate bit toggling.
+    registerValues[f * SID_REGISTER_COUNT + 4] = gateOn ? 0x11 : 0x10;
+  }
+  return {
+    registerValues,
+    writeCounts: new Uint8Array(frames),
+    frames,
+    callsPerFrame: 2,
+    exactCallsPerFrame: 2.4,
+  };
+}
+
 describe('indexTune — the ladder', () => {
   it('opens with a zero-frame probe, and every rung after it shares that session', async () => {
     const scanner = new ScriptedScanner([
@@ -201,6 +225,28 @@ describe('indexTune — the ladder', () => {
     expect(record.formatVersion).toBe(5);
     expect(record.callsPerFrame).toBe(1);
     expect(record.exactCallsPerFrame).toBe(1.03);
+  });
+
+  it('finds a multispeed pulse the nominal 1× histogram cap would discard, and computes nativeTempo off the exact rate', async () => {
+    const pulseOutput = multispeedPulseOutput();
+    const scanner = new ScriptedScanner([
+      { kind: 'done', output: probeOutput(2, 2.4) },
+      { kind: 'done', output: pulseOutput },
+      { kind: 'done', output: pulseOutput },
+      { kind: 'done', output: pulseOutput },
+      { kind: 'done', output: pulseOutput },
+    ]);
+
+    const record = await indexTune(scanner, BUNDLED_BYTES, IDENTITY);
+
+    // A 120-frame interval is past the ~101-frame cap a nominal-PAL-1× histogram would use — it only
+    // survives because the ladder now sizes that cap off `exactCallsPerFrame` (2.4), not 1.
+    expect(record.dominantIntervalFrames).toBe(120);
+    expect(record.pulseConfidence).toBe('strong');
+    // 120 frames at 19,950 µs / 2.4 calls-per-frame is ~0.9975s of music, ~60.15 BPM. Computed off the
+    // rounded rate (2) instead, the same interval reads about 20% slower.
+    expect(record.nativeTempo).not.toBeNull();
+    expect(record.nativeTempo ?? 0).toBeCloseTo(60.15, 1);
   });
 });
 

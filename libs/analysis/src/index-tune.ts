@@ -92,9 +92,16 @@ export async function indexTune(
   const matrix = buildFeatureMatrix(output);
   const novelty = computeNovelty(matrix, DEFAULT_FEATURE_WEIGHTS);
   const structure = computeStructure(matrix, DEFAULT_FEATURE_WEIGHTS);
-  const pulse = computePulse(novelty.candidates);
+  const pulse = computePulse(novelty.candidates, output.exactCallsPerFrame);
   const key = detectKey(segmentNotes(output, file.clock));
-  const tempo = impliedTempo(pulse.dominantInterval, nominalIntervalUs, output.callsPerFrame, 1);
+  // Duration-facing, unlike the ladder's rung sizing above: the exact rate, not the rounded one — see
+  // `C64Machine.exactCallsPerFrame`'s own doc for why rounding here would mis-tempo a multispeed tune.
+  const tempo = impliedTempo(
+    pulse.dominantInterval,
+    nominalIntervalUs,
+    output.exactCallsPerFrame,
+    1,
+  );
 
   return {
     sidHash: identity.sidHash,

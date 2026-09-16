@@ -7,11 +7,15 @@ export interface PulseResult {
   readonly confidence: 'strong' | 'weak' | 'none';
 }
 
-/** Maximum interval to track in frames — roughly 2 seconds at nominal PAL timing (19,950 µs).
- *  At PAL, this is about 100 frames; at NTSC, about 83 frames. Keeps the histogram array small
- *  and the chart readable. */
+/** Maximum interval to track — roughly 2 seconds of music. Keeps the histogram array small and the
+ *  chart readable. Expressed in frames via `callsPerFrame`, the same play-rate seam
+ *  `loop-detect.ts`'s thresholds convert through: a multispeed tune packs more recorded frames into
+ *  the same 2 seconds of music, so a candidate's `frame` values already live in the scan's own frame
+ *  units, not nominal PAL 1× ones. */
 const MAX_HISTOGRAM_INTERVAL_US = 2_000_000;
 const NOMINAL_INTERVAL_US = 19_950;
+/** What a caller gets when it has no scan to read a real play rate off — nominal PAL 1×, matching
+ *  this module's previous, un-parameterised behaviour. */
 const NOMINAL_CALLS_PER_FRAME = 1;
 
 /**
@@ -25,8 +29,15 @@ const NOMINAL_CALLS_PER_FRAME = 1;
  * - `none`: flat or near-flat histogram, or fewer than 2 candidates (no intervals to measure)
  *
  * Edge cases (empty or single-candidate lists) return `none` with a null interval.
+ *
+ * @param callsPerFrame the scan's play-call rate — pass `ScanOutput.exactCallsPerFrame` so the
+ *  2-second cap covers the same span of music for a multispeed tune that it does at 1×. Defaults to
+ *  nominal PAL 1× for callers with no scan to read a rate off.
  */
-export function computePulse(candidates: readonly Candidate[]): PulseResult {
+export function computePulse(
+  candidates: readonly Candidate[],
+  callsPerFrame: number = NOMINAL_CALLS_PER_FRAME,
+): PulseResult {
   if (candidates.length < 2) {
     return {
       histogram: new Uint32Array(0),
@@ -35,9 +46,11 @@ export function computePulse(candidates: readonly Candidate[]): PulseResult {
     };
   }
 
-  // Maximum interval size for histogram in frames, derived from the nominal PAL timing.
+  // Maximum interval size for histogram in frames, derived from the nominal PAL timing and the
+  // scan's own play rate — a multispeed tune's frames are shorter slices of real time, so it takes
+  // more of them to span the same 2 seconds of music.
   const maxIntervalFrames = Math.ceil(
-    (MAX_HISTOGRAM_INTERVAL_US / NOMINAL_INTERVAL_US) * NOMINAL_CALLS_PER_FRAME,
+    (MAX_HISTOGRAM_INTERVAL_US / NOMINAL_INTERVAL_US) * callsPerFrame,
   );
 
   // Build histogram of intervals between consecutive candidates.

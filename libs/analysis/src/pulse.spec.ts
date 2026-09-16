@@ -63,6 +63,37 @@ describe('pulse analysis', () => {
       expect(result.confidence).toBe('none');
     });
 
+    it('scales the cap by callsPerFrame, so a multispeed interval a nominal-1× cap would discard survives', () => {
+      // A 120-frame interval — past the ~101-frame cap at nominal PAL 1×, the same interval a
+      // 2.4-calls/frame tune's 60 BPM pulse produces (see index-tune.spec.ts's own scenario).
+      const candidates: Candidate[] = [
+        { frame: 0, strength: 0.8, contributors: [] },
+        { frame: 120, strength: 0.8, contributors: [] },
+        { frame: 240, strength: 0.8, contributors: [] },
+      ];
+
+      const atNominalRate = computePulse(candidates);
+      expect(atNominalRate.dominantInterval).toBe(null);
+      expect(atNominalRate.confidence).toBe('none');
+
+      const atMultispeedRate = computePulse(candidates, 2.4);
+      expect(atMultispeedRate.dominantInterval).toBe(120);
+      expect(atMultispeedRate.confidence).toBe('strong');
+    });
+
+    it('defaults to the nominal-PAL-1× cap when callsPerFrame is omitted', () => {
+      const candidates: Candidate[] = [
+        { frame: 0, strength: 0.8, contributors: [] },
+        { frame: 50, strength: 0.8, contributors: [] },
+      ];
+
+      const withoutRate = computePulse(candidates);
+      const atOneCallPerFrame = computePulse(candidates, 1);
+
+      expect(withoutRate.histogram.length).toBe(atOneCallPerFrame.histogram.length);
+      expect(withoutRate.dominantInterval).toBe(atOneCallPerFrame.dominantInterval);
+    });
+
     it('builds histogram with correct counts', () => {
       // Intervals: 10, 10, 10, 5, 5
       const candidates: Candidate[] = [

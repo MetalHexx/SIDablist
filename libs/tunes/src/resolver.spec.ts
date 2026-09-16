@@ -47,6 +47,28 @@ async function seededStore(): Promise<InMemoryTuneStore> {
   return store;
 }
 
+const HEADER_SIZE_V1 = 0x16; // 22 bytes — magic, version, dataOffset, addresses, songs/startSong/speed
+
+/** A minimal, valid v1 PSID header with `songs` set as given — Still Time's own fixture carries only
+ *  one subtune, which cannot isolate a fractional-but-in-range value from an out-of-range one. */
+function buildMinimalSidBytes(songs: number): Uint8Array {
+  const payload = new Uint8Array([0xa9, 0x00, 0x60]);
+  const buffer = new Uint8Array(HEADER_SIZE_V1 + payload.length);
+  const view = new DataView(buffer.buffer);
+  const magic = 'PSID';
+  for (let i = 0; i < magic.length; i++) buffer[i] = magic.charCodeAt(i);
+  view.setUint16(0x04, 1, false); // version 1
+  view.setUint16(0x06, HEADER_SIZE_V1, false); // dataOffset
+  view.setUint16(0x08, 0x1000, false); // loadAddress
+  view.setUint16(0x0a, 0x1000, false); // initAddress
+  view.setUint16(0x0c, 0x1003, false); // playAddress
+  view.setUint16(0x0e, songs, false); // songs
+  view.setUint16(0x10, 1, false); // startSong
+  view.setUint32(0x12, 0, false); // speedFlags
+  buffer.set(payload, HEADER_SIZE_V1);
+  return buffer;
+}
+
 function fakeIndexer() {
   const index = vi.fn(async (_bytes: Uint8Array, identity: TuneIdentity) =>
     fakeIndexRecord({ sidHash: identity.sidHash, subtune: identity.subtune }),
@@ -140,6 +162,23 @@ describe('createTuneResolver', () => {
       resolver.resolve({ sidHash: STILL_TIME_HASH, subtune: STILL_TIME_FILE.songs + 1 }),
     ).rejects.toThrow(RangeError);
     expect(indexer.index).not.toHaveBeenCalled();
+  });
+
+  it('throws RangeError for a non-integer subtune that is otherwise in range, and never calls the indexer or the store index', async () => {
+    // songs: 3, so 1.5 passes a bounds-only check (1 <= 1.5 <= 3) — it must be the integer check that
+    // rejects it, not the range check `subtune out of range` already covers elsewhere in this suite.
+    const bytes = buildMinimalSidBytes(3);
+    const hash = md5Hex(bytes);
+    const store = new InMemoryTuneStore();
+    await store.putBytes(hash, bytes);
+    const getIndexSpy = vi.spyOn(store, 'getIndex');
+    const indexer = fakeIndexer();
+    const resolver = createTuneResolver(store, indexer);
+
+    await expect(resolver.resolve({ sidHash: hash, subtune: 1.5 })).rejects.toThrow(RangeError);
+    expect(indexer.index).not.toHaveBeenCalled();
+    // The whole point: a fractional subtune must never reach the store as a lookup/index key.
+    expect(getIndexSpy).not.toHaveBeenCalled();
   });
 
   it('rejects non-SID bytes with SidParseError', async () => {
