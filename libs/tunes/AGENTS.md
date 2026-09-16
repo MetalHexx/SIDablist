@@ -18,8 +18,9 @@ it except `InMemoryTuneStore`.
   deliberately dumb: no rules, just storage.
 - `inserter.ts` — `TuneInserter` / `createTuneInserter`: hashes and stores a tune's bytes,
   idempotent by construction.
-- `resolver.ts` — `TuneResolver` / `createTuneResolver`: the lookup-or-index rule and the
-  in-flight de-duplication that makes concurrent resolves of one identity share a single scan.
+- `resolver.ts` — `TuneResolver` / `createTuneResolver`: the lookup-or-index rule, the in-flight
+  de-duplication that makes concurrent resolves of one identity share a single scan, and the
+  optional `onScanStart` hook that tells a host a real scan (not a cache hit) is about to run.
 - `md5.ts` — `md5Hex`, RFC 1321 MD5 hand-rolled with no dependency, since `sidHash` is a content
   MD5 and nothing else here needs a hashing library.
 - `testing/in-memory-tune-store.ts` — `InMemoryTuneStore`, a `Map`-backed `TuneStore` exported
@@ -37,9 +38,13 @@ it except `InMemoryTuneStore`.
 ## Hazards
 
 - **The in-flight de-dup map is per-resolver-instance and rejection clears it.** `resolver.ts`
-  keys `Map<string, Promise<Playable | null>>` by `${sidHash}:${subtune}` and deletes the entry in
-  `finally`, not only on success — a rejected scan must never be cached as if it were a completed
-  answer, or a transient failure would wedge that identity until the process restarts.
+  keys `Map<string, InFlightEntry>` by `${sidHash}:${subtune}`, where each entry holds the shared
+  promise, whether its scan has started, and the `onScanStart` hooks still waiting on it — and
+  deletes the entry in `finally`, not only on success, so a rejected scan is never cached as if it
+  were a completed answer and the next resolve of that identity scans again instead of wedging.
+  A joiner's hook fires immediately, inline, if it arrives after `scanStarted` flips true; before
+  that it queues to fire alongside the others when the scan starts. Every hook runs inside its own
+  `try/catch` so a throwing host callback never rejects the shared promise or blocks a sibling hook.
 - **A `Playable` never exists without its `index`.** The resolver's only two outcomes are
   bytes-with-index or `null`; do not add a code path that hands back bytes alone; a deck that plays
   from a `Playable` trusts the index is there.

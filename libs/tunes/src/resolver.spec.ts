@@ -152,4 +152,121 @@ describe('createTuneResolver', () => {
       SidParseError,
     );
   });
+
+  describe('onScanStart', () => {
+    it('fires once on a miss, before the indexer is called', async () => {
+      const store = await seededStore();
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const onScanStart = vi.fn(() => {
+        expect(indexer.index).not.toHaveBeenCalled();
+      });
+
+      await resolver.resolve(IDENTITY, { onScanStart });
+
+      expect(onScanStart).toHaveBeenCalledTimes(1);
+      expect(indexer.index).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not fire on a lookup hit', async () => {
+      const store = await seededStore();
+      await store.putIndex(fakeIndexRecord());
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const onScanStart = vi.fn();
+
+      await resolver.resolve(IDENTITY, { onScanStart });
+
+      expect(onScanStart).not.toHaveBeenCalled();
+    });
+
+    it('does not fire when getBytes is null', async () => {
+      const store = new InMemoryTuneStore();
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const onScanStart = vi.fn();
+
+      const playable = await resolver.resolve(
+        { sidHash: 'unknown-hash', subtune: 1 },
+        { onScanStart },
+      );
+
+      expect(playable).toBeNull();
+      expect(onScanStart).not.toHaveBeenCalled();
+    });
+
+    it('fires on a stale formatVersion', async () => {
+      const store = await seededStore();
+      await store.putIndex(fakeIndexRecord({ formatVersion: TUNE_INDEX_FORMAT_VERSION - 1 }));
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const onScanStart = vi.fn();
+
+      await resolver.resolve(IDENTITY, { onScanStart });
+
+      expect(onScanStart).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires for both callers of two concurrent resolves sharing one scan', async () => {
+      const store = await seededStore();
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const firstHook = vi.fn();
+      const secondHook = vi.fn();
+
+      await Promise.all([
+        resolver.resolve(IDENTITY, { onScanStart: firstHook }),
+        resolver.resolve(IDENTITY, { onScanStart: secondHook }),
+      ]);
+
+      expect(indexer.index).toHaveBeenCalledTimes(1);
+      expect(firstHook).toHaveBeenCalledTimes(1);
+      expect(secondHook).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires immediately for a joiner arriving after the scan started', async () => {
+      const store = await seededStore();
+      let releaseIndex: (() => void) | undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseIndex = resolve;
+      });
+      const index = vi.fn(async (bytes: Uint8Array, identity: TuneIdentity) => {
+        await gate;
+        return fakeIndexRecord({ sidHash: identity.sidHash, subtune: identity.subtune });
+      });
+      const resolver = createTuneResolver(store, { index });
+      const firstHook = vi.fn(() => {
+        // Scan has started: a joiner arriving now must be invoked synchronously, inline.
+        const lateHook = vi.fn();
+        resolver.resolve(IDENTITY, { onScanStart: lateHook });
+        expect(lateHook).toHaveBeenCalledTimes(1);
+      });
+
+      const first = resolver.resolve(IDENTITY, { onScanStart: firstHook });
+      releaseIndex?.();
+      await first;
+
+      expect(firstHook).toHaveBeenCalledTimes(1);
+    });
+
+    it('swallows a throwing hook without rejecting resolve or blocking a second hook', async () => {
+      const store = await seededStore();
+      const indexer = fakeIndexer();
+      const resolver = createTuneResolver(store, indexer);
+      const throwingHook = vi.fn(() => {
+        throw new Error('boom');
+      });
+      const secondHook = vi.fn();
+
+      const [first, second] = await Promise.all([
+        resolver.resolve(IDENTITY, { onScanStart: throwingHook }),
+        resolver.resolve(IDENTITY, { onScanStart: secondHook }),
+      ]);
+
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(throwingHook).toHaveBeenCalledTimes(1);
+      expect(secondHook).toHaveBeenCalledTimes(1);
+    });
+  });
 });
