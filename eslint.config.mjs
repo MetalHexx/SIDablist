@@ -27,7 +27,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['libs/core/**/*.ts'],
+    files: ['libs/core/**/*.ts', 'libs/analysis/**/*.ts', 'libs/tunes/**/*.ts'],
     rules: {
       'no-restricted-globals': [
         'error',

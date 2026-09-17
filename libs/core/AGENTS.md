@@ -91,6 +91,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   incomplete CPU state silently, since `MachineSnapshot.cpu` is an opaque `CpuState` record. Keep
   the key list in sync and run `cpu/vendor-cpu.spec.ts`. Detail:
   [`cpu/vendor-cpu.ts`](./src/cpu/vendor-cpu.ts).
+- **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`)
+  or `RegisterFrame`'s snapshot API?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
+  shifted meaning is a wrong index record, not a compile error. Run analysis's
+  `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 
 ## Commands
 
