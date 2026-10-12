@@ -31,10 +31,22 @@ export { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from './registers/clock-ratio.j
 export {
   NTSC_FRAME_INTERVAL_US,
   PAL_FRAME_INTERVAL_US,
+  SID_FILTER_MODE_BAND_PASS,
+  SID_FILTER_MODE_HIGH_PASS,
+  SID_FILTER_MODE_LOW_PASS,
+  SID_FILTER_MODE_OFF,
   SID_REGISTER_COUNT,
   VOICE_CONTROL_REGISTERS,
   VOICE_COUNT,
 } from './registers/sid-constants.js';
+export {
+  type SidField,
+  type SidFieldName,
+  type SidVoiceFieldName,
+  type SidChipFieldName,
+  SID_FIELD_WIDTHS,
+  readSidField,
+} from './registers/sid-fields.js';
 export { clamp, MICROSECONDS_PER_SECOND, framesToSeconds } from './common/math.js';
 export { describeError } from './common/errors.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
