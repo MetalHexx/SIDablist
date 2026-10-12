@@ -3,6 +3,8 @@ import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from './clock-ratio.js';
 import { createRegisterFrame } from './register-frame.js';
 import type { RegisterFrame, ScaledRegisterGroup, SidFilterMode } from './register-frame.js';
 import type { SidFrame } from './sid-frame.js';
+import { readSidField } from './sid-fields.js';
+import type { SidField } from './sid-fields.js';
 import { SID_REGISTER_COUNT, VOICE_CONTROL_REGISTERS } from './sid-constants.js';
 import { clamp } from '../common/math.js';
 import { createC64Machine } from '../cpu/c64-machine.js';
@@ -1366,6 +1368,468 @@ describe('RegisterFrame', () => {
     });
   });
 });
+
+describe('RegisterFrame field holds', () => {
+  const CUTOFF = { name: 'cutoff' } as const;
+  const FILTER_TYPE = { name: 'filterType' } as const;
+  const CUTOFF_LOW = 21;
+  const CUTOFF_HIGH = 22;
+  const ROUTING = 23;
+  const VOLUME = 24;
+
+  /** A frame whose tune wrote `bytes` once, with that frame already delivered — so what comes out
+   *  next is what the holds alone force. */
+  function frameWith(
+    bytes: readonly (readonly [register: number, value: number])[],
+  ): RegisterFrame {
+    const frame = createRegisterFrame();
+    for (const [register, value] of bytes) {
+      frame.onSidWrite(register, value);
+    }
+    frame.takeSnapshot();
+    return frame;
+  }
+
+  describe('a field of each shape', () => {
+    it('holds a 16-bit pair across both registers, then restores both once', () => {
+      const frame = frameWith([
+        [7, 0x34],
+        [8, 0x12],
+      ]);
+      const frequency = { name: 'frequency', voice: 1 } as const;
+
+      frame.holdField(frequency, 0xabcd);
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 7, value: 0xcd },
+        { register: 8, value: 0xab },
+      ]);
+
+      frame.releaseField(frequency);
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 7, value: 0x34 },
+        { register: 8, value: 0x12 },
+      ]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('holds the split 11-bit cutoff, sparing the unused bits of its low register', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+
+      frame.holdField(CUTOFF, 0x555);
+      const held = frame.takeSnapshot();
+      expect(emittedValue(held, CUTOFF_LOW)).toBe(0xf8 | 0x05);
+      expect(emittedValue(held, CUTOFF_HIGH)).toBe(0xaa);
+
+      frame.releaseField(CUTOFF);
+      const released = frame.takeSnapshot();
+      expect(emittedValue(released, CUTOFF_LOW)).toBe(0xff);
+      expect(emittedValue(released, CUTOFF_HIGH)).toBe(0x65);
+    });
+
+    it('holds one nibble of a register and leaves the other with the tune', () => {
+      const frame = frameWith([[19, 0x5a]]);
+      const attack = { name: 'attack', voice: 2 } as const;
+
+      frame.holdField(attack, 0x0c);
+      expect(emittedValue(frame.takeSnapshot(), 19)).toBe(0xca);
+
+      frame.releaseField(attack);
+      expect(emittedValue(frame.takeSnapshot(), 19)).toBe(0x5a);
+    });
+
+    it('holds a single bit, leaving the rest of the register with the tune', () => {
+      const frame = frameWith([[4, 0x40]]);
+      const gate = { name: 'gate', voice: 0 } as const;
+
+      frame.holdField(gate, 1);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x41);
+
+      frame.releaseField(gate);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x40);
+    });
+
+    it.each([0, 1, 2])('routes voice %i through the filter on its own bit of $D417', (voice) => {
+      const field = { name: 'filtered', voice } as const;
+      const frame = frameWith([[ROUTING, 0xf0]]);
+
+      frame.holdField(field, 1);
+      expect(emittedValue(frame.takeSnapshot(), ROUTING)).toBe(0xf0 | (1 << voice));
+
+      const clearing = frameWith([[ROUTING, 0xff]]);
+      clearing.holdField(field, 0);
+      expect(emittedValue(clearing.takeSnapshot(), ROUTING)).toBe(0xff & ~(1 << voice));
+    });
+  });
+
+  describe('composition', () => {
+    it('puts held resonance beside the tunes routing nibble', () => {
+      const frame = frameWith([[ROUTING, 0x35]]);
+
+      frame.holdField({ name: 'resonance' }, 0x0a);
+
+      expect(emittedValue(frame.takeSnapshot(), ROUTING)).toBe(0xa5);
+    });
+
+    it('puts a held filter type beside gain-scaled volume and the raw voice-3-off bit', () => {
+      const frame = frameWith([[VOLUME, 0xba]]); // voice 3 off, tune mode 0b011, volume 10
+      frame.setOutputGain(0.5);
+
+      frame.holdField(FILTER_TYPE, 0b100);
+
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x80 | 0x40 | 0x05);
+    });
+
+    it('puts a held waveform beside the tunes gate', () => {
+      const frame = frameWith([[4, 0x11]]);
+
+      frame.holdField({ name: 'waveform', voice: 0 }, 0b1000);
+
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x81);
+    });
+
+    it('keeps another hold on the register when one is released', () => {
+      const frame = frameWith([[ROUTING, 0x35]]);
+      frame.holdField({ name: 'resonance' }, 0x0a);
+      frame.holdField({ name: 'filtered', voice: 1 }, 1);
+      frame.takeSnapshot();
+
+      frame.releaseField({ name: 'resonance' });
+
+      expect(emittedValue(frame.takeSnapshot(), ROUTING)).toBe(0x37);
+    });
+
+    it('lets a hold win over a scale on the same bits, and the scale come back on release', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65], // 815
+      ]);
+      frame.setRegisterScale('cutoff', 0.5); // 815 -> 408
+
+      frame.holdField(CUTOFF, 1001);
+      const held = frame.takeSnapshot();
+      expect(emittedValue(held, CUTOFF_LOW)).toBe(0xf8 | (1001 & 0x07));
+      expect(emittedValue(held, CUTOFF_HIGH)).toBe(1001 >> 3);
+
+      frame.releaseField(CUTOFF);
+      const released = frame.takeSnapshot();
+      expect(emittedValue(released, CUTOFF_LOW)).toBe(0xf8 | (408 & 0x07));
+      expect(emittedValue(released, CUTOFF_HIGH)).toBe(408 >> 3);
+    });
+
+    it('applies a hold to the byte the tune wrote this frame', () => {
+      const frame = createRegisterFrame();
+      frame.holdField({ name: 'resonance' }, 0x0a);
+
+      frame.onSidWrite(ROUTING, 0x35);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: ROUTING, value: 0xa5 }]);
+    });
+  });
+
+  describe('forcing', () => {
+    it('sends a held field on every frame of a tune that never writes the register', () => {
+      const frame = createRegisterFrame();
+      frame.holdField({ name: 'volume' }, 0x0c);
+
+      for (let index = 0; index < 3; index++) {
+        expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x0c }]);
+      }
+    });
+
+    it('carries a changed value or amount on the very next frame', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+      frame.holdField({ name: 'volume' }, 0x0c);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0c);
+
+      frame.holdField({ name: 'volume' }, 0x0e);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0e);
+
+      frame.holdField({ name: 'volume' }, 0x0e, 0.5);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x09);
+    });
+
+    it('sends exactly one restoring write on release, then nothing', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+      frame.holdField({ name: 'volume' }, 0x0c);
+      frame.takeSnapshot();
+
+      frame.releaseField({ name: 'volume' });
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x04 }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('arms nothing when a field that is not held is released', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+
+      frame.releaseField({ name: 'volume' });
+
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('shares its state with setFilterMode, which is a hold of the filter type', () => {
+      const frame = frameWith([[VOLUME, 0x0a]]);
+      frame.setFilterMode('highPass');
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x40 | 0x0a);
+
+      frame.releaseField(FILTER_TYPE);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0a);
+
+      frame.holdField(FILTER_TYPE, 0b010);
+      frame.setFilterMode(null);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0a);
+    });
+  });
+
+  describe('refusals', () => {
+    function expectRefused(hold: (frame: RegisterFrame) => void): void {
+      const fresh = createRegisterFrame();
+      hold(fresh);
+      expect(fresh.takeSnapshot().count).toBe(0);
+
+      const held = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      held.holdField(CUTOFF, 1001);
+      hold(held);
+      const snapshot = held.takeSnapshot();
+      expect(emittedValue(snapshot, CUTOFF_LOW)).toBe(0xf8 | (1001 & 0x07));
+      expect(emittedValue(snapshot, CUTOFF_HIGH)).toBe(1001 >> 3);
+    }
+
+    it.each([1.5, -1, 2048, Number.NaN])('ignores a cutoff value of %s', (value) => {
+      expectRefused((frame) => frame.holdField(CUTOFF, value));
+    });
+
+    it.each([Number.NaN, -0.1, 1.1])('ignores an amount of %s', (amount) => {
+      expectRefused((frame) => frame.holdField(CUTOFF, 5, amount));
+    });
+
+    it.each([3, -1, 1.5])('ignores a per-voice field on voice %s', (voice) => {
+      expectRefused((frame) => {
+        frame.holdField({ name: 'gate', voice }, 1);
+        frame.releaseField({ name: 'gate', voice });
+      });
+    });
+
+    it('ignores a field that does not exist', () => {
+      expectRefused((frame) => frame.holdField({ name: 'bogus' } as unknown as SidField, 1));
+    });
+  });
+
+  describe('the shadow and cues', () => {
+    it('keeps the shadow the tunes own, and keeps current holds across a cue restore', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      const cue = frame.snapshotValues();
+      frame.holdField(CUTOFF, 1001);
+
+      expect(frame.snapshotValues().values[CUTOFF_LOW]).toBe(0xff);
+      expect(frame.snapshotValues().values[CUTOFF_HIGH]).toBe(0x65);
+      expect(readSidField(frame.emittedValues().written, CUTOFF)).toBe(815);
+
+      frame.restoreValues(cue);
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, CUTOFF_HIGH)).toBe(1001 >> 3);
+    });
+
+    it('does not carry a hold into a cue', () => {
+      const source = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      source.holdField(CUTOFF, 1001);
+      const cue = source.snapshotValues();
+
+      const target = createRegisterFrame();
+      target.restoreValues(cue);
+      target.markAllDirty();
+
+      const snapshot = target.takeSnapshot();
+      expect(emittedValue(snapshot, CUTOFF_LOW)).toBe(0xff);
+      expect(emittedValue(snapshot, CUTOFF_HIGH)).toBe(0x65);
+    });
+
+    it('leaves voiceState raw while a field is held', () => {
+      const frame = frameWith([[4, 0x11]]);
+
+      frame.holdField({ name: 'waveform', voice: 0 }, 0b1000);
+
+      expect(frame.voiceState(0).waveform).toBe(0b0001);
+    });
+  });
+
+  describe('emittedValues', () => {
+    it('reports holds in sent while written stays the tunes own', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      frame.holdField(CUTOFF, 1001);
+
+      const { written, sent } = frame.emittedValues();
+
+      expect(written[CUTOFF_LOW]).toBe(0xff);
+      expect(written[CUTOFF_HIGH]).toBe(0x65);
+      expect(sent[CUTOFF_LOW]).toBe(0xf8 | (1001 & 0x07));
+      expect(sent[CUTOFF_HIGH]).toBe(1001 >> 3);
+    });
+
+    it('never consumes the one-shot a release armed', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+      frame.holdField({ name: 'volume' }, 0x0c);
+      frame.takeSnapshot();
+      frame.releaseField({ name: 'volume' });
+
+      expect(frame.emittedValues().sent[VOLUME]).toBe(0x04);
+      expect(frame.emittedValues().sent[VOLUME]).toBe(0x04);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x04 }]);
+    });
+
+    it('matches, register for register, what a real resync frame sends', () => {
+      const frame = createRegisterFrame();
+      ALL_REGISTERS.forEach((register) => frame.onSidWrite(register, byteFor(register)));
+      frame.setOutputGain(0.5);
+      frame.setRegisterScale('cutoff', 0.5);
+      frame.setVoicePitch(1, 0.5);
+      frame.setFilterMode('bandPass');
+      frame.holdField({ name: 'frequency', voice: 1 }, 0x1234, 0.5);
+      frame.holdField({ name: 'resonance' }, 0x0d);
+      frame.holdField({ name: 'filtered', voice: 0 }, 1);
+      frame.holdField({ name: 'gate', voice: 2 }, 1);
+      frame.holdField({ name: 'pulseWidth', voice: 0 }, 0x0abc);
+
+      const { sent } = frame.emittedValues();
+      frame.markAllDirty();
+      const snapshot = frame.takeSnapshot();
+
+      for (const register of ALL_REGISTERS) {
+        expect(emittedValue(snapshot, register)).toBe(sent[register]);
+      }
+    });
+  });
+
+  describe('amount', () => {
+    it('puts a numeric field between the tunes value and the held one, rounded once', () => {
+      const frame = frameWith([
+        [0, 0xff],
+        [1, 0x00],
+      ]);
+      const frequency = { name: 'frequency', voice: 0 } as const;
+
+      // 255.5 rounds to 256. Rounded a byte at a time it would come out as 0x0180.
+      frame.holdField(frequency, 0x0101, 0.5);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 0)).toBe(0x00);
+      expect(emittedValue(snapshot, 1)).toBe(0x01);
+    });
+
+    it('keeps following the tune while held', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0x00],
+        [CUTOFF_HIGH, 0x0c], // 96
+      ]);
+      frame.holdField(CUTOFF, 500, 0.5);
+      expect(sentField(frame, CUTOFF)).toBe(298);
+
+      frame.onSidWrite(CUTOFF_HIGH, 0x19); // 200
+      expect(sentField(frame, CUTOFF)).toBe(350);
+    });
+
+    it('equals the tunes value at 0 and the held value at 1', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0x00],
+        [CUTOFF_HIGH, 0x0c],
+      ]);
+
+      frame.holdField(CUTOFF, 500, 0);
+      expect(sentField(frame, CUTOFF)).toBe(96);
+
+      frame.holdField(CUTOFF, 500, 1);
+      expect(sentField(frame, CUTOFF)).toBe(500);
+    });
+
+    it('sends a switch only at exactly 1, and the tunes own value below it', () => {
+      const frame = frameWith([[4, 0x10]]);
+      const gate = { name: 'gate', voice: 0 } as const;
+
+      frame.holdField(gate, 1, 0.99);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x10);
+
+      frame.holdField(gate, 1, 1);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x11);
+    });
+  });
+
+  describe('a voice control register', () => {
+    it('carries a held waveform on both bytes of a retrigger', () => {
+      const frame = frameWith([[4, 0x00]]);
+      frame.holdField({ name: 'waveform', voice: 0 }, 0b0100);
+
+      frame.onSidWrite(4, 0x10);
+      frame.onSidWrite(4, 0x11);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 4, value: 0x40 },
+        { register: 4, value: 0x41 },
+      ]);
+    });
+
+    it('leaves each byte of a retrigger its own gate while a held gate is below an amount of 1', () => {
+      const frame = frameWith([[4, 0x00]]);
+      frame.holdField({ name: 'gate', voice: 0 }, 0, 0.5);
+
+      frame.onSidWrite(4, 0x10);
+      frame.onSidWrite(4, 0x11);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 4, value: 0x10 },
+        { register: 4, value: 0x11 },
+      ]);
+    });
+
+    it('keeps a muted voice at 0 under a held gate, and applies the hold again once unmuted', () => {
+      const frame = frameWith([[4, 0x11]]);
+      frame.setVoiceMuted(0, true);
+      frame.holdField({ name: 'gate', voice: 0 }, 1);
+
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0);
+      expect(frame.emittedValues().sent[4]).toBe(0);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBeUndefined();
+
+      frame.setVoiceMuted(0, false);
+      expect(emittedValue(frame.takeSnapshot(), 4)).toBe(0x01);
+    });
+
+    it('still applies a muted voices holds on its other registers', () => {
+      const frame = frameWith([[0, 0x34]]);
+      frame.setVoiceMuted(0, true);
+
+      frame.holdField({ name: 'frequency', voice: 0 }, 0x00aa);
+
+      expect(emittedValue(frame.takeSnapshot(), 0)).toBe(0xaa);
+    });
+  });
+});
+
+/** A field's value as the next frame sends it: delivers one frame and decodes the registers it
+ *  carried. */
+function sentField(frame: RegisterFrame, field: SidField): number {
+  const snapshot = frame.takeSnapshot();
+  const registers = new Uint8Array(SID_REGISTER_COUNT);
+  for (let index = 0; index < snapshot.count; index++) {
+    registers[snapshot.registers[index]] = snapshot.values[index];
+  }
+  return readSidField(registers, field);
+}
 
 /** An arbitrary but distinct byte per register, so a test that pins all 25 at once can tell them
  *  apart. */
