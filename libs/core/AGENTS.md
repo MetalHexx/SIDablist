@@ -18,8 +18,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `cpu/` — `C64Machine`, the faked 64 KB address space and CIA/VIC stubs a tune's `init`/`play`
   routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in
   `vendor/mos6502/` implements.
-- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and
-  knob-scaling engine that builds one), and the register and clock constants.
+- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator, scaling and
+  field-hold engine that builds one), `sid-fields.ts` (the table of chip fields a hold can name),
+  and the register and clock constants.
 - `clock/` — `FrameAccumulator`, `ClockStats` and the play-rate math a host clock is measured and
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
@@ -41,6 +42,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - Whether new player state goes on `PlayerSnapshot` (pushed through `subscribe`) or `PlayerStats`
   (pulled via `getStats()`) follows the read/notify split `docs/architecture.md`'s "How a consumer
   reads core" explains: a person's action notifies, time passing does not.
+- A chip field an application wants to drive is a row in `registers/sid-fields.ts`, reached through
+  `holdField`/`releaseField` — never a new per-field method on `RegisterFrame` or `SidPlayer`.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.
@@ -67,6 +70,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   third-party source with one deliberate behavioural change (`cpu/vendor-cpu.ts`'s
   `QuietMos6502`), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
   directly. See the co-change edge below before touching a field it exposes.
+- **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
+  routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
+  re-creates two owners that can disagree about which mode is forced.
 - **A spec that needs a DOM is a spec testing the wrong thing.** `vitest.config.ts` here runs
   `environment: 'node'`, no `jsdom`, matching the "touches no browser global" invariant at the
   root. A `core` spec that reaches for `window` or `document` has crossed a port boundary that

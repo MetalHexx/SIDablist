@@ -9,9 +9,7 @@ import {
   SID_FILTER_MODE_BAND_PASS,
   SID_FILTER_MODE_HIGH_PASS,
   SID_FILTER_MODE_LOW_PASS,
-  SID_FILTER_MODE_MASK,
   SID_FILTER_MODE_OFF,
-  SID_FILTER_MODE_SHIFT,
   SID_FILTER_RESONANCE_REGISTER,
   SID_REGISTER_COUNT,
   SID_VOLUME_REGISTER,
@@ -24,6 +22,14 @@ import {
   VOICE_PULSE_WIDTH_LOW_OFFSET,
   VOICE_SUSTAIN_RELEASE_OFFSET,
 } from './sid-constants.js';
+import {
+  SID_FIELD_TABLE,
+  isUsableHold,
+  readFieldEntry,
+  resolveSidField,
+  splitFieldEntry,
+} from './sid-fields.js';
+import type { SidField, SidFieldEntry } from './sid-fields.js';
 
 /**
  * The accumulated register values alone, detached from any per-frame state.
@@ -75,12 +81,15 @@ const SCALED_REGISTER_GROUPS: readonly ScaledRegisterGroup[] = [
   'pulseWidth',
 ];
 
-const FILTER_MODE_BITS: Readonly<Record<SidFilterMode, number>> = {
+/** The `filterType` field's value for each mode — what `setFilterMode` holds it at. */
+export const FILTER_MODE_BITS: Readonly<Record<SidFilterMode, number>> = {
   lowPass: SID_FILTER_MODE_LOW_PASS,
   bandPass: SID_FILTER_MODE_BAND_PASS,
   highPass: SID_FILTER_MODE_HIGH_PASS,
   off: SID_FILTER_MODE_OFF,
 };
+
+const FILTER_TYPE_FIELD: SidField = { name: 'filterType' };
 
 const NIBBLE_CEILING = 0x0f;
 const CUTOFF_CEILING = 0x07ff;
@@ -127,22 +136,33 @@ function scaleField(value: number, coefficient: number, ceiling: number): number
 }
 
 /**
- * `$D418`'s composed byte: gain owns the low nibble, a forced filter mode owns bits 4-6, and bit 7
- * (voice-3 mute) belongs to neither and always passes through raw. Pure and shared by the per-frame
- * override path and `emittedValues()`'s read-only one, so a stats read can never drift from what a
- * real frame would actually emit.
+ * `$D418`'s scaled byte: gain owns the low nibble, and the mode bits and bit 7 (voice-3 mute) belong
+ * to the tune and pass through raw — a held `filterType` replaces the mode bits afterwards, in
+ * `heldByte`. Pure and shared by the per-frame override path and `emittedValues()`'s read-only one,
+ * so a stats read can never drift from what a real frame would actually emit.
  */
-function scaledVolumeByte(
-  raw: number,
-  gain: number,
-  forcedFilterMode: SidFilterMode | null,
-): number {
+function scaledVolumeByte(raw: number, gain: number): number {
   const volume = gain === 1 ? raw & 0x0f : scaleField(raw & 0x0f, gain, NIBBLE_CEILING);
-  const mode =
-    forcedFilterMode === null
-      ? (raw >> SID_FILTER_MODE_SHIFT) & SID_FILTER_MODE_MASK
-      : FILTER_MODE_BITS[forcedFilterMode];
-  return (raw & 0x80) | (mode << SID_FILTER_MODE_SHIFT) | volume;
+  return (raw & 0xf0) | volume;
+}
+
+/**
+ * What a held numeric field sends this frame: `amount` of the way from the tune's own value to the
+ * held one, rounded once at the field's full width — never byte by byte, which could split back
+ * inconsistently across a register pair.
+ */
+function blendedValue(entry: SidFieldEntry, tune: number, held: number, amount: number): number {
+  return clamp(Math.round(tune + amount * (held - tune)), 0, entry.ceiling);
+}
+
+/**
+ * A register's final byte: `base` with every bit a hold covers replaced by the hold's own. Holds are
+ * the last layer, over whatever scaling or the tune put there. Pure and shared by the frame path
+ * (shadow, scaled and retrigger bytes alike) and `emittedValues()`, for the same reason
+ * `scaledVolumeByte` is.
+ */
+function heldByte(base: number, holdMask: number, holdBits: number): number {
+  return (base & ~holdMask) | holdBits;
 }
 
 /** 11 bits across the cutoff register pair, packed as low byte | (high byte << 8) so a caller can
@@ -238,10 +258,43 @@ export interface RegisterFrame extends SidWriteSink {
   setVoicePitch(voice: number, coefficient: number): void;
 
   /**
-   * Replaces `$D418`'s filter-mode bits in every emitted volume byte until deselected. This is an
-   * override rather than a scale — the tune's own mode bits are discarded while one is held, and
-   * `null` hands them back. Selecting forces the volume register out the same way an off-home
-   * coefficient does; deselecting arms the same one-shot restore.
+   * Holds `field` at `value` instead of whatever the tune puts there, `amount` of the way (0…1, 1 if
+   * omitted): a numeric field sends `amount` of the way from the tune's own value to `value`, rounded
+   * once at the field's full width, so it keeps following the tune while held; a switch sends
+   * `value` only at exactly 1 and the tune's own below it.
+   *
+   * A hold is the last layer on the way out. Its bits replace whatever the tune or a scale put
+   * there, and every other bit of the same register keeps its own source — so `filterType` sits
+   * beside a gain-scaled volume nibble and `resonance` beside the tune's routing. It is never
+   * written into the shadow: `snapshotValues()`, `voiceState()` and `emittedValues().written` stay
+   * the tune's own, a cue restore leaves current holds in place, and holds are not part of a cue.
+   *
+   * While held, every register the field touches goes out on every frame — a standing condition
+   * re-checked in `takeSnapshot()`, like an off-home group — so a tune that never writes that
+   * register still carries the held value, and a changed value or amount reaches the very next
+   * frame. When a tune writes a voice control register twice in a frame, the hold applies to both
+   * bytes. Holds on a muted voice's control-register fields (`waveform`, `test`, `ringMod`, `sync`,
+   * `gate`) wait until it is unmuted, so the mute's 0 stands.
+   *
+   * An unknown field, a voice that is not an integer 0…2, a value that is not an integer within the
+   * field's width, or an amount that is not finite within 0…1 is ignored and leaves any hold already
+   * in place alone. Holding the value and amount already held changes nothing.
+   */
+  holdField(field: SidField, value: number, amount?: number): void;
+
+  /**
+   * Hands `field` back to the tune. The field's registers are forced out once on the next frame,
+   * carrying the byte composed from the tune's own bits, any scale and any other hold — the
+   * restoring write the standing condition can no longer produce. Releasing a field that is not
+   * held arms nothing.
+   */
+  releaseField(field: SidField): void;
+
+  /**
+   * Holds `$D418`'s filter-mode bits at `mode` until `null`: a hold of `filterType`, so the tune's
+   * own mode bits are discarded while one is held and `null` hands them back. The volume register
+   * goes out every frame meanwhile, with gain still applied to its low nibble; clearing sends one
+   * restoring write.
    */
   setFilterMode(mode: SidFilterMode | null): void;
 
@@ -272,13 +325,14 @@ export interface RegisterFrame extends SidWriteSink {
    * the second-write tracking — so the next frame starts empty.
    *
    * The order is: what the tune wrote, as it wrote it; then whatever a resync, an off-home
-   * coefficient or a mute forces out, ascending by register and only for registers the tune left
-   * alone. An override replaces the byte of the write it applies to and never adds one.
+   * coefficient, a held field or a mute forces out, ascending by register and only for registers
+   * the tune left alone. An override or a hold replaces the byte of the write it applies to and
+   * never adds one.
    *
-   * Forcing a group out is a standing condition re-checked live on every call, so a frame a caller
-   * discards can never swallow a knob move on a tune that does not keep rewriting those registers
-   * itself. Scaled bytes are computed once per frame, before the fill, because a two-register group
-   * read per write would combine and round twice.
+   * Forcing a group or a held field out is a standing condition re-checked live on every call, so a
+   * frame a caller discards can never swallow a knob move on a tune that does not keep rewriting
+   * those registers itself. Scaled bytes are computed once per frame, before the fill, because a
+   * two-register group read per write would combine and round twice.
    */
   takeSnapshot(): SidFrame;
 
@@ -308,11 +362,12 @@ export interface RegisterFrame extends SidWriteSink {
   voiceState(voice: number): VoiceRegisterState;
 
   /**
-   * The 25 registers as the tune wrote them (`written`) and as scaling would emit them if a frame
-   * went out this instant (`sent`) — computed fresh from the shadow and the live coefficients on
-   * every call rather than read off the last real frame: `takeSnapshot()` only ever carries the
-   * registers that frame actually wrote, and discards its own override scratch the moment it
-   * returns, so there is nothing per-frame left lying around for a pull to reuse.
+   * The 25 registers as the tune wrote them (`written`) and as scaling and holds would emit them if
+   * a frame went out this instant (`sent`) — computed fresh from the shadow, the live coefficients
+   * and the held fields on every call rather than read off the last real frame: `takeSnapshot()`
+   * only ever carries the registers that frame actually wrote, and discards its own override scratch
+   * the moment it returns, so there is nothing per-frame left lying around for a pull to reuse. A
+   * pull never consumes a pending restore.
    */
   emittedValues(): { readonly written: Uint8Array; readonly sent: Uint8Array };
 }
@@ -367,13 +422,21 @@ class RegisterFrameImpl implements RegisterFrame {
   /** `restoreOnNextSnapshot`, per voice, for the frequency pair. */
   private readonly restoreFrequencyOnNextSnapshot = new Uint8Array(VOICE_COUNT);
 
-  private forcedFilterMode: SidFilterMode | null = null;
-  private restoreFilterModeOnNextSnapshot = false;
+  /** Hold state, one slot per `SID_FIELD_TABLE` entry and sized once so a hold never allocates. */
+  private readonly held = new Uint8Array(SID_FIELD_TABLE.length);
+  private readonly heldValue = new Uint16Array(SID_FIELD_TABLE.length);
+  private readonly heldAmount = new Float64Array(SID_FIELD_TABLE.length);
+  /** One-shot per field, `restoreOnNextSnapshot`'s counterpart: the standing check stops covering a
+   *  field's registers the instant it is released, so this forces the one restoring write. */
+  private readonly releaseOnNextSnapshot = new Uint8Array(SID_FIELD_TABLE.length);
 
   /** Per-frame scratch, cleared and refilled in `takeSnapshot()` — scaling runs inside frame
    *  delivery, so nothing on this path may allocate. */
   private readonly overrideValues = new Uint8Array(SID_REGISTER_COUNT);
   private readonly overrideApplies = new Uint8Array(SID_REGISTER_COUNT);
+  /** Per register, the bits some hold covers and what it sends for them. */
+  private readonly holdMask = new Uint8Array(SID_REGISTER_COUNT);
+  private readonly holdBits = new Uint8Array(SID_REGISTER_COUNT);
 
   /** Refilled and handed back by every `takeSnapshot()`, so rendering a frame allocates nothing. */
   private readonly frame: MutableSidFrame = {
@@ -433,12 +496,30 @@ class RegisterFrameImpl implements RegisterFrame {
     }
   }
 
-  setFilterMode(mode: SidFilterMode | null): void {
-    if (mode === this.forcedFilterMode) return;
-    if (this.forcedFilterMode !== null && mode === null) {
-      this.restoreFilterModeOnNextSnapshot = true;
+  holdField(field: SidField, value: number, amount = 1): void {
+    const index = resolveSidField(field);
+    if (index < 0 || !isUsableHold(index, value, amount)) return;
+    if (this.held[index] && this.heldValue[index] === value && this.heldAmount[index] === amount) {
+      return;
     }
-    this.forcedFilterMode = mode;
+    this.held[index] = 1;
+    this.heldValue[index] = value;
+    this.heldAmount[index] = amount;
+  }
+
+  releaseField(field: SidField): void {
+    const index = resolveSidField(field);
+    if (index < 0 || !this.held[index]) return;
+    this.held[index] = 0;
+    this.releaseOnNextSnapshot[index] = 1;
+  }
+
+  setFilterMode(mode: SidFilterMode | null): void {
+    if (mode === null) {
+      this.releaseField(FILTER_TYPE_FIELD);
+    } else {
+      this.holdField(FILTER_TYPE_FIELD, FILTER_MODE_BITS[mode]);
+    }
   }
 
   setOutputGain(gain: number): void {
@@ -488,7 +569,9 @@ class RegisterFrameImpl implements RegisterFrame {
 
   takeSnapshot(): SidFrame {
     this.forceScaledGroups();
+    this.forceHeldFields();
     this.buildScaledOverrides();
+    this.buildHoldComposition();
 
     const frame = this.frame;
     let count = 0;
@@ -497,7 +580,7 @@ class RegisterFrameImpl implements RegisterFrame {
       const register = this.writeOrder[index];
       frame.registers[count] = register;
       frame.values[count] = this.writeIsRetrigger[index]
-        ? this.retriggerValues[register]
+        ? heldByte(this.retriggerValues[register], this.holdMask[register], this.holdBits[register])
         : this.emittedValue(register);
       count++;
     }
@@ -518,14 +601,62 @@ class RegisterFrameImpl implements RegisterFrame {
     return frame;
   }
 
-  /** An override stands in for the shadow byte wherever one applies this frame. */
+  /** An override stands in for the shadow byte wherever one applies this frame; holds go over
+   *  either. */
   private emittedValue(register: number): number {
-    return this.overrideApplies[register] ? this.overrideValues[register] : this.values[register];
+    const base = this.overrideApplies[register]
+      ? this.overrideValues[register]
+      : this.values[register];
+    return heldByte(base, this.holdMask[register], this.holdBits[register]);
   }
 
-  /** Self-emission: every register of every off-home group, the frequency pair of every voice off
-   *  its own home coefficient, plus the volume register while a filter mode is held, and one further
-   *  frame for whichever of them has just come home. */
+  /** A muted voice's control register belongs to the mute, so holds on its fields wait. */
+  private isInert(entry: SidFieldEntry): boolean {
+    return entry.voiceControl && this.mutedVoices.has(entry.voice);
+  }
+
+  /** Self-emission for holds: every register of every held field, and one further frame for
+   *  whichever field has just been released. */
+  private forceHeldFields(): void {
+    for (let index = 0; index < SID_FIELD_TABLE.length; index++) {
+      if (!this.held[index] && !this.releaseOnNextSnapshot[index]) continue;
+      this.releaseOnNextSnapshot[index] = 0;
+
+      const entry = SID_FIELD_TABLE[index];
+      if (this.isInert(entry)) continue;
+      for (const part of entry.segments) {
+        this.forcedRegisters[part.register] = 1;
+      }
+    }
+  }
+
+  /**
+   * Rebuilds, from the shadow and the held fields alone, which bits each register's holds cover and
+   * what they send for them. It reads state and arms and consumes nothing, which is what lets
+   * `emittedValues()` share it without disturbing the next real frame.
+   *
+   * A switch held below an amount of 1 covers no bits at all: the tune's own bit goes out, and on a
+   * retrigger that means each of the two bytes' own bit rather than the shadow's copy of the first.
+   */
+  private buildHoldComposition(): void {
+    this.holdMask.fill(0);
+    this.holdBits.fill(0);
+
+    for (let index = 0; index < SID_FIELD_TABLE.length; index++) {
+      if (!this.held[index]) continue;
+      const entry = SID_FIELD_TABLE[index];
+      const amount = this.heldAmount[index];
+      if (this.isInert(entry) || (!entry.numeric && amount !== 1)) continue;
+
+      const sent = entry.numeric
+        ? blendedValue(entry, readFieldEntry(this.values, entry), this.heldValue[index], amount)
+        : this.heldValue[index];
+      splitFieldEntry(entry, sent, this.holdMask, this.holdBits);
+    }
+  }
+
+  /** Self-emission: every register of every off-home group and the frequency pair of every voice off
+   *  its own home coefficient, and one further frame for whichever of them has just come home. */
   private forceScaledGroups(): void {
     for (const group of SCALED_REGISTER_GROUPS) {
       if (this.coefficients[group] !== 1 || this.restoreOnNextSnapshot[group]) {
@@ -544,11 +675,6 @@ class RegisterFrameImpl implements RegisterFrame {
       }
       this.restoreFrequencyOnNextSnapshot[voice] = 0;
     }
-
-    if (this.forcedFilterMode !== null || this.restoreFilterModeOnNextSnapshot) {
-      this.forceGroup('volume');
-    }
-    this.restoreFilterModeOnNextSnapshot = false;
   }
 
   private forceGroup(group: ScaledRegisterGroup): void {
@@ -575,12 +701,9 @@ class RegisterFrameImpl implements RegisterFrame {
   /** Off-home guard around `scaledVolumeByte` — see that function for the byte layout. */
   private composeVolumeByte(): void {
     const gain = this.coefficients.volume;
-    if (gain === 1 && this.forcedFilterMode === null) return;
+    if (gain === 1) return;
 
-    this.setOverride(
-      SID_VOLUME_REGISTER,
-      scaledVolumeByte(this.values[SID_VOLUME_REGISTER], gain, this.forcedFilterMode),
-    );
+    this.setOverride(SID_VOLUME_REGISTER, scaledVolumeByte(this.values[SID_VOLUME_REGISTER], gain));
   }
 
   /** Off-home guard around `scaledCutoffPacked` — see that function for the bit layout. */
@@ -659,11 +782,10 @@ class RegisterFrameImpl implements RegisterFrame {
    * consume the one-shot restore flags early or perturb what the next real frame emits.
    */
   private applyScaling(target: Uint8Array): void {
-    if (this.coefficients.volume !== 1 || this.forcedFilterMode !== null) {
+    if (this.coefficients.volume !== 1) {
       target[SID_VOLUME_REGISTER] = scaledVolumeByte(
         this.values[SID_VOLUME_REGISTER],
         this.coefficients.volume,
-        this.forcedFilterMode,
       );
     }
     if (this.coefficients.cutoff !== 1) {
@@ -738,6 +860,10 @@ class RegisterFrameImpl implements RegisterFrame {
     const written = this.values.slice();
     const sent = written.slice();
     this.applyScaling(sent);
+    this.buildHoldComposition();
+    for (let register = 0; register < SID_REGISTER_COUNT; register++) {
+      sent[register] = heldByte(sent[register], this.holdMask[register], this.holdBits[register]);
+    }
     return { written, sent };
   }
 }

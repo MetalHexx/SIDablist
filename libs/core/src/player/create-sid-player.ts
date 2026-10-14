@@ -11,13 +11,15 @@ import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
 import type { SidSink } from '../ports/sink.js';
 import { clockRatio } from '../registers/clock-ratio.js';
-import { createRegisterFrame } from '../registers/register-frame.js';
+import { FILTER_MODE_BITS, createRegisterFrame } from '../registers/register-frame.js';
 import type {
   RegisterFrame,
   ScaledRegisterGroup,
   SidFilterMode,
 } from '../registers/register-frame.js';
 import type { SidFrame } from '../registers/sid-frame.js';
+import { isUsableHold, resolveSidField } from '../registers/sid-fields.js';
+import type { SidField } from '../registers/sid-fields.js';
 import {
   NTSC_FRAME_INTERVAL_US,
   PAL_FRAME_INTERVAL_US,
@@ -139,10 +141,15 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly heldVoices = [false, false, false];
 
   /** Held so a fresh `RegisterFrame` built by `loadTune` inherits them — otherwise every tune load
-   *  would silently reset the deck to full, at home, with the tune's own filter bits. */
+   *  would silently reset the deck to full, at home, with no field held. */
   private outputGain = 1;
   private readonly registerScales = new Map<ScaledRegisterGroup, number>();
-  private filterMode: SidFilterMode | null = null;
+  /** Keyed by the field's table index, so the same field named by two different objects is one
+   *  hold. The filter-type override is a hold of `filterType` here and has no state of its own. */
+  private readonly fieldHolds = new Map<
+    number,
+    { readonly field: SidField; readonly value: number; readonly amount: number }
+  >();
 
   /** The clock pair rather than the ratio it derives, because a fresh `RegisterFrame` is handed the
    *  pair. Null until the application — the only thing that knows what machine is on the far end —
@@ -283,14 +290,16 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.load(file);
 
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
-    // and the tune's own filter bits, so every held control is re-applied here, before this load can
-    // emit a packet at the wrong setting.
+    // and no field held, so every held control is re-applied here, before this load can emit a
+    // packet at the wrong setting.
     const frame = this.session.frame;
     frame?.setOutputGain(this.outputGain);
     for (const [group, coefficient] of this.registerScales) {
       frame?.setRegisterScale(group, coefficient);
     }
-    frame?.setFilterMode(this.filterMode);
+    for (const hold of this.fieldHolds.values()) {
+      frame?.holdField(hold.field, hold.value, hold.amount);
+    }
     this.applyPitch();
 
     this.mutedVoices.fill(false);
@@ -594,9 +603,39 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.frame?.setRegisterScale(group, coefficient);
   }
 
+  /**
+   * Holds `field` at `value`, blended by `amount`, and carries it into every tune loaded after. A
+   * refused hold is neither applied nor carried, and leaves any hold already on the field alone.
+   */
+  holdField(field: SidField, value: number, amount = 1): void {
+    const index = resolveSidField(field);
+    if (!isUsableHold(index, value, amount)) {
+      console.warn(
+        `SID player: ignoring a hold of ${value} (amount ${amount}) on ${describeField(field)}.`,
+      );
+      return;
+    }
+    this.fieldHolds.set(index, { field: { ...field }, value, amount });
+    this.session.frame?.holdField(field, value, amount);
+  }
+
+  releaseField(field: SidField): void {
+    const index = resolveSidField(field);
+    if (index < 0) {
+      console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+      return;
+    }
+    this.fieldHolds.delete(index);
+    this.session.frame?.releaseField(field);
+  }
+
+  /** A hold or release of `filterType`, so the override has no copy of its own to disagree with. */
   setFilterMode(mode: SidFilterMode | null): void {
-    this.filterMode = mode;
-    this.session.frame?.setFilterMode(mode);
+    if (mode === null) {
+      this.releaseField({ name: 'filterType' });
+    } else {
+      this.holdField({ name: 'filterType' }, FILTER_MODE_BITS[mode]);
+    }
   }
 
   /**
@@ -635,6 +674,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.clock.stop();
     this.session.discardOutstandingJump();
     this.session.dispose();
+    this.fieldHolds.clear();
     if (this.transport === 'playing' || this.transport === 'paused') {
       this.sink.end();
     }
@@ -1042,6 +1082,11 @@ class SidPlayerCoordinator implements SidPlayer {
       error: this.error,
     };
   }
+}
+
+/** `name`, or `name` of voice `n` — enough to tell a refused hold's field apart in a warning. */
+function describeField(field: SidField): string {
+  return 'voice' in field ? `${field.name} of voice ${field.voice}` : field.name;
 }
 
 /**

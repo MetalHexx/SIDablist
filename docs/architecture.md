@@ -80,13 +80,13 @@ collections.**
 
 Worked examples of the same test:
 
-| Thing                                         | Where       | Why                                             |
-| --------------------------------------------- | ----------- | ----------------------------------------------- |
-| Seek, tempo, active loop, voice control       | core        | Timeline operations                             |
-| Web MIDI access                               | application | Bytes to a device; knows nothing about position |
-| Persistence                                   | application | A preference, not a timeline fact               |
-| Crossfader position                           | application | Intent                                          |
-| Applying gain and filter scaling to registers | core        | Register state on the frame path                |
+| Thing                                                                   | Where       | Why                                             |
+| ----------------------------------------------------------------------- | ----------- | ----------------------------------------------- |
+| Seek, tempo, active loop, voice control                                 | core        | Timeline operations                             |
+| Web MIDI access                                                         | application | Bytes to a device; knows nothing about position |
+| Persistence                                                             | application | A preference, not a timeline fact               |
+| Crossfader position                                                     | application | Intent                                          |
+| Applying gain and filter scaling, and holding chip fields, on registers | core        | Register state on the frame path                |
 
 ## The two seams
 

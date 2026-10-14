@@ -1299,6 +1299,200 @@ describe('createSidPlayer', () => {
     });
   });
 
+  describe('field holds', () => {
+    /** $D418 as the tune writes it: bit 7 set, filter mode 0b010, volume nibble $F. */
+    const TUNE_VOLUME_BYTE = 0xaf;
+    const VOLUME_REGISTER = 24;
+    const VOLUME_FIELD = { name: 'volume' } as const;
+    const FILTER_TYPE_FIELD = { name: 'filterType' } as const;
+
+    it('reaches the delivered frames and the sent bytes until released', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+
+      player.holdField(VOLUME_FIELD, 5);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), VOLUME_REGISTER)).toBe(0xa5);
+      expect(player.getStats().emitted.sent[VOLUME_REGISTER]).toBe(0xa5);
+      expect(player.getStats().emitted.written[VOLUME_REGISTER]).toBe(TUNE_VOLUME_BYTE);
+
+      player.releaseField(VOLUME_FIELD);
+      run(clock, 1, 1);
+      expect(valueOf(lastDelivered(sink), VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+      expect(player.getStats().emitted.sent[VOLUME_REGISTER]).toBe(TUNE_VOLUME_BYTE);
+    });
+
+    it('is in the first delivered frame of a tune loaded after it was set', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune());
+      player.holdField(VOLUME_FIELD, 3);
+
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(0xa3);
+    });
+
+    it('is in the first delivered frame after a subtune change', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune(2));
+      player.holdField(VOLUME_FIELD, 7);
+      await player.play();
+      run(clock, 2);
+
+      player.selectSubtune(2);
+      run(clock, 1, 2);
+
+      const frame = lastDelivered(sink);
+      expect(frame.count).toBe(25);
+      expect(valueOf(frame, VOLUME_REGISTER)).toBe(7);
+    });
+
+    it('is absent from the gate-off a seek owes while playing and present in the resync after it', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.holdField(VOLUME_FIELD, 9);
+      run(clock, 2);
+
+      await player.seek(frames(10));
+
+      run(clock, 1);
+      const gateOff = lastDelivered(sink);
+      expect(gateOff.count).toBe(VOICE_CONTROL_REGISTERS.length);
+      expect(valueOf(gateOff, VOLUME_REGISTER)).toBeUndefined();
+
+      run(clock, 1, 1);
+      const resync = lastDelivered(sink);
+      expect(resync.count).toBe(25);
+      expect(valueOf(resync, VOLUME_REGISTER)).toBe(9);
+    });
+
+    it('is in the immediate resync of a seek while stopped or paused', async () => {
+      const stopped = harness();
+      stopped.player.loadTune(counterTune());
+      stopped.player.holdField(VOLUME_FIELD, 9);
+      await stopped.player.seek(frames(10));
+      expect(valueOf(lastDeliveredNow(stopped.sink), VOLUME_REGISTER)).toBe(9);
+
+      const paused = harness();
+      paused.player.loadTune(counterTune());
+      await paused.player.play();
+      paused.player.holdField(VOLUME_FIELD, 9);
+      run(paused.clock, 2);
+      paused.player.pause();
+      await paused.player.seek(frames(10));
+      expect(valueOf(lastDeliveredNow(paused.sink), VOLUME_REGISTER)).toBe(9);
+    });
+
+    it('carries the filter-type override into the next load, leaving the other bits of $D418 alone', async () => {
+      const { player, sink, clock } = harness();
+      player.setFilterMode('lowPass');
+
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      const byte = valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER);
+      expect(byte).toBeDefined();
+      expect(((byte ?? 0) >> 4) & 0b111).toBe(0b001);
+      expect((byte ?? 0) & 0x80).toBe(0x80);
+      expect((byte ?? 0) & 0x0f).toBe(0x0f);
+    });
+
+    it('leaves no forced filter mode once the filter-type hold is released, now or on the next load', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      player.setFilterMode('lowPass');
+
+      player.releaseField(FILTER_TYPE_FIELD);
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+      expect(player.getStats().emitted.sent[VOLUME_REGISTER]).toBe(TUNE_VOLUME_BYTE);
+    });
+
+    it('lets the filter mode be cleared as well as set through a plain hold of filterType', async () => {
+      const { player, sink, clock } = harness();
+      player.holdField(FILTER_TYPE_FIELD, 0b100);
+      player.setFilterMode(null);
+
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+    });
+
+    it('warns about a refused value and does not carry it into the next load', async () => {
+      const { player, sink, clock } = harness();
+      const warn = vi.spyOn(console, 'warn');
+      warn.mockClear();
+
+      player.holdField(VOLUME_FIELD, 16);
+      player.holdField(VOLUME_FIELD, 5, 1.5);
+      player.holdField({ name: 'gate', voice: 3 }, 1);
+      expect(warn).toHaveBeenCalledTimes(3);
+
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+    });
+
+    it('keeps a hold already in place when a replacement is refused', async () => {
+      const { player, sink, clock } = harness();
+      player.holdField(VOLUME_FIELD, 5);
+
+      player.holdField(VOLUME_FIELD, 99);
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(0xa5);
+    });
+
+    it('warns about a release of a field that does not resolve and carries on', () => {
+      const { player } = harness();
+      const warn = vi.spyOn(console, 'warn');
+      warn.mockClear();
+
+      player.releaseField({ name: 'gate', voice: -1 });
+
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats one field given as two different objects as a single hold', async () => {
+      const { player, sink, clock } = harness();
+      player.holdField({ name: 'volume' }, 5);
+      player.holdField({ name: 'volume' }, 6);
+      player.releaseField({ name: 'volume' });
+
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+    });
+
+    it('is dropped by dispose', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      player.holdField(VOLUME_FIELD, 5);
+
+      player.dispose();
+      player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, VOLUME_REGISTER)).toBe(TUNE_VOLUME_BYTE);
+    });
+  });
+
   describe('the read side', () => {
     it('notifies on a discrete change and stays quiet while the playhead moves', async () => {
       const { player, clock } = harness();

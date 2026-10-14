@@ -10,13 +10,14 @@ export const SID_REGISTER_COUNT = 25;
 export const REGISTERS_PER_VOICE = 7;
 export const VOICE_COUNT = 3;
 
-/** Offsets from a voice's base register. Offset 4, the control register, is not named here —
- *  `VOICE_CONTROL_REGISTERS` already names all three as absolute register numbers, which is what
- *  the retrigger table needs. */
+/** Offsets from a voice's base register. The control register's offset is named for the field table;
+ *  `VOICE_CONTROL_REGISTERS` below names all three as absolute register numbers, which is what the
+ *  retrigger table needs. */
 export const VOICE_FREQUENCY_LOW_OFFSET = 0;
 export const VOICE_FREQUENCY_HIGH_OFFSET = 1;
 export const VOICE_PULSE_WIDTH_LOW_OFFSET = 2;
 export const VOICE_PULSE_WIDTH_HIGH_OFFSET = 3;
+export const VOICE_CONTROL_OFFSET = 4;
 export const VOICE_ATTACK_DECAY_OFFSET = 5;
 export const VOICE_SUSTAIN_RELEASE_OFFSET = 6;
 

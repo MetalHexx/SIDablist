@@ -3,6 +3,7 @@ import type { SidFile } from '../sid/sid-file.model.js';
 import type { DetectedLoopFrames } from '../timeline/track-structure.js';
 import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
+import type { SidField } from '../registers/sid-fields.js';
 import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
 
 /**
@@ -65,6 +66,12 @@ export interface SidPlayer {
   setOutputGain(gain: number): void;
   setFilterMode(mode: SidFilterMode | null): void;
   setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void;
+  /** Holds a chip field at `value` (raw, at the field's width) blended by `amount` 0…1 (default 1),
+   *  and carries it into every tune loaded after — see `RegisterFrame.holdField`. */
+  holdField(field: SidField, value: number, amount?: number): void;
+  /** Hands the field back to the tune. The player never releases a hold on its own, except on
+   *  dispose. */
+  releaseField(field: SidField): void;
   /** The φ2 clocks a tune was written for and is playing on. Derived and session-lifetime, not a
    *  performance control — and the application's to supply, since core cannot know the far end. */
   setTargetClock(sourceHz: number, targetHz: number): void;
