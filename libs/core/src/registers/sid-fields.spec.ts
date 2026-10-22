@@ -4,6 +4,7 @@ import {
   SID_FIELD_TABLE,
   SID_FIELD_WIDTHS,
   isUsableHold,
+  isUsableOffset,
   readSidField,
   resolveSidField,
 } from './sid-fields.js';
@@ -136,5 +137,50 @@ describe('isUsableHold', () => {
   it('refuses an index that is not in the table', () => {
     expect(isUsableHold(-1, 0, 1)).toBe(false);
     expect(isUsableHold(SID_FIELD_TABLE.length, 0, 1)).toBe(false);
+  });
+});
+
+describe('isUsableOffset', () => {
+  const cutoff = resolveSidField({ name: 'cutoff' });
+
+  it('takes any integer within the ceiling of a numeric field, in either direction', () => {
+    expect(isUsableOffset(cutoff, 0)).toBe(true);
+    expect(isUsableOffset(cutoff, 2047)).toBe(true);
+    expect(isUsableOffset(cutoff, -2047)).toBe(true);
+    expect(isUsableOffset(cutoff, 1)).toBe(true);
+  });
+
+  it('is bounded by each numeric field own ceiling', () => {
+    const frequency = resolveSidField({ name: 'frequency', voice: 1 });
+    const attack = resolveSidField({ name: 'attack', voice: 0 });
+
+    expect(isUsableOffset(frequency, -65535)).toBe(true);
+    expect(isUsableOffset(frequency, 65536)).toBe(false);
+    expect(isUsableOffset(attack, 15)).toBe(true);
+    expect(isUsableOffset(attack, 16)).toBe(false);
+  });
+
+  it.each([1.5, -0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2048, -2048])(
+    'refuses an offset of %s',
+    (amount) => {
+      expect(isUsableOffset(cutoff, amount)).toBe(false);
+    },
+  );
+
+  it('refuses every switch field', () => {
+    const switches = SID_FIELD_TABLE.map((entry, index) => ({ entry, index })).filter(
+      ({ entry }) => !entry.numeric,
+    );
+
+    expect(switches.length).toBeGreaterThan(0);
+    for (const { index } of switches) {
+      expect(isUsableOffset(index, 1)).toBe(false);
+    }
+  });
+
+  it('refuses an index that is not in the table', () => {
+    expect(isUsableOffset(-1, 1)).toBe(false);
+    expect(isUsableOffset(SID_FIELD_TABLE.length, 1)).toBe(false);
+    expect(isUsableOffset(Number.NaN, 1)).toBe(false);
   });
 });

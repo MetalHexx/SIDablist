@@ -286,6 +286,16 @@ export function isUsableHold(index: number, value: number, amount: number): bool
   );
 }
 
+/**
+ * True when the field at `index` is numeric and `amount` is an integer no larger in magnitude than
+ * the field's ceiling — what `setFieldOffset` accepts.
+ */
+export function isUsableOffset(index: number, amount: number): boolean {
+  if (!Number.isInteger(index) || index < 0 || index >= SID_FIELD_TABLE.length) return false;
+  const entry = SID_FIELD_TABLE[index];
+  return entry.numeric && Number.isInteger(amount) && Math.abs(amount) <= entry.ceiling;
+}
+
 /** The field's value recombined from `registers` at its full width. */
 export function readFieldEntry(registers: ArrayLike<number>, entry: SidFieldEntry): number {
   let value = 0;
