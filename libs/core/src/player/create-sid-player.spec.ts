@@ -259,6 +259,17 @@ function frequencyTune(low: number, high: number): SidFile {
   });
 }
 
+/** play writes voice 0's pulse width — low byte to $D402, high nibble to $D403 — every call. */
+function pulseWidthTune(low: number, high: number): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [RTS] },
+      // LDA #low; STA $D402; LDA #high; STA $D403; RTS
+      { at: 0x1010, bytes: [0xa9, low, 0x8d, 0x02, 0xd4, 0xa9, high, 0x8d, 0x03, 0xd4, RTS] },
+    ],
+  });
+}
+
 /** init programs CIA 1 timer A for exactly two play calls per frame. */
 function doubleSpeedTune(): SidFile {
   return tune({
@@ -1557,6 +1568,182 @@ describe('createSidPlayer', () => {
 
       expect(player.getSnapshot().tune).toBeNull();
       expect(player.getStats().effectiveIntervalUs).toBe(0);
+    });
+  });
+
+  describe('field offsets', () => {
+    const PULSE_LOW_REGISTER = 2;
+    const PULSE_HIGH_REGISTER = 3;
+    const PULSE_FIELD = { name: 'pulseWidth', voice: 0 } as const;
+    /** The tune writes a pulse width of 256 ($100). */
+    const TUNE_LOW = 0x00;
+    const TUNE_HIGH = 0x01;
+
+    it('reaches the delivered frames and the sent bytes until cleared', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      await player.play();
+
+      player.setFieldOffset(PULSE_FIELD, 512);
+      run(clock, 1);
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, PULSE_LOW_REGISTER)).toBe(0x00);
+      expect(valueOf(frame, PULSE_HIGH_REGISTER)).toBe(0x03);
+      expect(player.getStats().emitted.sent[PULSE_HIGH_REGISTER]).toBe(0x03);
+      expect(player.getStats().emitted.written[PULSE_HIGH_REGISTER]).toBe(TUNE_HIGH);
+
+      player.clearFieldOffset(PULSE_FIELD);
+      run(clock, 1, 1);
+      expect(valueOf(lastDelivered(sink), PULSE_HIGH_REGISTER)).toBe(TUNE_HIGH);
+      expect(player.getStats().emitted.sent[PULSE_HIGH_REGISTER]).toBe(TUNE_HIGH);
+    });
+
+    it('is in the first delivered frame of a tune loaded after it was set', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(silentTune());
+      player.setFieldOffset(PULSE_FIELD, 512);
+
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, PULSE_HIGH_REGISTER)).toBe(0x03);
+    });
+
+    it('is not carried once set back to 0 or cleared', async () => {
+      const { player, sink, clock } = harness();
+      player.setFieldOffset(PULSE_FIELD, 512);
+      player.setFieldOffset(PULSE_FIELD, 0);
+      player.setFieldOffset({ name: 'pulseWidth', voice: 1 }, 512);
+      player.clearFieldOffset({ name: 'pulseWidth', voice: 1 });
+
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, PULSE_HIGH_REGISTER)).toBe(TUNE_HIGH);
+    });
+
+    it('treats one field given as two different objects as a single offset', async () => {
+      const { player, sink, clock } = harness();
+      player.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 512);
+      player.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 256);
+      player.clearFieldOffset({ name: 'pulseWidth', voice: 0 });
+
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, PULSE_HIGH_REGISTER)).toBe(TUNE_HIGH);
+    });
+
+    it('is dropped by dispose', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      player.setFieldOffset(PULSE_FIELD, 512);
+
+      player.dispose();
+      player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+      await player.play();
+      run(clock, 1);
+
+      expect(valueOf(sink.deliveredFrames[0].frame, PULSE_HIGH_REGISTER)).toBe(TUNE_HIGH);
+    });
+
+    it.each([
+      ['a switch field', { name: 'gate', voice: 0 } as const, 1],
+      ['a fraction', PULSE_FIELD, 1.5],
+      ['an amount out of range', PULSE_FIELD, 5000],
+      ['an unknown field', { name: 'pulseWidth', voice: 3 } as const, 512],
+    ])(
+      'warns once about %s and leaves an offset already in place alone',
+      async (_, field, amount) => {
+        const { player, sink, clock } = harness();
+        const warn = vi.spyOn(console, 'warn');
+        player.setFieldOffset(PULSE_FIELD, 512);
+        warn.mockClear();
+
+        player.setFieldOffset(field, amount);
+        expect(warn).toHaveBeenCalledTimes(1);
+
+        player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
+        await player.play();
+        run(clock, 1);
+        expect(valueOf(sink.deliveredFrames[0].frame, PULSE_HIGH_REGISTER)).toBe(0x03);
+      },
+    );
+
+    it('warns once about a release of a field that does not resolve and carries on', () => {
+      const { player } = harness();
+      const warn = vi.spyOn(console, 'warn');
+      warn.mockClear();
+
+      player.clearFieldOffset({ name: 'gate', voice: -1 });
+
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('readRegisters', () => {
+    const REGISTER_COUNT = 25;
+
+    it('fills both buffers with zeros when nothing is loaded', () => {
+      const { player } = harness();
+      const written = new Uint8Array(REGISTER_COUNT).fill(0xff);
+      const sent = new Uint8Array(REGISTER_COUNT).fill(0xff);
+
+      player.readRegisters(written, sent);
+
+      expect(Array.from(written)).toEqual(new Array(REGISTER_COUNT).fill(0));
+      expect(Array.from(sent)).toEqual(new Array(REGISTER_COUNT).fill(0));
+    });
+
+    it('matches getStats().emitted with a tune loaded, offsets included', async () => {
+      const { player, clock } = harness();
+      player.loadTune(pulseWidthTune(0x00, 0x01));
+      player.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 512);
+      await player.play();
+      run(clock, 2);
+      const written = new Uint8Array(REGISTER_COUNT);
+      const sent = new Uint8Array(REGISTER_COUNT);
+
+      player.readRegisters(written, sent);
+
+      const { emitted } = player.getStats();
+      expect(Array.from(written)).toEqual(Array.from(emitted.written));
+      expect(Array.from(sent)).toEqual(Array.from(emitted.sent));
+      expect(sent[3]).toBe(0x03);
+      expect(written[3]).toBe(0x01);
+    });
+
+    it('refreshes the same buffers on repeated calls', async () => {
+      const { player, clock } = harness();
+      player.loadTune(pulseWidthTune(0x00, 0x01));
+      await player.play();
+      run(clock, 1);
+      const written = new Uint8Array(REGISTER_COUNT);
+      const sent = new Uint8Array(REGISTER_COUNT);
+      player.readRegisters(written, sent);
+      expect(sent[3]).toBe(0x01);
+
+      player.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 512);
+      run(clock, 1, 1);
+      player.readRegisters(written, sent);
+
+      expect(sent[3]).toBe(0x03);
+      expect(written[3]).toBe(0x01);
+    });
+
+    it('throws a RangeError for a buffer shorter than a register file, loaded or not', () => {
+      const { player } = harness();
+      const ok = new Uint8Array(REGISTER_COUNT);
+      const short = new Uint8Array(REGISTER_COUNT - 1);
+
+      expect(() => player.readRegisters(short, ok)).toThrow(RangeError);
+      expect(() => player.readRegisters(ok, short)).toThrow(RangeError);
+
+      player.loadTune(silentTune());
+      expect(() => player.readRegisters(ok, short)).toThrow(RangeError);
     });
   });
 

@@ -269,7 +269,7 @@ class TuneSessionImpl implements TuneSession {
       const result = machine.initSubtune(clamped);
       if (!result.completed) {
         console.warn(
-          `DJ engine: subtune ${clamped} init ran out of cycles (${result.cyclesUsed}) — playing it anyway.`,
+          `SID player: subtune ${clamped} init ran out of cycles (${result.cyclesUsed}) — playing it anyway.`,
         );
       }
     } catch (error) {
@@ -370,7 +370,7 @@ class TuneSessionImpl implements TuneSession {
     }
 
     if (!response.ok) {
-      console.warn(`DJ engine: ${response.error}`);
+      console.warn(`SID player: ${response.error}`);
       return null;
     }
     return response.result;

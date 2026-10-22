@@ -5,7 +5,7 @@ import type { FarEndConsumption, SinkCapabilities } from '../ports/sink.js';
 
 /**
  * The read side of `SidPlayer`: everything a consumer's change detection should wake up for,
- * grouped into named objects rather than a flat property bag so a field P07-T02 adds lands inside
+ * grouped into named objects rather than a flat property bag so a field added later lands inside
  * its group instead of forcing every existing field to shift.
  *
  * `positionPercent` is deliberately absent — it derives from `getPosition()`, which is a pulled
@@ -53,7 +53,7 @@ export interface PlayerSnapshot {
 export interface PlayerStats {
   readonly framesRendered: Frames;
   readonly clock: FrameClockStats;
-  /** What the clock is actually pacing at, which differs from what the fader asked for only while
+  /** What the clock is actually pacing at, which differs from what the tempo asked for only while
    *  nothing is playing. */
   readonly effectiveIntervalUs: Microseconds;
   /** Measured by core at the `deliver()` call site — see the measurement/scheduling split. */

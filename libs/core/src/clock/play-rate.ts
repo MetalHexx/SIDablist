@@ -52,7 +52,7 @@ export function asRounded(rate: PlayRate): PlayRate {
   return { ...rate, mode: 'rounded', callsPerFrame: rate.roundedCallsPerFrame };
 }
 
-/** µs between play calls, before the speed fader. */
+/** µs between play calls, before the tempo multiplier. */
 export function playCallIntervalUs(nominalIntervalUs: number, rate: PlayRate): Microseconds {
   return microseconds(sanitizedIntervalUs(nominalIntervalUs) / rate.callsPerFrame);
 }

@@ -27,7 +27,7 @@ few thousand lines rather than an emulator.
 
 ```
                     your application
-                deck state · saved cues & loops
+              player state · saved cues & loops
              MIDI access · controller mapping · UI
                             │
               ┌─────────────┼─────────────┐
@@ -80,13 +80,31 @@ collections.**
 
 Worked examples of the same test:
 
-| Thing                                                                   | Where       | Why                                             |
-| ----------------------------------------------------------------------- | ----------- | ----------------------------------------------- |
-| Seek, tempo, active loop, voice control                                 | core        | Timeline operations                             |
-| Web MIDI access                                                         | application | Bytes to a device; knows nothing about position |
-| Persistence                                                             | application | A preference, not a timeline fact               |
-| Crossfader position                                                     | application | Intent                                          |
-| Applying gain and filter scaling, and holding chip fields, on registers | core        | Register state on the frame path                |
+| Thing                                                                                 | Where       | Why                                             |
+| ------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------- |
+| Seek, tempo, active loop, voice control                                               | core        | Timeline operations                             |
+| Web MIDI access                                                                       | application | Bytes to a device; knows nothing about position |
+| Persistence                                                                           | application | A preference, not a timeline fact               |
+| A control's position                                                                  | application | Intent                                          |
+| Applying gain and filter scaling, and offsetting or holding chip fields, on registers | core        | Register state on the frame path                |
+
+## The output stage
+
+Every register the tune writes passes through one table, `registers/sid-fields.ts`, on its way to
+the sink. A row names a chip field — a 16-bit frequency, an 11-bit cutoff, a lone gate bit — once,
+and the same row serves reading it, writing it and shaping it, so no field has a code path of its
+own. An application drives a field through three controls, applied in a fixed order:
+
+1. **Multiply.** A coefficient scales the tune's value: the output gain, a register group's scale,
+   and the frequency field's clock-times-pitch coefficient.
+2. **Offset.** A signed amount is added to the multiplied value and clamped to the field's range.
+3. **Hold.** The held bits replace whatever the first two produced, blended from the tune's own
+   value when the hold is partial.
+
+Multipliers and offsets act on the tune's raw value, never on the shadow of what the tune wrote:
+the shadow stays the tune's own, which is what lets a saved position be re-entered at a different
+setting without applying it twice. All three are standing conditions the player carries into every
+tune loaded after, until the application hands them back.
 
 ## The two seams
 
@@ -121,7 +139,7 @@ interface SidFrame {
 ```
 
 Struct-of-arrays rather than an array of `{ register, value }` records, because **the hot path does
-not allocate**: frame delivery runs fifty times a second per deck, and a fresh record per write, on
+not allocate**: frame delivery runs fifty times a second, and a fresh record per write, on
 every write, on that path, is exactly the allocation pressure a garbage collector would have to
 absorb where a pause is audible rather than merely visible. The three arrays are reused between
 frames — a sink that needs to keep one past the call that handed it over must copy it.
@@ -194,10 +212,15 @@ Everything is a plain read. The only distinction is **whether a change notifies 
 | `getSnapshot()` | yes      | Transport state, tune, tempo, the active loop, voices, error |
 | `getPosition()` | no       | The playhead frame                                           |
 | `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth          |
+| `readRegisters` | no       | Every register, as written and as sent                       |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 
-This is not stylistic. The engine advances fifty times a second per deck. Pushing the playhead
+`readRegisters(written, sent)` is a pull read like `getPosition()`: it never notifies, and it fills
+two buffers the caller owns instead of returning a fresh object, so a consumer reading it every
+animation frame allocates nothing. With no tune loaded both buffers read zero.
+
+This is not stylistic. The engine advances fifty times a second. Pushing the playhead
 through a subscription would wake every consumer's change detection fifty times a second to tell it
 something it already knew to ask for. Continuous values are pulled by the consumer on its own
 schedule, typically in an animation frame, and the hot path never crosses the subscription boundary
@@ -208,10 +231,10 @@ at all.
 Playing a tune on a machine it was not written for goes wrong in two independent ways. They have
 different causes and different fixes, which is the whole reason they are separable.
 
-| Effect | Cause                                           | Size                   |
-| ------ | ----------------------------------------------- | ---------------------- |
-| Tempo  | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC  | +19.36%                |
-| Pitch  | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804%, ≈ +64.6 cents |
+| Effect | Cause                                           | Size    |
+| ------ | ----------------------------------------------- | ------- |
+| Tempo  | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC  | +19.36% |
+| Pitch  | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804% |
 
 The oscillator frequency is:
 
@@ -242,7 +265,7 @@ Fn_out = Fn × clockRatio × voicePitch[voice]
 `clockRatio` is derived, constant for the session, and invisible to the performer. `voicePitch` is
 live and user-driven, one value per voice — the application decides whether to gang them. Keeping
 them separate means moving a pitch control never disturbs the correction, and an interface can
-report how much correction is in effect independently of where a fader sits.
+report how much correction is in effect independently of where a pitch control sits.
 
 Scale the frequency registers and nothing else:
 

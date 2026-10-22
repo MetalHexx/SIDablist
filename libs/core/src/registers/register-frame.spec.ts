@@ -556,7 +556,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(frame.takeSnapshot(), 24)).toBeUndefined();
     });
 
-    it('never emits the volume register while the fader stays at unity', () => {
+    it('never emits the volume register while the gain stays at unity', () => {
       const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.takeSnapshot();
@@ -564,7 +564,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(frame.takeSnapshot(), 24)).toBeUndefined();
     });
 
-    it('survives a discarded snapshot between a gain change and the next emitted frame, without swallowing the fader move', () => {
+    it('survives a discarded snapshot between a gain change and the next emitted frame, without swallowing the gain change', () => {
       const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.setOutputGain(0.5);
@@ -607,7 +607,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(snapshot, 24)).toBe(0x10 | Math.round(0x0f * 0.5));
     });
 
-    it('does not double-apply gain to a cue captured at one fader position and re-entered at another', () => {
+    it('does not double-apply gain to a cue captured at one gain and re-entered at another', () => {
       const source = createRegisterFrame();
       source.onSidWrite(24, 0x2f);
       source.setOutputGain(0.5);
@@ -1180,7 +1180,7 @@ describe('RegisterFrame', () => {
     }
 
     /** Runs the bundled tune for `frames` play calls, calling `perFrame` before each one so a control
-     *  can be swept exactly as a deck would move it. */
+     *  can be swept exactly as an application would move it. */
     function runTune(
       frames: number,
       perFrame?: (frame: RegisterFrame, index: number) => void,

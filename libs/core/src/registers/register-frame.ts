@@ -393,7 +393,7 @@ class RegisterFrameImpl implements RegisterFrame {
 
   /** The clock correction: derived, session-lifetime and invisible to the performer. Held apart from
    *  `voicePitch` so moving a pitch control can never disturb it, and so an interface can report how
-   *  much correction is in force whatever a fader is doing. */
+   *  much correction is in force whatever a pitch control is doing. */
   private clockRatio = 1;
   /** The live, user-driven half of the frequency multiplier — one per voice. Any ganging is the
    *  application's; this accepts three independent values. */

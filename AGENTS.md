@@ -43,12 +43,12 @@ dependency the package manager rejects, not a convention someone has to remember
 
 ### The hot path does not allocate
 
-Frame delivery runs fifty times a second, per deck. Code on that path reuses typed arrays
+Frame delivery runs fifty times a second. Code on that path reuses typed arrays
 deliberately and says so in comments. Do not wrap it in value objects, getters, or immutable
 structures for readability. Speed is the acceptance bar there, and a regression is audible rather
 than visible — no test will catch it for you.
 
-### Ear-validated constants are not tuning knobs
+### Ear-validated constants are not tunable settings
 
 Several timing constants were settled by listening on real hardware and cannot be re-derived from
 tests. They carry comments saying so. Changing one is a hardware experiment, not a refactor.

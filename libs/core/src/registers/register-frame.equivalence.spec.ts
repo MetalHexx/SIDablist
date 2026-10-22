@@ -176,8 +176,8 @@ describe.each(BUNDLED_TUNES)(
         lock.apply((frame) => frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ));
         play();
         for (let voice = 0; voice < 3; voice++) {
-          for (const semitones of [-12, -1, 1, 7, 12]) {
-            lock.apply((frame) => frame.setVoicePitch(voice, 2 ** (semitones / 12)));
+          for (const steps of [-12, -1, 1, 7, 12]) {
+            lock.apply((frame) => frame.setVoicePitch(voice, 2 ** (steps / 12)));
             play(20);
           }
           lock.apply((frame) => frame.setVoicePitch(voice, 1));
