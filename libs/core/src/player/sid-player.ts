@@ -8,9 +8,8 @@ import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
- * (`createSidPlayer`). Every operation the engine it replaces exposed either
- * has a route through here, moved to the application, or moved to the sink — nothing is dropped
- * silently.
+ * (`createSidPlayer`). Every operation a consumer needs has a route: through here, to the
+ * application, or to the sink — nothing is dropped silently.
  *
  * The rule that shapes the read side: things a person did notify you; things time did, you go and
  * look at. A performer's action — loading a tune, muting a voice, changing the filter — is a

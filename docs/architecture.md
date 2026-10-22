@@ -251,7 +251,7 @@ same pitch.
 real machine they always moved together, because the frame rate and φ2 both derive from the same
 crystal. Streaming register writes breaks that link: the host owns the play rate, the attached
 machine owns φ2. The practical upshot is that tempo changes cost no pitch change — the thing
-keylock exists to fake for audio DJs.
+time-stretching exists to fake in audio software.
 
 Tempo is already ours. Pitch has to be corrected by rewriting the frequency register values before
 they leave the engine, scaled by the source/target clock ratio.

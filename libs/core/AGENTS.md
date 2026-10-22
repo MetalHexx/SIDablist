@@ -18,10 +18,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `cpu/` — `C64Machine`, the faked 64 KB address space and CIA/VIC stubs a tune's `init`/`play`
   routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in
   `vendor/mos6502/` implements.
-- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output stage — multiplier, offset, hold — that builds
-  one), `sid-fields.ts` (the table of chip fields an application can drive), `__reference__/` (the
-  frozen pre-field-table implementation `register-frame.equivalence.spec.ts` checks against), and
-  the register and clock constants.
+- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
+  stage — multiplier, offset, hold — that builds one), `sid-fields.ts` (the table of chip fields an
+  application can drive), `__reference__/` (the frozen pre-field-table implementation
+  `register-frame.equivalence.spec.ts` checks against), and the register and clock constants.
 - `clock/` — `FrameAccumulator`, `ClockStats` and the play-rate math a host clock is measured and
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
@@ -44,7 +44,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (pulled via `getStats()`) follows the read/notify split `docs/architecture.md`'s "How a consumer
   reads core" explains: a person's action notifies, time passing does not.
 - A chip field an application wants to drive is a row in `registers/sid-fields.ts`, reached through
-  `holdField`/`releaseField` and `setFieldOffset`/`clearFieldOffset` — never a new per-field method on `RegisterFrame` or `SidPlayer`.
+  `holdField`/`releaseField` and `setFieldOffset`/`clearFieldOffset` — never a new per-field method
+  on `RegisterFrame` or `SidPlayer`.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.

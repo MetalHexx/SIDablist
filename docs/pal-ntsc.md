@@ -37,8 +37,8 @@ On real hardware they always moved together, because the frame rate and φ2 both
 crystal — there was never a machine that ran PAL's video timing off NTSC's clock or vice versa, so the
 two effects had no way to appear separately. Streaming register writes breaks that link: the host
 owns the play rate, the attached machine owns φ2. The practical upshot is that a tempo change costs no
-pitch change — the thing keylock exists to fake for audio DJs, and here it is simply true rather than
-compensated for.
+pitch change — the thing time-stretching exists to fake in audio software, and here it is simply
+true rather than compensated for.
 
 Tempo is corrected by the play rate — moving how often the play routine runs, which core already
 owns. Pitch has to be corrected by rewriting the frequency register values themselves before they
