@@ -556,7 +556,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(frame.takeSnapshot(), 24)).toBeUndefined();
     });
 
-    it('never emits the volume register while the fader stays at unity', () => {
+    it('never emits the volume register while the gain stays at unity', () => {
       const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.takeSnapshot();
@@ -564,7 +564,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(frame.takeSnapshot(), 24)).toBeUndefined();
     });
 
-    it('survives a discarded snapshot between a gain change and the next emitted frame, without swallowing the fader move', () => {
+    it('survives a discarded snapshot between a gain change and the next emitted frame, without swallowing the gain change', () => {
       const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x2f);
       frame.setOutputGain(0.5);
@@ -607,7 +607,7 @@ describe('RegisterFrame', () => {
       expect(emittedValue(snapshot, 24)).toBe(0x10 | Math.round(0x0f * 0.5));
     });
 
-    it('does not double-apply gain to a cue captured at one fader position and re-entered at another', () => {
+    it('does not double-apply gain to a cue captured at one gain and re-entered at another', () => {
       const source = createRegisterFrame();
       source.onSidWrite(24, 0x2f);
       source.setOutputGain(0.5);
@@ -1180,7 +1180,7 @@ describe('RegisterFrame', () => {
     }
 
     /** Runs the bundled tune for `frames` play calls, calling `perFrame` before each one so a control
-     *  can be swept exactly as a deck would move it. */
+     *  can be swept exactly as an application would move it. */
     function runTune(
       frames: number,
       perFrame?: (frame: RegisterFrame, index: number) => void,
@@ -1816,6 +1816,498 @@ describe('RegisterFrame field holds', () => {
       frame.holdField({ name: 'frequency', voice: 0 }, 0x00aa);
 
       expect(emittedValue(frame.takeSnapshot(), 0)).toBe(0xaa);
+    });
+  });
+});
+
+describe('RegisterFrame field offsets', () => {
+  const CUTOFF = { name: 'cutoff' } as const;
+  const CUTOFF_LOW = 21;
+  const CUTOFF_HIGH = 22;
+  const ROUTING = 23;
+  const VOLUME = 24;
+
+  /** A frame whose tune wrote `bytes` once, with that frame already delivered — so what comes out
+   *  next is what the output stage alone forces. */
+  function frameWith(
+    bytes: readonly (readonly [register: number, value: number])[],
+  ): RegisterFrame {
+    const frame = createRegisterFrame();
+    for (const [register, value] of bytes) {
+      frame.onSidWrite(register, value);
+    }
+    frame.takeSnapshot();
+    return frame;
+  }
+
+  describe('a field of each shape', () => {
+    it('carries a frequency across the high byte in either direction, sending both bytes', () => {
+      const frame = frameWith([
+        [0, 0xff],
+        [1, 0x12],
+      ]);
+      const frequency = { name: 'frequency', voice: 0 } as const;
+
+      frame.setFieldOffset(frequency, 1);
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 0, value: 0x00 },
+        { register: 1, value: 0x13 },
+      ]);
+
+      frame.setFieldOffset(frequency, -0x100);
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 0, value: 0xff },
+        { register: 1, value: 0x11 },
+      ]);
+    });
+
+    it("offsets a pulse width across its pair, leaving the high register's unused nibble alone", () => {
+      const frame = frameWith([
+        [2, 0x23],
+        [3, 0xa1],
+      ]);
+
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 0x100);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([
+        { register: 2, value: 0x23 },
+        { register: 3, value: 0xa2 },
+      ]);
+    });
+
+    it('offsets the split cutoff, sparing the unused bits of its low register', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65], // 815
+      ]);
+
+      frame.setFieldOffset(CUTOFF, 1);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, CUTOFF_LOW)).toBe(0xf8 | (816 & 0x07));
+      expect(emittedValue(snapshot, CUTOFF_HIGH)).toBe(816 >> 3);
+    });
+
+    it('offsets two envelope nibbles that share a register independently', () => {
+      const frame = frameWith([
+        [19, 0x5a],
+        [20, 0x39],
+      ]);
+      const attack = { name: 'attack', voice: 2 } as const;
+
+      frame.setFieldOffset(attack, 3);
+      expect(emittedValue(frame.takeSnapshot(), 19)).toBe(0x8a);
+      expect(emittedValue(frame.takeSnapshot(), 20)).toBeUndefined();
+
+      frame.setFieldOffset({ name: 'decay', voice: 2 }, -2);
+      expect(emittedValue(frame.takeSnapshot(), 19)).toBe(0x88);
+
+      frame.setFieldOffset({ name: 'sustain', voice: 2 }, 1);
+      frame.setFieldOffset({ name: 'release', voice: 2 }, -9);
+      expect(emittedValue(frame.takeSnapshot(), 20)).toBe(0x40);
+    });
+
+    it("puts an offset resonance beside the tune's routing nibble", () => {
+      const frame = frameWith([[ROUTING, 0x35]]);
+
+      frame.setFieldOffset({ name: 'resonance' }, 4);
+
+      expect(emittedValue(frame.takeSnapshot(), ROUTING)).toBe(0x75);
+    });
+
+    it('puts an offset volume beside the filter type and the voice-3-off bit', () => {
+      const frame = frameWith([[VOLUME, 0xba]]); // voice 3 off, tune mode 0b011, volume 10
+
+      frame.setFieldOffset({ name: 'volume' }, -4);
+
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0xb6);
+    });
+  });
+
+  describe('clamping', () => {
+    it('stops at 0 and at the ceiling of the field', () => {
+      const frame = frameWith([
+        [0, 0xfe],
+        [1, 0xff],
+        [19, 0x30],
+        [CUTOFF_HIGH, 0x01],
+      ]);
+
+      frame.setFieldOffset({ name: 'frequency', voice: 0 }, 5);
+      frame.setFieldOffset({ name: 'attack', voice: 2 }, -15);
+      frame.setFieldOffset({ name: 'decay', voice: 2 }, 15);
+      frame.setFieldOffset(CUTOFF, -2047);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 0)).toBe(0xff);
+      expect(emittedValue(snapshot, 1)).toBe(0xff);
+      expect(emittedValue(snapshot, 19)).toBe(0x0f);
+      expect(emittedValue(snapshot, CUTOFF_HIGH)).toBe(0);
+    });
+  });
+
+  describe('order', () => {
+    it("multiplies, then offsets: the tune's 100, doubled, plus 10 sends 210", () => {
+      const frame = frameWith([[2, 100]]);
+      frame.setRegisterScale('pulseWidth', 2);
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 10);
+
+      expect(emittedValue(frame.takeSnapshot(), 2)).toBe(210);
+    });
+
+    it('clamps the product before the offset is added', () => {
+      const frame = frameWith([
+        [2, 0xa0],
+        [3, 0x0f], // 4000
+      ]);
+      frame.setRegisterScale('pulseWidth', 2); // 8000, clamped to 4095
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 0 }, -10);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 2)).toBe(4085 & 0xff);
+      expect(emittedValue(snapshot, 3)).toBe(4085 >> 8);
+    });
+
+    it('offsets the clock-corrected and pitched frequency', () => {
+      const frame = frameWith([[1, 0x01]]); // 256
+      frame.setVoicePitch(0, 2);
+      frame.setFieldOffset({ name: 'frequency', voice: 0 }, 1);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 0)).toBe(0x01);
+      expect(emittedValue(snapshot, 1)).toBe(0x02);
+    });
+
+    it('offsets the scaled output gain', () => {
+      const frame = frameWith([[VOLUME, 0x4a]]);
+      frame.setOutputGain(0.5); // 10 -> 5
+      frame.setFieldOffset({ name: 'volume' }, 2);
+
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x47);
+    });
+
+    it('lets a full hold win over a multiplier and an offset', () => {
+      const frame = frameWith([[2, 100]]);
+      frame.setRegisterScale('pulseWidth', 2);
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 10);
+
+      frame.holdField({ name: 'pulseWidth', voice: 0 }, 3000);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 2)).toBe(3000 & 0xff);
+      expect(emittedValue(snapshot, 3)).toBe(3000 >> 8);
+    });
+
+    it("blends a half hold from the tune's own value, not from the multiplied and offset one", () => {
+      const frame = frameWith([[2, 100]]);
+      frame.setRegisterScale('pulseWidth', 2);
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 0 }, 10);
+
+      frame.holdField({ name: 'pulseWidth', voice: 0 }, 300, 0.5);
+
+      expect(emittedValue(frame.takeSnapshot(), 2)).toBe(200);
+    });
+  });
+
+  describe('forcing', () => {
+    it('sends the register on every frame of a tune that never writes it', () => {
+      const frame = createRegisterFrame();
+      frame.setFieldOffset({ name: 'volume' }, 3);
+
+      for (let index = 0; index < 3; index++) {
+        expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 3 }]);
+      }
+    });
+
+    it('lets a changed amount reach the very next frame', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x07);
+
+      frame.setFieldOffset({ name: 'volume' }, 6);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0a);
+    });
+
+    it("sends one restoring write on clear, carrying the tune's own bits", () => {
+      const frame = frameWith([[VOLUME, 0x4a]]);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+
+      frame.clearFieldOffset({ name: 'volume' });
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x4a }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('treats an amount of 0 as a clear', () => {
+      const frame = frameWith([[VOLUME, 0x0a]]);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+
+      frame.setFieldOffset({ name: 'volume' }, 0);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x0a }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('writes nothing extra for the same amount twice', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x07 }]);
+    });
+
+    it('arms nothing when moving between amounts, or clearing what was never set', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+
+      frame.clearFieldOffset({ name: 'volume' });
+      frame.setFieldOffset({ name: 'volume' }, 0);
+      expect(frame.takeSnapshot().count).toBe(0);
+
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+      frame.setFieldOffset({ name: 'volume' }, 5);
+      frame.takeSnapshot();
+      frame.clearFieldOffset({ name: 'volume' });
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x04 }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('keeps forcing a field that is clear of its offset but still off its multiplier', () => {
+      const frame = frameWith([[VOLUME, 0x08]]);
+      frame.setOutputGain(0.5);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+
+      frame.clearFieldOffset({ name: 'volume' });
+
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x04);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x04);
+    });
+
+    it('sends one restoring write when the multiplier comes home with the offset already clear', () => {
+      const frame = frameWith([[VOLUME, 0x08]]);
+      frame.setOutputGain(0.5);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.clearFieldOffset({ name: 'volume' });
+      frame.takeSnapshot();
+
+      frame.setOutputGain(1);
+
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x08 }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+
+    it('keeps the offset standing when the multiplier comes home, restoring only on the clear', () => {
+      const frame = frameWith([[VOLUME, 0x08]]);
+      frame.setOutputGain(0.5);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+
+      frame.setOutputGain(1);
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x0b);
+
+      frame.clearFieldOffset({ name: 'volume' });
+      expect(emittedValue(frame.takeSnapshot(), VOLUME)).toBe(0x08);
+      expect(frame.takeSnapshot().count).toBe(0);
+    });
+  });
+
+  describe('refusals', () => {
+    /** The refused call must leave a standing offset exactly as it was. */
+    function expectRefused(call: (frame: RegisterFrame) => void): void {
+      const fresh = createRegisterFrame();
+      call(fresh);
+      expect(fresh.takeSnapshot().count).toBe(0);
+
+      const standing = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      standing.setFieldOffset(CUTOFF, 10);
+      call(standing);
+      expect(sentField(standing, CUTOFF)).toBe(825);
+    }
+
+    it.each([1.5, -0.5, Number.NaN, Number.POSITIVE_INFINITY, 2048, -2048])(
+      'ignores a cutoff offset of %s',
+      (amount) => {
+        expectRefused((frame) => frame.setFieldOffset(CUTOFF, amount));
+      },
+    );
+
+    it('ignores an amount beyond the ceiling of a narrower field', () => {
+      expectRefused((frame) => frame.setFieldOffset({ name: 'attack', voice: 0 }, 16));
+    });
+
+    it.each([3, -1, 1.5])('ignores a per-voice field on voice %s', (voice) => {
+      expectRefused((frame) => {
+        frame.setFieldOffset({ name: 'attack', voice }, 1);
+        frame.clearFieldOffset({ name: 'attack', voice });
+      });
+    });
+
+    it('ignores a field that does not exist', () => {
+      expectRefused((frame) => {
+        frame.setFieldOffset({ name: 'bogus' } as unknown as SidField, 1);
+        frame.clearFieldOffset({ name: 'bogus' } as unknown as SidField);
+      });
+    });
+
+    it.each([
+      { name: 'gate', voice: 0 },
+      { name: 'waveform', voice: 1 },
+      { name: 'filtered', voice: 2 },
+      { name: 'filterType' },
+      { name: 'voice3Off' },
+    ] as const)('ignores the switch field $name', (field) => {
+      expectRefused((frame) => frame.setFieldOffset(field, 1));
+    });
+  });
+
+  describe('a muted voice', () => {
+    it('still offsets the voice numeric fields, since the mute owns only its control register', () => {
+      const frame = frameWith([
+        [0, 0x34],
+        [4, 0x11],
+      ]);
+      frame.setVoiceMuted(0, true);
+      frame.takeSnapshot();
+
+      frame.setFieldOffset({ name: 'frequency', voice: 0 }, 1);
+
+      const snapshot = frame.takeSnapshot();
+      expect(emittedValue(snapshot, 0)).toBe(0x35);
+      expect(emittedValue(snapshot, 4)).toBeUndefined();
+      expect(frame.emittedValues().sent[4]).toBe(0);
+    });
+  });
+
+  describe('the shadow and cues', () => {
+    it('leaves the shadow, voiceState and written values the tunes own', () => {
+      const frame = frameWith([
+        [0, 0x34],
+        [1, 0x12],
+        [19, 0x5a],
+      ]);
+      const before = frame.snapshotValues().values;
+
+      frame.setFieldOffset({ name: 'frequency', voice: 0 }, 5);
+      frame.setFieldOffset({ name: 'attack', voice: 2 }, 2);
+      frame.takeSnapshot();
+
+      expect(frame.snapshotValues().values).toEqual(before);
+      expect(frame.voiceState(0).frequency).toBe(0x1234);
+      expect(frame.voiceState(2).envelope >> 8).toBe(0x5a);
+      expect(readSidField(frame.emittedValues().written, { name: 'frequency', voice: 0 })).toBe(
+        0x1234,
+      );
+      expect(readSidField(frame.emittedValues().sent, { name: 'frequency', voice: 0 })).toBe(
+        0x1239,
+      );
+    });
+
+    it('applies the offset once to a cue restored at a different offset', () => {
+      const frame = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65], // 815
+      ]);
+      frame.setFieldOffset(CUTOFF, 10);
+      const cue = frame.snapshotValues();
+
+      frame.setFieldOffset(CUTOFF, 100);
+      frame.restoreValues(cue);
+
+      expect(sentField(frame, CUTOFF)).toBe(915);
+    });
+
+    it('leaves a standing offset in place across a restore, and carries none into a cue', () => {
+      const source = frameWith([
+        [CUTOFF_LOW, 0xff],
+        [CUTOFF_HIGH, 0x65],
+      ]);
+      source.setFieldOffset(CUTOFF, 10);
+      const cue = source.snapshotValues();
+
+      const target = createRegisterFrame();
+      target.restoreValues(cue);
+      target.markAllDirty();
+
+      expect(sentField(target, CUTOFF)).toBe(815);
+      source.restoreValues(cue);
+      expect(sentField(source, CUTOFF)).toBe(825);
+    });
+  });
+
+  describe('readRegisters', () => {
+    /** A frame with every layer in play at once, so the read has something of each to compose. */
+    function crowdedFrame(): RegisterFrame {
+      const frame = createRegisterFrame();
+      ALL_REGISTERS.forEach((register) => frame.onSidWrite(register, byteFor(register)));
+      frame.takeSnapshot();
+      frame.setOutputGain(0.5);
+      frame.setRegisterScale('cutoff', 0.5);
+      frame.setVoicePitch(1, 0.5);
+      frame.setFilterMode('bandPass');
+      frame.holdField({ name: 'frequency', voice: 1 }, 0x1234, 0.5);
+      frame.holdField({ name: 'gate', voice: 2 }, 1);
+      frame.setFieldOffset({ name: 'frequency', voice: 2 }, 300);
+      frame.setFieldOffset({ name: 'attack', voice: 0 }, -3);
+      frame.setFieldOffset({ name: 'resonance' }, 2);
+      frame.setFieldOffset({ name: 'pulseWidth', voice: 1 }, 17);
+      frame.setFieldOffset({ name: 'volume' }, 1);
+      frame.setVoiceMuted(0, true);
+      return frame;
+    }
+
+    it("fills the caller's two buffers with what emittedValues reports", () => {
+      const frame = crowdedFrame();
+      const written = new Uint8Array(SID_REGISTER_COUNT).fill(0xee);
+      const sent = new Uint8Array(SID_REGISTER_COUNT).fill(0xee);
+
+      frame.readRegisters(written, sent);
+
+      const expected = frame.emittedValues();
+      expect(written).toEqual(expected.written);
+      expect(sent).toEqual(expected.sent);
+      expect(sent).not.toEqual(written);
+    });
+
+    it('matches, register for register, what a real resync frame sends', () => {
+      const frame = crowdedFrame();
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      frame.readRegisters(written, sent);
+
+      frame.markAllDirty();
+      const snapshot = frame.takeSnapshot();
+
+      for (const register of ALL_REGISTERS) {
+        expect(emittedValue(snapshot, register)).toBe(sent[register]);
+      }
+    });
+
+    it('arms and consumes no one-shot, so the next real frame is undisturbed', () => {
+      const frame = frameWith([[VOLUME, 0x04]]);
+      frame.setFieldOffset({ name: 'volume' }, 3);
+      frame.takeSnapshot();
+      frame.clearFieldOffset({ name: 'volume' });
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+
+      frame.readRegisters(written, sent);
+      frame.readRegisters(written, sent);
+
+      expect(sent[VOLUME]).toBe(0x04);
+      expect(writesOf(frame.takeSnapshot())).toEqual([{ register: VOLUME, value: 0x04 }]);
+      expect(frame.takeSnapshot().count).toBe(0);
+
+      frame.readRegisters(written, sent);
+      expect(frame.takeSnapshot().count).toBe(0);
     });
   });
 });

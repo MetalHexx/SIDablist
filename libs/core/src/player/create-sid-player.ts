@@ -18,7 +18,7 @@ import type {
   SidFilterMode,
 } from '../registers/register-frame.js';
 import type { SidFrame } from '../registers/sid-frame.js';
-import { isUsableHold, resolveSidField } from '../registers/sid-fields.js';
+import { isUsableHold, isUsableOffset, resolveSidField } from '../registers/sid-fields.js';
 import type { SidField } from '../registers/sid-fields.js';
 import {
   NTSC_FRAME_INTERVAL_US,
@@ -134,14 +134,14 @@ class SidPlayerCoordinator implements SidPlayer {
     rounded: 1,
   };
   /** What the clock was last handed, or null before it has ever started — the rate diagnostics
-   *  report, rather than one derived from a fader that may have moved while stopped. */
+   *  report, rather than one derived from a tempo that may have changed while stopped. */
   private runningIntervalUs: Microseconds | null = null;
 
   private readonly mutedVoices = [false, false, false];
   private readonly heldVoices = [false, false, false];
 
   /** Held so a fresh `RegisterFrame` built by `loadTune` inherits them — otherwise every tune load
-   *  would silently reset the deck to full, at home, with no field held. */
+   *  would silently reset the output to full, at home, with no field held or offset. */
   private outputGain = 1;
   private readonly registerScales = new Map<ScaledRegisterGroup, number>();
   /** Keyed by the field's table index, so the same field named by two different objects is one
@@ -149,6 +149,11 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly fieldHolds = new Map<
     number,
     { readonly field: SidField; readonly value: number; readonly amount: number }
+  >();
+  /** Keyed like `fieldHolds`; an amount of 0 is never stored. */
+  private readonly fieldOffsets = new Map<
+    number,
+    { readonly field: SidField; readonly amount: number }
   >();
 
   /** The clock pair rather than the ratio it derives, because a fresh `RegisterFrame` is handed the
@@ -290,8 +295,8 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.load(file);
 
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
-    // and no field held, so every held control is re-applied here, before this load can emit a
-    // packet at the wrong setting.
+    // and no field held or offset, so every carried setting is re-applied here, before this load can
+    // emit a packet at the wrong setting.
     const frame = this.session.frame;
     frame?.setOutputGain(this.outputGain);
     for (const [group, coefficient] of this.registerScales) {
@@ -299,6 +304,9 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     for (const hold of this.fieldHolds.values()) {
       frame?.holdField(hold.field, hold.value, hold.amount);
+    }
+    for (const offset of this.fieldOffsets.values()) {
+      frame?.setFieldOffset(offset.field, offset.amount);
     }
     this.applyPitch();
 
@@ -401,7 +409,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.discardOutstandingJump();
     this.transport = 'stopped';
     // After the transport, so the one snapshot this publishes already reads as stopped rather than
-    // announcing a deck that is still playing with its loop taken away.
+    // announcing a player that is still playing with its loop taken away.
     this.setActiveLoop(null);
     if (this.session.file !== null) {
       this.sink.end();
@@ -533,7 +541,7 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /** A divisor on the clock and nothing else, which is what makes a tempo change nearly free. The
-   *  span a fader may reach is the application's to decide; core rejects only what it cannot divide
+   *  span a tempo may reach is the application's to decide; core rejects only what it cannot divide
    *  by. */
   setTempo(multiplier: number): void {
     if (!Number.isFinite(multiplier) || multiplier <= 0) {
@@ -629,6 +637,55 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.frame?.releaseField(field);
   }
 
+  /**
+   * Offsets `field` by `amount` and carries it into every tune loaded after. A refused offset is
+   * neither applied nor carried, and leaves any offset already on the field alone; an amount of 0
+   * hands the field back.
+   */
+  setFieldOffset(field: SidField, amount: number): void {
+    const index = resolveSidField(field);
+    if (!isUsableOffset(index, amount)) {
+      console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+      return;
+    }
+    if (amount === 0) {
+      this.fieldOffsets.delete(index);
+    } else {
+      this.fieldOffsets.set(index, { field: { ...field }, amount });
+    }
+    this.session.frame?.setFieldOffset(field, amount);
+  }
+
+  clearFieldOffset(field: SidField): void {
+    const index = resolveSidField(field);
+    if (index < 0) {
+      console.warn(`SID player: ignoring an offset release of ${describeField(field)}.`);
+      return;
+    }
+    this.fieldOffsets.delete(index);
+    this.session.frame?.clearFieldOffset(field);
+  }
+
+  /** Allocates nothing: both buffers are the caller's, and zero-filled by index when no tune is
+   *  loaded. */
+  readRegisters(written: Uint8Array, sent: Uint8Array): void {
+    const shortest = Math.min(written.length, sent.length);
+    if (shortest < SID_REGISTER_COUNT) {
+      throw new RangeError(
+        `register buffers must hold ${SID_REGISTER_COUNT} bytes, got ${shortest}`,
+      );
+    }
+    const frame = this.session.frame;
+    if (frame === null) {
+      for (let i = 0; i < SID_REGISTER_COUNT; i++) {
+        written[i] = 0;
+        sent[i] = 0;
+      }
+      return;
+    }
+    frame.readRegisters(written, sent);
+  }
+
   /** A hold or release of `filterType`, so the override has no copy of its own to disagree with. */
   setFilterMode(mode: SidFilterMode | null): void {
     if (mode === null) {
@@ -675,6 +732,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.discardOutstandingJump();
     this.session.dispose();
     this.fieldHolds.clear();
+    this.fieldOffsets.clear();
     if (this.transport === 'playing' || this.transport === 'paused') {
       this.sink.end();
     }
@@ -778,14 +836,14 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /**
    * The track played through and stopped. Leaves the playhead at the track's end rather than
-   * snapping it to zero, so a consumer can see where the deck finished, and deliberately does not
+   * snapping it to zero, so a consumer can see where playback finished, and deliberately does not
    * re-initialise the subtune — that would reset the position counter, and `play()` from `'ended'`
    * already falls through its own non-paused branch to restart from the beginning.
    */
   private endTrack(): void {
     this.haltPlayback();
     // A scrub still in flight would otherwise land after this reports `ended`, restore a position
-    // and queue a resync that — with the clock stopped — goes out at once, so the deck would report
+    // and queue a resync that — with the clock stopped — goes out at once, so the player would report
     // `ended` and then audibly resume.
     this.session.discardOutstandingJump();
     this.sink.end();

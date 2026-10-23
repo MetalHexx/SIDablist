@@ -51,7 +51,7 @@ export interface ActiveLoopTracker {
    * track's own end.
    *
    * Reaching the active loop's end re-enters its start — through the entry image if one is held,
-   * else by seeking along the anchor path from P05-T03 — and reports the frame landed on.
+   * else by seeking along the anchor path — and reports the frame landed on.
    *
    * Reaching the track's end with no active loop set decides between replaying and stopping per
    * `track.repeatEnabled()`: off stops, leaving the pair exactly where it stands — what stopping

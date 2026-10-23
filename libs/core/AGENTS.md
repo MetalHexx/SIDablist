@@ -18,9 +18,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `cpu/` — `C64Machine`, the faked 64 KB address space and CIA/VIC stubs a tune's `init`/`play`
   routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in
   `vendor/mos6502/` implements.
-- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator, scaling and
-  field-hold engine that builds one), `sid-fields.ts` (the table of chip fields a hold can name),
-  and the register and clock constants.
+- `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
+  stage — multiplier, offset, hold — that builds one), `sid-fields.ts` (the table of chip fields an
+  application can drive), `__reference__/` (the frozen pre-field-table implementation
+  `register-frame.equivalence.spec.ts` checks against), and the register and clock constants.
 - `clock/` — `FrameAccumulator`, `ClockStats` and the play-rate math a host clock is measured and
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
@@ -43,7 +44,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (pulled via `getStats()`) follows the read/notify split `docs/architecture.md`'s "How a consumer
   reads core" explains: a person's action notifies, time passing does not.
 - A chip field an application wants to drive is a row in `registers/sid-fields.ts`, reached through
-  `holdField`/`releaseField` — never a new per-field method on `RegisterFrame` or `SidPlayer`.
+  `holdField`/`releaseField` and `setFieldOffset`/`clearFieldOffset` — never a new per-field method
+  on `RegisterFrame` or `SidPlayer`.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.
@@ -52,7 +54,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 
 - **The hot path does not allocate.** `RegisterFrame`'s per-frame state — `values`, `writeOrder`,
   the reused `SidFrame` buffers `takeSnapshot()` hands back — is mutated in place on purpose (see
-  `registers/register-frame.ts`). Frame delivery runs fifty times a second per deck; wrapping any
+  `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
   of it in a fresh object or a getter for readability is a real regression, and it is audible, not
   caught by a test.
 - **Hardware-precise constants are not typos to fix.** `registers/sid-constants.ts`'s
@@ -73,6 +75,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
+- **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
+  output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
+  the shadow makes a cue re-entered at another setting apply it twice.
 - **A spec that needs a DOM is a spec testing the wrong thing.** `vitest.config.ts` here runs
   `environment: 'node'`, no `jsdom`, matching the "touches no browser global" invariant at the
   root. A `core` spec that reaches for `window` or `document` has crossed a port boundary that
@@ -101,6 +106,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   or `RegisterFrame`'s snapshot API?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+
+- **Made a deliberate change to how multiply, offset or hold compose?**
+  `registers/register-frame.equivalence.spec.ts` fails against the frozen reference in
+  `registers/__reference__/`, because the reference still composes them the old way. Confirm the
+  change is intended, then retire `registers/__reference__/` and that spec together. Detail:
+  [`docs/architecture.md`](../../docs/architecture.md).
 
 ## Commands
 

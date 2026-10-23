@@ -53,7 +53,7 @@ export function createPlayerSnapshotStore(initial: PlayerSnapshot): PlayerSnapsh
 /**
  * Structural equality over the plain data a snapshot is built from — primitives, arrays and plain
  * objects only, never a function or a class instance. Generic on purpose: it needs no update when
- * P07-T02 adds a field or a group, because the addition is more of the same shapes.
+ * a later change adds a field or a group, because the addition is more of the same shapes.
  */
 function snapshotsEqual(a: PlayerSnapshot, b: PlayerSnapshot): boolean {
   return valuesEqual(a, b);

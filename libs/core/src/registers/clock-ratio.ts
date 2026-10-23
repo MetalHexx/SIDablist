@@ -9,7 +9,7 @@
 
 /** PAL φ2, in Hz. */
 export const PAL_PHI2_HZ = 985248.6;
-/** NTSC φ2, in Hz — 3.804% above PAL, roughly two-thirds of a semitone. */
+/** NTSC φ2, in Hz — 3.804% above PAL. */
 export const NTSC_PHI2_HZ = 1022727.1;
 
 /**

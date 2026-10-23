@@ -8,9 +8,8 @@ import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
- * (`createSidPlayer`, landing in P05-T07). Every operation the engine it replaces exposed either
- * has a route through here, moved to the application, or moved to the sink — nothing is dropped
- * silently.
+ * (`createSidPlayer`). Every operation a consumer needs has a route: through here, to the
+ * application, or to the sink — nothing is dropped silently.
  *
  * The rule that shapes the read side: things a person did notify you; things time did, you go and
  * look at. A performer's action — loading a tune, muting a voice, changing the filter — is a
@@ -72,6 +71,16 @@ export interface SidPlayer {
   /** Hands the field back to the tune. The player never releases a hold on its own, except on
    *  dispose. */
   releaseField(field: SidField): void;
+  /** Adds `amount` (signed, the field's raw units) to a numeric field on the way out, after any
+   *  multiplier and before any hold, and carries it into every tune loaded after — see
+   *  `RegisterFrame.setFieldOffset`. An amount of 0 is the same as `clearFieldOffset`. */
+  setFieldOffset(field: SidField, amount: number): void;
+  /** Hands the field back. The player never clears an offset on its own, except on dispose. */
+  clearFieldOffset(field: SidField): void;
+  /** Not notified — pulled on the consumer's own schedule, like `getPosition()`. Fills two
+   *  caller-owned buffers (≥ SID_REGISTER_COUNT) with the registers as written and as sent;
+   *  zeros when nothing is loaded. Allocates nothing. */
+  readRegisters(written: Uint8Array, sent: Uint8Array): void;
   /** The φ2 clocks a tune was written for and is playing on. Derived and session-lifetime, not a
    *  performance control — and the application's to supply, since core cannot know the far end. */
   setTargetClock(sourceHz: number, targetHz: number): void;

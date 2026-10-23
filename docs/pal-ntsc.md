@@ -11,10 +11,10 @@ responsibilities.
 
 Playing a tune on a machine it was not written for goes wrong in two independent ways:
 
-| Effect | Cause                                           | Size                   |
-| ------ | ----------------------------------------------- | ---------------------- |
-| Tempo  | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC  | +19.36%                |
-| Pitch  | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804%, ≈ +64.6 cents |
+| Effect | Cause                                           | Size    |
+| ------ | ----------------------------------------------- | ------- |
+| Tempo  | Frame rate — 50.1245 Hz PAL vs 59.8261 Hz NTSC  | +19.36% |
+| Pitch  | φ2 clock — 985248.6 Hz PAL vs 1022727.1 Hz NTSC | +3.804% |
 
 They have different causes, so they need different fixes — which is the whole reason it is useful
 that they are separable at all.
@@ -37,8 +37,8 @@ On real hardware they always moved together, because the frame rate and φ2 both
 crystal — there was never a machine that ran PAL's video timing off NTSC's clock or vice versa, so the
 two effects had no way to appear separately. Streaming register writes breaks that link: the host
 owns the play rate, the attached machine owns φ2. The practical upshot is that a tempo change costs no
-pitch change — the thing keylock exists to fake for audio DJs, and here it is simply true rather than
-compensated for.
+pitch change — the thing time-stretching exists to fake in audio software, and here it is simply
+true rather than compensated for.
 
 Tempo is corrected by the play rate — moving how often the play routine runs, which core already
 owns. Pitch has to be corrected by rewriting the frequency register values themselves before they
@@ -62,10 +62,10 @@ Fn_out = Fn × clockRatio × voicePitch[voice]
 - **`voicePitch`** is live and user-driven, one independent value per voice. Whether a performer's
   interface gangs the three voices together is an application decision core has no opinion on.
 
-Keeping them apart means moving a pitch fader never disturbs the clock correction, and vice versa: a
+Keeping them apart means moving a pitch control never disturbs the clock correction, and vice versa: a
 `setTargetClock` call re-derives `clockRatio` without touching whatever `voicePitch` a performer has
 already set, and `setVoicePitch` composes with whatever `clockRatio` is already in force. An interface
-can report how much correction is in effect independently of where a fader currently sits.
+can report how much correction is in effect independently of where a pitch control currently sits.
 
 ## What is scaled, and what is not — and why
 
@@ -98,10 +98,10 @@ the low byte moves from call to call.
 
 A correct implementation therefore keeps a per-voice shadow of both bytes, recomputes the _whole_
 16-bit value from that shadow on every low-or-high write, and emits both registers — not just the one
-the tune wrote — whenever the recomputed value moved. `register-frame.ts`'s `scaleVoiceFrequency`
-does exactly this: it recombines both shadow bytes, rounds once, and the frame-construction path
-forces both frequency registers of a voice out on every frame the voice's combined coefficient is off
-its 1.0 home, specifically so the moved high byte reaches the chip instead of being left behind at the
+the tune wrote — whenever the recomputed value moved. The field table does exactly this: the
+`frequency` field's multiplier is the clock ratio times the voice pitch, recombined from both shadow
+bytes and rounded once. While that field is off home, both of its registers are forced out on every
+frame, specifically so the moved high byte reaches the chip instead of being left behind at the
 tune's own value.
 
 **Worked case.** Take an NTSC tune corrected for PAL playback: `clockRatio(1022727.1, 985248.6) ≈
