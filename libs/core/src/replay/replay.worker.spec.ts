@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ReplayRequest, ReplayResponse } from './replay-runner.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { frames } from '../units.js';
+import { replayToFrame } from './replay-to-frame.js';
 
 /** The slice of `DedicatedWorkerGlobalScope` the entry point actually touches. Node has no `self`
  *  of its own, so the worker module reads whatever this test installs on `globalThis` before
@@ -82,6 +83,52 @@ describe('replay worker entry point', () => {
       id: 2,
       ok: false,
       error: expect.stringContaining('failed during init'),
+    });
+  });
+
+  it('replays from the start image the request carries', async () => {
+    const scope = await importWorkerWithFakeScope();
+    const file = tune();
+    const mutes = [false, false, false];
+    const start = replayToFrame(file, 1, frames(5), mutes);
+    const request: ReplayRequest = {
+      id: 3,
+      file,
+      subtune: 1,
+      targetFrame: frames(9),
+      mutes,
+      start,
+    };
+
+    scope.onmessage?.({ data: request } as MessageEvent<ReplayRequest>);
+
+    expect(scope.postMessage).toHaveBeenCalledWith({
+      id: 3,
+      ok: true,
+      result: replayToFrame(file, 1, frames(9), mutes),
+    });
+  });
+
+  it('refuses a start image past the target, which only happens when the worker forwards start', async () => {
+    const scope = await importWorkerWithFakeScope();
+    const file = tune();
+    const mutes = [false, false, false];
+    const start = replayToFrame(file, 1, frames(5), mutes);
+    const request: ReplayRequest = {
+      id: 4,
+      file,
+      subtune: 1,
+      targetFrame: frames(3),
+      mutes,
+      start,
+    };
+
+    scope.onmessage?.({ data: request } as MessageEvent<ReplayRequest>);
+
+    expect(scope.postMessage).toHaveBeenCalledWith({
+      id: 4,
+      ok: false,
+      error: expect.stringContaining('past the target'),
     });
   });
 });

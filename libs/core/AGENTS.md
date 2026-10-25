@@ -27,7 +27,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
   operations core owns.
 - `player/` — `createSidPlayer`, the composition root wiring the above into `SidPlayer`, plus
-  `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads.
+  `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
+  surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
+  queue are published under `tune.preparedFrames`, `tune.queuedJump` and `tune.handOffs`);
+  `queueJump` queues a hand-off for the running loop's next wrap; `capturePosition()` returns the
+  frame it captured. `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for
+  those builds, so a scrub does not wait behind a batch of them; without it they share the scrub
+  runner.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -85,7 +91,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   host's declaration does.
 - **A queued jump never lands without a held image.** A target that is not yet built waits whole
   laps for it rather than replaying on the main thread inside the tick, so a host that queues an
-  unprepared frame sees the running loop continue. `tune.handOffs` is how it tells a landing from a
+  unprepared frame sees the running loop continue. Frame 0 is no exception: an undeclared target
+  is replayed off-thread like any other, since a queued hand-off restores only from an image. `tune.handOffs` is how it tells a landing from a
   dropped queue; clearing a queue never touches it.
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
@@ -128,7 +135,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   forwards it in its own way. A field one of them drops compiles fine and degrades quietly: a
   dropped `start` makes every prepared build replay from the top, and a dropped `mutes` builds
   frames that sound wrong once unmuted. Update the worker and each runner, then run
-  `replay/replay.worker.spec.ts` and `replay/worker-replay-runner.spec.ts`. Detail:
+  `replay/replay.worker.spec.ts`, which pins that the worker forwards `start`. No spec catches a
+  `ReplayRunner` implementation that drops it, since the in-spec fakes forward it themselves. Detail:
   [`replay/replay.worker.ts`](./src/replay/replay.worker.ts)
 - **Made a deliberate change to how multiply, offset or hold compose?**
   `registers/register-frame.equivalence.spec.ts` fails against the frozen reference in

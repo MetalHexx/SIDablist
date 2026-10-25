@@ -1090,6 +1090,12 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   private async captureEntryImage(startFrame: Frames): Promise<HeldImage | null> {
     if (startFrame === 0) return null;
+    return this.replayEntryImage(startFrame);
+  }
+
+  /** The replay behind `captureEntryImage`, with no frame-0 shortcut: an image is a replay to
+   *  `startFrame` whatever that frame is, checked against the file and subtune it was issued for. */
+  private async replayEntryImage(startFrame: Frames): Promise<HeldImage | null> {
     const file = this.session.file;
     if (file === null) return null;
     const subtune = this.session.currentSubtune;
@@ -1176,9 +1182,10 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /** Captures the start frame of `record` once, off-thread, and hands it over if `record` is still
-   *  the jump queued when the image arrives. */
+   *  the jump queued when the image arrives. Frame 0 is replayed here too: a loop at 0 re-enters
+   *  through the ring's seed, but a queued hand-off restores only from an image it is given. */
   private async captureQueuedImage(record: QueuedJump): Promise<void> {
-    const result = await this.captureEntryImage(record.startFrame);
+    const result = await this.replayEntryImage(record.startFrame);
     if (result === null) return;
 
     this.rememberEntryImage(result);

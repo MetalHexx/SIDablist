@@ -2393,6 +2393,19 @@ describe('createSidPlayer', () => {
       expect(player.getPosition()).toBe(300);
     });
 
+    it('captures an undeclared frame 0 off-thread and lands on it', async () => {
+      const { player, clock, replay } = await loopingPlayer();
+      const requests = replay.requests.length;
+
+      player.queueJump({ startFrame: frames(0), endFrame: frames(20) });
+      await flushEntryImageCapture();
+
+      expect(replay.requests.slice(requests).map((request) => request.targetFrame)).toEqual([0]);
+      runUntil(clock, () => handOffs(player) === 1);
+      expect(player.getPosition()).toBe(0);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 0, endFrame: 20 });
+    });
+
     it('needs no replay for a target whose image was captured from the live position', async () => {
       const { player, clock, replay } = harness();
       player.loadTune(counterTune());

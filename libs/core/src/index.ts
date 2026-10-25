@@ -89,6 +89,7 @@ export {
   type ActiveLoop,
   type ActiveLoopTracker,
   type AdvanceResult,
+  type QueuedNext,
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
 export { type SidPlayer } from './player/sid-player.js';
