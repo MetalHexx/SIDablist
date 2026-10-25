@@ -88,6 +88,10 @@ Worked examples of the same test:
 | A control's position                                                                  | application | Intent                                          |
 | Applying gain and filter scaling, and offsetting or holding chip fields, on registers | core        | Register state on the frame path                |
 
+The `LoopPositionsStore` port that holds a tune's saved loop markers lives in `libs/tunes`; the
+storage behind it is still the application's. Core never imports `tunes`: the application rebuilds
+core's loop snapshots from the stored positions.
+
 ## The output stage
 
 Every register the tune writes passes through one table, `registers/sid-fields.ts`, on its way to
