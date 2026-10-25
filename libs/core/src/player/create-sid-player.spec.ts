@@ -54,28 +54,54 @@ vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
 });
 
 /** Answers every request against the real `replayToFrame`, immediately — the landing is what these
- *  tests are about, not the thread it crosses. */
+ *  tests are about, not the thread it crosses. `manual` holds requests until `resolveAll()`, which
+ *  is what lets a test see what a second runner does while this one is busy. */
 class FakeReplayRunner implements ReplayRunner {
+  readonly requests: ReplayRequest[] = [];
   disposed = false;
+  disposeCount = 0;
+  manual = false;
+  private readonly held: (() => void)[] = [];
 
   run(request: ReplayRequest): Promise<ReplayResponse> {
-    try {
-      return Promise.resolve({
-        id: request.id,
-        ok: true,
-        result: replayToFrame(request.file, request.subtune, request.targetFrame, request.mutes),
-      });
-    } catch (error) {
-      return Promise.resolve({
-        id: request.id,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
+    this.requests.push(request);
+    if (this.manual) {
+      return new Promise<ReplayResponse>((resolve) => {
+        this.held.push(() => resolve(answer(request)));
       });
     }
+    return Promise.resolve(answer(request));
   }
 
   dispose(): void {
     this.disposed = true;
+    this.disposeCount++;
+  }
+
+  resolveAll(): void {
+    this.held.splice(0).forEach((resolve) => resolve());
+  }
+}
+
+function answer(request: ReplayRequest): ReplayResponse {
+  try {
+    return {
+      id: request.id,
+      ok: true,
+      result: replayToFrame(
+        request.file,
+        request.subtune,
+        request.targetFrame,
+        request.mutes,
+        request.start,
+      ),
+    };
+  } catch (error) {
+    return {
+      id: request.id,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -302,6 +328,47 @@ function harness(): Harness {
   const clock = new FakeClock();
   const replay = new FakeReplayRunner();
   return { player: createSidPlayer({ sink, clock, replayRunner: replay }), sink, clock, replay };
+}
+
+interface SplitHarness extends Harness {
+  readonly prepare: FakeReplayRunner;
+}
+
+/** A player whose prepared builds run on a runner of their own, the way a second worker would. */
+function splitHarness(): SplitHarness {
+  const sink = new RecordingSink();
+  const clock = new FakeClock();
+  const replay = new FakeReplayRunner();
+  const prepare = new FakeReplayRunner();
+  return {
+    player: createSidPlayer({ sink, clock, replayRunner: replay, prepareRunner: prepare }),
+    sink,
+    clock,
+    replay,
+    prepare,
+  };
+}
+
+/** init sets voice 0's control register once and play never touches it again, so a state captured
+ *  while that voice was muted stays silent after an unmute for as long as nothing rebuilds it. */
+function heldNoteTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0x41, 0x8d, 0x04, 0xd4, RTS] }, // LDA #$41; STA $D404; RTS
+      { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+    ],
+  });
+}
+
+/** The byte the tune last wrote to `register`, read off the live register shadow. */
+function writtenRegister(player: SidPlayer, register: number): number {
+  const written = new Uint8Array(SID_REGISTER_COUNT);
+  player.readRegisters(written, new Uint8Array(SID_REGISTER_COUNT));
+  return written[register];
+}
+
+function preparedFrames(player: SidPlayer): readonly number[] | undefined {
+  return player.getSnapshot().tune?.preparedFrames;
 }
 
 /** Ticks `count` frames, each one interval apart on the same rising timeline a real clock reports. */
@@ -1033,6 +1100,7 @@ describe('createSidPlayer', () => {
         subtune: 2,
         subtuneCount: 3,
         lengthFrames: null,
+        preparedFrames: [],
       });
       expect(player.getSnapshot().repeatTrack).toBe(true);
     });
@@ -1758,5 +1826,451 @@ describe('createSidPlayer', () => {
     expect(replay.disposed).toBe(true);
     expect(sink.endCallCount).toBe(1);
     expect(() => run(clock, 1)).toThrow();
+  });
+
+  describe('declared jump frames', () => {
+    it('makes every declared frame ready, however many, and leaves the playhead and the stream alone', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 5);
+      const delivered = sink.deliveredFrames.length;
+
+      player.setJumpTargets([900, 100, 500, 300, 700, 50].map((frame) => frames(frame)));
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([50, 100, 300, 500, 700, 900]);
+      expect(player.getPosition()).toBe(5);
+      expect(sink.deliveredFrames).toHaveLength(delivered);
+      expect(sink.deliveredNowFrames).toHaveLength(0);
+    });
+
+    it('notifies as each frame becomes ready, and stays quiet when a declaration changes nothing', async () => {
+      const { player } = harness();
+      player.loadTune(counterTune());
+      const seen: (readonly number[] | undefined)[] = [];
+      player.subscribe(() => seen.push(preparedFrames(player)));
+
+      player.setJumpTargets([frames(200), frames(100)]);
+      await flushEntryImageCapture();
+
+      expect(seen).toEqual([[100], [100, 200]]);
+
+      const settled = player.getSnapshot();
+      player.setJumpTargets([frames(100), frames(200)]);
+      await flushEntryImageCapture();
+
+      expect(player.getSnapshot()).toBe(settled);
+    });
+
+    it('answers a seek, a lap re-entry and a cue on a ready frame without a replay request', async () => {
+      const { player, clock, replay } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setJumpTargets([frames(100), frames(500)]);
+      await flushEntryImageCapture();
+      const requests = replay.requests.length;
+      runFrameSpy.mockClear();
+
+      await player.seek(frames(500));
+      expect(player.getPosition()).toBe(500);
+
+      run(clock, 1); // the gate-off tick the jump owed the stream
+      player.setActiveLoop({ startFrame: frames(500), endFrame: frames(510) });
+      runFrameSpy.mockClear();
+      run(clock, 10); // plays the lap through and re-enters its start on the last tick
+      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(player.getPosition()).toBe(500);
+
+      await player.seek(frames(100));
+      expect(player.getPosition()).toBe(100);
+      expect(replay.requests).toHaveLength(requests);
+    });
+
+    it('builds each frame the way a replay from the top would have', async () => {
+      const { player } = harness();
+      const file = counterTune();
+      player.loadTune(file);
+
+      player.setJumpTargets([frames(300), frames(100)]);
+      await flushEntryImageCapture();
+      await player.seek(frames(300));
+
+      const straight = replayToFrame(file, 1, frames(300), [false, false, false]);
+      expect(writtenRegister(player, 0)).toBe(straight.registers.values[0]);
+    });
+
+    it('builds in ascending order, each continuing from the one before', async () => {
+      const { player, replay } = harness();
+      player.loadTune(counterTune());
+
+      player.setJumpTargets([frames(300), frames(100), frames(200)]);
+      await flushEntryImageCapture();
+
+      expect(replay.requests.map((request) => request.targetFrame)).toEqual([100, 200, 300]);
+      expect(replay.requests.map((request) => request.start?.frame)).toEqual([undefined, 100, 200]);
+    });
+
+    it('routes builds to the prepare runner, one at a time, and answers a scrub while one is pending', async () => {
+      const { player, replay, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+
+      player.setJumpTargets([frames(200), frames(100)]);
+
+      expect(prepare.requests.map((request) => request.targetFrame)).toEqual([100]);
+      expect(replay.requests).toHaveLength(0);
+
+      await player.seek(frames(40));
+
+      expect(player.getPosition()).toBe(40);
+      expect(replay.requests.map((request) => request.targetFrame)).toEqual([40]);
+      expect(preparedFrames(player)).toEqual([]);
+
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([100, 200]);
+      expect(prepare.requests.map((request) => request.start?.frame)).toEqual([undefined, 100]);
+      expect(replay.requests).toHaveLength(1);
+    });
+
+    it('seeds every build unmuted, so a frame prepared while a voice is silenced still sounds once it is let back', async () => {
+      const { player, replay } = harness();
+      player.loadTune(heldNoteTune());
+      player.setVoiceMuted(0, true);
+      player.setVoiceHeld(1, true);
+
+      player.setJumpTargets([frames(60)]);
+      await flushEntryImageCapture();
+
+      expect(replay.requests[0].mutes).toEqual([false, false, false]);
+
+      player.setVoiceMuted(0, false);
+      player.setVoiceHeld(1, false);
+      await player.seek(frames(60));
+
+      expect(writtenRegister(player, VOICE_CONTROL_REGISTERS[0])).toBe(0x41);
+    });
+
+    it('unpublishes a frame the moment it is withdrawn, and sends a seek to it down the generic path', async () => {
+      const { player, replay } = harness();
+      player.loadTune(counterTune());
+      player.setJumpTargets([frames(100), frames(200), frames(300)]);
+      await flushEntryImageCapture();
+
+      player.setJumpTargets([frames(200)]);
+      expect(preparedFrames(player)).toEqual([200]);
+
+      player.setJumpTargets([]);
+      expect(preparedFrames(player)).toEqual([]);
+
+      const requests = replay.requests.length;
+      await player.seek(frames(200));
+      expect(replay.requests).toHaveLength(requests + 1);
+      expect(player.getPosition()).toBe(200);
+    });
+
+    it('leaves a running loop on its image when the loop’s start is withdrawn', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setJumpTargets([frames(100)]);
+      await flushEntryImageCapture();
+      run(clock, 100);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+
+      player.setJumpTargets([]);
+      runFrameSpy.mockClear();
+      run(clock, 10);
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(player.getPosition()).toBe(100);
+    });
+
+    it('hands the image to a loop armed on a declared start before its build landed', async () => {
+      const { player, clock, replay, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 500);
+
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(500), endFrame: frames(510) });
+      await flushEntryImageCapture();
+
+      expect(replay.requests).toHaveLength(0);
+
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+      run(clock, 9);
+      runFrameSpy.mockClear();
+      run(clock, 1);
+
+      expect(runFrameSpy).toHaveBeenCalledTimes(1);
+      expect(player.getPosition()).toBe(500);
+    });
+
+    it('discards a build that was running when a new tune was loaded, and builds nothing against the new file', async () => {
+      const { player, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+      player.setJumpTargets([frames(100)]);
+
+      player.loadTune(silentTune());
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([]);
+      expect(prepare.requests).toHaveLength(1);
+    });
+
+    it('clears the declaration with a subtune change, discarding a build still running for it', async () => {
+      const { player, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(silentTune(3));
+      player.setJumpTargets([frames(100)]);
+
+      player.selectSubtune(2);
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([]);
+      expect(prepare.requests).toHaveLength(1);
+
+      player.setJumpTargets([frames(100)]);
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([100]);
+      expect(prepare.requests[1].subtune).toBe(2);
+    });
+
+    it('unpublishes ready frames on a load or a subtune change and does not rebuild them', async () => {
+      const { player, replay } = harness();
+      player.loadTune(silentTune(3));
+      player.setJumpTargets([frames(100)]);
+      await flushEntryImageCapture();
+      expect(preparedFrames(player)).toEqual([100]);
+
+      player.selectSubtune(2);
+      await flushEntryImageCapture();
+      expect(preparedFrames(player)).toEqual([]);
+
+      player.setJumpTargets([frames(100)]);
+      await flushEntryImageCapture();
+      player.loadTune(silentTune(3));
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([]);
+      expect(replay.requests).toHaveLength(2);
+    });
+
+    it('builds the declared frames again when the track structure changes', async () => {
+      const { player, replay } = harness();
+      player.loadTune(counterTune());
+      player.setJumpTargets([frames(100), frames(200)]);
+      await flushEntryImageCapture();
+      const requests = replay.requests.length;
+
+      player.setTrackStructure(null);
+      expect(preparedFrames(player)).toEqual([]);
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([100, 200]);
+      expect(replay.requests.slice(requests).map((request) => request.targetFrame)).toEqual([
+        100, 200,
+      ]);
+    });
+
+    it('keeps the declaration across stop, play and pause', async () => {
+      const { player, replay } = harness();
+      player.loadTune(counterTune());
+      player.setJumpTargets([frames(100)]);
+      await flushEntryImageCapture();
+
+      await player.play();
+      player.pause();
+      player.stop();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([100]);
+      expect(replay.requests).toHaveLength(1);
+    });
+
+    it('captures the live position without a replay, returning the frame', async () => {
+      const { player, clock, replay } = harness();
+      expect(player.capturePosition()).toBeNull();
+
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 7);
+
+      expect(player.capturePosition()).toBe(player.getPosition());
+      expect(player.capturePosition()).toBe(7);
+      expect(replay.requests).toHaveLength(0);
+    });
+
+    it('reads a captured position that is declared afterwards as ready with no replay', async () => {
+      const { player, clock, replay } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 500);
+      player.capturePosition();
+
+      player.setJumpTargets([frames(500)]);
+
+      expect(preparedFrames(player)).toEqual([500]);
+      await flushEntryImageCapture();
+      expect(replay.requests).toHaveLength(0);
+
+      await player.seek(frames(0));
+      runFrameSpy.mockClear();
+      await player.seek(frames(500));
+      expect(runFrameSpy).not.toHaveBeenCalled();
+      expect(player.getPosition()).toBe(500);
+    });
+
+    it('makes a position captured at an already declared frame ready at once, adding no replay', async () => {
+      const { player, clock, replay, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+      await player.play();
+      player.setJumpTargets([frames(300)]);
+      run(clock, 300);
+
+      expect(player.capturePosition()).toBe(300);
+
+      expect(preparedFrames(player)).toEqual([300]);
+      expect(prepare.requests).toHaveLength(1);
+      expect(replay.requests).toHaveLength(0);
+    });
+
+    it('stands a capture taken while a voice was muted in until a clean image replaces it', async () => {
+      const { player, clock, replay } = harness();
+      player.loadTune(heldNoteTune());
+      await player.play();
+      run(clock, 50);
+      player.setVoiceMuted(0, true);
+      expect(player.capturePosition()).toBe(50);
+      player.setVoiceMuted(0, false);
+
+      player.setJumpTargets([frames(50)]);
+
+      expect(preparedFrames(player)).toEqual([50]);
+      expect(replay.requests).toHaveLength(1);
+      expect(replay.requests[0].targetFrame).toBe(50);
+      expect(replay.requests[0].mutes).toEqual([false, false, false]);
+
+      await flushEntryImageCapture();
+      await player.seek(frames(10));
+      await player.seek(frames(50));
+
+      expect(writtenRegister(player, VOICE_CONTROL_REGISTERS[0])).toBe(0x41);
+    });
+
+    it('queues the same clean rebuild for a muted capture made at a frame already declared', async () => {
+      const { player, clock, replay } = harness();
+      player.loadTune(heldNoteTune());
+      await player.play();
+      player.setJumpTargets([frames(50)]);
+      await flushEntryImageCapture();
+      run(clock, 50);
+      player.setVoiceMuted(0, true);
+      const requests = replay.requests.length;
+
+      player.capturePosition();
+      player.setVoiceMuted(0, false);
+
+      expect(replay.requests).toHaveLength(requests + 1);
+      expect(replay.requests[requests].mutes).toEqual([false, false, false]);
+    });
+
+    it('normalises what is declared the way a seek does, collapsing duplicates and refusing what is not a number', async () => {
+      const { player, replay } = harness();
+      player.loadTune(counterTune());
+
+      player.setJumpTargets([NaN, 0, -7, 99.6, 100, Infinity].map((frame) => frames(frame)));
+      await flushEntryImageCapture();
+
+      expect(console.warn).toHaveBeenCalledWith('SID player: ignoring a jump target of NaN.');
+      expect(console.warn).toHaveBeenCalledWith('SID player: ignoring a jump target of Infinity.');
+      expect(preparedFrames(player)).toEqual([0, 100]);
+
+      const requests = replay.requests.length;
+      await player.seek(frames(99.6));
+      expect(player.getPosition()).toBe(100);
+      await player.seek(frames(0));
+      expect(player.getPosition()).toBe(0);
+      expect(replay.requests).toHaveLength(requests);
+    });
+
+    it('leaves a frame whose build failed unready, warns, and tries again only when it is declared again', async () => {
+      const { player, replay } = harness();
+      player.loadTune(runawayTune());
+
+      player.setJumpTargets([frames(5)]);
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([]);
+      expect(replay.requests).toHaveLength(1);
+      expect(console.warn).toHaveBeenCalledWith(
+        expect.stringContaining('exceeded its cycle budget'),
+      );
+
+      player.setJumpTargets([frames(5)]);
+      await flushEntryImageCapture();
+
+      expect(replay.requests).toHaveLength(2);
+    });
+
+    it('does not move the tempo or the rate across a prepared jump', async () => {
+      const { player } = harness();
+      player.loadTune(doubleSpeedTune());
+      player.setTempo(1.5);
+      player.setJumpTargets([frames(100)]);
+      await flushEntryImageCapture();
+      const tempo = player.getSnapshot().tempo;
+      const rate = player.getStats().rate;
+      expect(rate.exactCallsPerFrame).toBe(2);
+
+      await player.seek(frames(100));
+
+      expect(player.getPosition()).toBe(100);
+      expect(player.getSnapshot().tempo).toEqual(tempo);
+      expect(player.getStats().rate).toEqual(rate);
+    });
+
+    it('disposes a separate prepare runner with the player, and a shared one once', async () => {
+      const split = splitHarness();
+      split.player.dispose();
+      expect(split.replay.disposeCount).toBe(1);
+      expect(split.prepare.disposeCount).toBe(1);
+
+      const shared = new FakeReplayRunner();
+      const player = createSidPlayer({
+        sink: new RecordingSink(),
+        clock: new FakeClock(),
+        replayRunner: shared,
+        prepareRunner: shared,
+      });
+      player.dispose();
+      expect(shared.disposeCount).toBe(1);
+    });
+
+    it('lands a build that finishes after the player was disposed without effect', async () => {
+      const { player, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+      player.setJumpTargets([frames(100)]);
+
+      player.dispose();
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+
+      expect(preparedFrames(player)).toEqual([]);
+    });
   });
 });

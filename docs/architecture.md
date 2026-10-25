@@ -73,6 +73,9 @@ The corollary that catches most cases: **core owns the operations, the applicati
 collections.**
 
 - Core holds the _active_ loop, because it has to enforce it on every frame.
+- Core holds a snapshot for each frame the host declares as a jump target, because returning to a
+  frame instantly is a timeline operation. Which of those frames are loops, which are cues, and
+  what they are called stays with the application.
 - The application holds the list of saved cues and loops, their names, their pad assignments, and
   whether they survive a reload.
 - A cue is a loop without an end marker. Both are _a frame number someone remembered_ plus _an
@@ -211,12 +214,12 @@ and Angular wraps it in a signal updated from an effect.
 
 Everything is a plain read. The only distinction is **whether a change notifies you**:
 
-| Read            | Notifies | Carries                                                      |
-| --------------- | -------- | ------------------------------------------------------------ |
-| `getSnapshot()` | yes      | Transport state, tune, tempo, the active loop, voices, error |
-| `getPosition()` | no       | The playhead frame                                           |
-| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth          |
-| `readRegisters` | no       | Every register, as written and as sent                       |
+| Read            | Notifies | Carries                                                                                |
+| --------------- | -------- | -------------------------------------------------------------------------------------- |
+| `getSnapshot()` | yes      | Transport state, tune and its ready jump frames, tempo, the active loop, voices, error |
+| `getPosition()` | no       | The playhead frame                                                                     |
+| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                    |
+| `readRegisters` | no       | Every register, as written and as sent                                                 |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 

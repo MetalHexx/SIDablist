@@ -129,13 +129,24 @@ export interface TuneSession {
 
   /**
    * Replays off-thread to `targetFrame` and hands the result back instead of adopting it onto the
-   * live pair. Shares the jump's runner but none of its outstanding-id gating: nothing about the live
-   * machine changes, so a scrub in flight is neither superseded by this nor supersedes it.
+   * live pair. Shares the jump's id counter but none of its outstanding-id gating: nothing about the
+   * live machine changes, so a scrub in flight is neither superseded by this nor supersedes it.
+   *
+   * `options.start` continues from an image instead of from init; `options.mutes` replaces the
+   * host's effective mutes, which are the default; `options.runner` replaces the session's own
+   * runner, which is how a batch of builds stays off the queue a scrub waits in.
    *
    * Null with no file loaded, or when the replay could not complete — the caller is asking for an
    * image it can do without, so a failure degrades rather than failing the engine.
    */
-  replayImage(targetFrame: Frames): Promise<ReplayResult | null>;
+  replayImage(
+    targetFrame: Frames,
+    options?: {
+      readonly start?: ReplayResult;
+      readonly mutes?: readonly boolean[];
+      readonly runner?: ReplayRunner;
+    },
+  ): Promise<ReplayResult | null>;
 
   /**
    * Puts an image back onto the live pair: restore, adopt its frame number, resync. Shared by a cue
@@ -280,9 +291,8 @@ class TuneSessionImpl implements TuneSession {
     frame.markAllDirty();
     this._framesRendered = frames(0);
     // The ring is dropped rather than carried: its entries describe a machine that no longer exists,
-    // at frame numbers the reset counter has just invalidated. Marker cues and marker loop starts
-    // survive this deliberately — each owns its own anchor, so none of them needs the ring to
-    // persist.
+    // at frame numbers the reset counter has just invalidated. The entry images the coordinator
+    // holds are not the ring's to drop — each is a snapshot of its own, kept or discarded there.
     this.host.resetAnchors();
     this.host.recordAnchor(machine, frame, this._framesRendered);
     // Init just ran, so this is the moment the CIA latch becomes meaningful — mirroring it any
@@ -346,7 +356,14 @@ class TuneSessionImpl implements TuneSession {
     return this.awaitJump(request);
   }
 
-  async replayImage(targetFrame: Frames): Promise<ReplayResult | null> {
+  async replayImage(
+    targetFrame: Frames,
+    options: {
+      readonly start?: ReplayResult;
+      readonly mutes?: readonly boolean[];
+      readonly runner?: ReplayRunner;
+    } = {},
+  ): Promise<ReplayResult | null> {
     const file = this._file;
     if (file === null) return null;
 
@@ -355,12 +372,13 @@ class TuneSessionImpl implements TuneSession {
       file,
       subtune: this._currentSubtune,
       targetFrame,
-      mutes: this.host.effectiveMutes(),
+      mutes: options.mutes ?? this.host.effectiveMutes(),
+      ...(options.start === undefined ? {} : { start: options.start }),
     };
 
     let response: ReplayResponse;
     try {
-      response = await this.replayRunner.run(request);
+      response = await (options.runner ?? this.replayRunner).run(request);
     } catch (error) {
       response = {
         id: request.id,

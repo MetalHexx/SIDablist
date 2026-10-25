@@ -8,10 +8,11 @@ import type { AnchorRing, PositionAnchor } from './anchor-ring.js';
  * Moves `machine`/`frame` to `targetFrame`: takes the newest usable anchor from `ring`, restores it
  * onto the pair, and runs forward from there to the target.
  *
- * The one path a cue trigger, a scrub and a loop lap all take. The application remembers a frame
- * number and hands it back here; nothing above core has to hold a machine image to return to a
- * position. The cost is the one a nudge has always paid — a replay bounded by the anchor spacing,
- * not by how deep the position sits in the tune.
+ * The generic path, taken by a seek or a lap when no held image stands at the target; a declared
+ * jump frame and a captured loop start restore their own image and never come through here. The
+ * application remembers a frame number and hands it back; nothing above core has to hold a machine
+ * image to return to a position. The cost is the one a nudge has always paid — a replay bounded by
+ * the anchor spacing, not by how deep the position sits in the tune.
  *
  * The pair is left standing at the target, and every frame replayed on the way is discarded: the
  * register values arrive restored wholesale rather than written, so a caller seeking the live pair

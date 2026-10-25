@@ -18,6 +18,8 @@ export interface PlayerSnapshot {
     readonly subtune: number;
     readonly subtuneCount: number;
     readonly lengthFrames: Frames | null;
+    /** Declared jump frames whose snapshot is ready, ascending. */
+    readonly preparedFrames: readonly Frames[];
   } | null;
   readonly tempo: {
     readonly multiplier: number;

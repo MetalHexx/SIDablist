@@ -75,6 +75,14 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
+- **An entry image is a pure function of (file, subtune, frame, mutes at capture).** Prepared
+  images are built with every voice unmuted, so a restore into an unmuted player sounds; a muted
+  voice's control register is zeroed in an image taken muted. Only an image built by an unmuted
+  replay may start a chained build — a live `capturePosition()` never does, and a capture taken
+  after a mute and unmute can carry a stale control register until the tune next writes it.
+- **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
+  long as it stays declared. The four-image cache for undeclared captures does not bound them; the
+  host's declaration does.
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
   the shadow makes a cue re-entered at another setting apply it twice.
@@ -107,6 +115,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 
+- **Changed `ReplayRequest`'s shape (`replay/replay-runner.ts`)?** `replay/replay.worker.ts` unpacks
+  the request field by field into `replayToFrame`, and every host `ReplayRunner` implementation
+  forwards it in its own way. A field one of them drops compiles fine and degrades quietly: a
+  dropped `start` makes every prepared build replay from the top, and a dropped `mutes` builds
+  frames that sound wrong once unmuted. Update the worker and each runner, then run
+  `replay/replay.worker.spec.ts` and `replay/worker-replay-runner.spec.ts`. Detail:
+  [`replay/replay.worker.ts`](./src/replay/replay.worker.ts)
 - **Made a deliberate change to how multiply, offset or hold compose?**
   `registers/register-frame.equivalence.spec.ts` fails against the frozen reference in
   `registers/__reference__/`, because the reference still composes them the old way. Confirm the

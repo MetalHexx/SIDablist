@@ -76,8 +76,15 @@ const MICROSECONDS_PER_MILLISECOND = 1000;
  * More than one because a performer alternates: a set of two or three loops triggered against each
  * other is the ordinary gesture, and a cache of one would have every hand-off away from a loop
  * throw away the image the hand-off back to it is about to need.
+ *
+ * Bounds only the images no one declared: a declared jump frame is held in the prepared map for as
+ * long as it stays declared, however many there are.
  */
 const LOOP_ENTRY_CACHE_SIZE = 4;
+
+/** The mutes every prepared build is seeded with. An image taken with a voice muted carries that
+ *  voice's control register zeroed, which is wrong for a restore into an unmuted player. */
+const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
 
 /** What a player is built around: the far end it streams to, the cadence it rides, and the thread a
  *  jump replays on. Every one of them is injected — core constructs none of them. */
@@ -85,6 +92,28 @@ export interface SidPlayerCollaborators {
   readonly sink: SidSink;
   readonly clock: FrameClock;
   readonly replayRunner: ReplayRunner;
+  /** Runs prepared-snapshot builds. Supply a second runner (its own worker) so a scrub never
+   *  waits behind a batch of builds; when absent, builds share `replayRunner`'s queue. */
+  readonly prepareRunner?: ReplayRunner;
+}
+
+/** An entry image and what is known about how it was taken. */
+interface HeldImage {
+  readonly anchor: PositionAnchor;
+  /** Built by replay with every voice unmuted — the only kind a chained build may start from. A
+   *  live capture never is: the live machine's history is not guaranteed to be a replay's. */
+  readonly chainable: boolean;
+  /** Some voice was effectively muted as the image was taken, which leaves its control register
+   *  zeroed in the image. */
+  readonly mutedAtCapture: boolean;
+}
+
+/** A prepared-snapshot build in flight, with what must still hold when its answer arrives. */
+interface PreparedBuild {
+  readonly frame: number;
+  readonly generation: number;
+  readonly file: SidFile;
+  readonly subtune: number;
 }
 
 /**
@@ -110,6 +139,8 @@ export function createSidPlayer(collaborators: SidPlayerCollaborators): SidPlaye
 class SidPlayerCoordinator implements SidPlayer {
   private readonly sink: SidSink;
   private readonly clock: FrameClock;
+  private readonly replayRunner: ReplayRunner;
+  private readonly prepareRunner: ReplayRunner | undefined;
   private readonly session: TuneSession;
   private readonly store: PlayerSnapshotStore;
 
@@ -176,7 +207,26 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Every entry image captured for this machine, by the frame it was taken at, oldest first — what
    *  a loop being armed, or a jump landing on one's own start, is served from instead of a replay.
    *  Emptied wholesale by anything that replaces the machine the images describe. */
-  private readonly loopEntries = new Map<number, PositionAnchor>();
+  private readonly loopEntries = new Map<number, HeldImage>();
+
+  /** The frames the host asked to be able to jump to instantly, normalised the way `seek` is. */
+  private readonly declared = new Set<number>();
+
+  /** One image per declared frame that has one, kept for as long as the frame stays declared. Looked
+   *  up before `loopEntries`. */
+  private readonly prepared = new Map<number, HeldImage>();
+
+  /** Declared frames still owed a build: not yet ready, or ready from a capture taken muted. A build
+   *  that fails leaves its frame out, so a failure is retried by the next declaration and never in a
+   *  loop. */
+  private readonly buildQueue = new Set<number>();
+
+  /** The one build running. Builds go one at a time, lowest frame first, so each can continue from
+   *  the one before it and the whole set costs about one pass to its deepest frame. */
+  private activeBuild: PreparedBuild | null = null;
+
+  /** Bumped by anything that makes a running build's answer describe the wrong machine. */
+  private preparedGeneration = 0;
 
   /** The start frames a capture is in flight for. A loop re-armed while its own image is still on
    *  its way — a trigger pressed twice, an end nudged repeatedly — would otherwise queue a second
@@ -199,6 +249,8 @@ class SidPlayerCoordinator implements SidPlayer {
   constructor(collaborators: SidPlayerCollaborators) {
     this.sink = collaborators.sink;
     this.clock = collaborators.clock;
+    this.replayRunner = collaborators.replayRunner;
+    this.prepareRunner = collaborators.prepareRunner;
     this.session = createTuneSession(collaborators.replayRunner, {
       nominalIntervalUs: () => this.nominalIntervalUs,
       playRate: () => this.playRate(),
@@ -290,8 +342,12 @@ class SidPlayerCoordinator implements SidPlayer {
       this.clock.stop();
       this.sink.end();
     }
-    // Whatever a jump is replaying describes the outgoing tune, not this one.
+    // Whatever a jump is replaying describes the outgoing tune, not this one. The same goes for the
+    // frames declared against it and the images prepared for them: gone before the new file is
+    // loaded, so nothing published or scheduled from here on names the old tune's frames.
     this.session.discardOutstandingJump();
+    this.declared.clear();
+    this.dropPreparedImages();
     this.session.load(file);
 
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
@@ -433,6 +489,9 @@ class SidPlayerCoordinator implements SidPlayer {
    * land a position nobody asked for — a scrub is held to the same rule and takes the generic path
    * for every target but that one frame.
    *
+   * The same holds for a target exactly on a declared jump frame that is ready: it is restored from
+   * that frame's prepared image, whatever the active loop is.
+   *
    * Anything else replays off this thread, and the promise resolves once that request has settled
    * (landed, failed, or been superseded), not when it was issued.
    *
@@ -442,11 +501,15 @@ class SidPlayerCoordinator implements SidPlayer {
   seek(frame: Frames): Promise<void> {
     const target = frames(Math.max(0, Math.round(frame)));
     const entry = this.activeLoop.entryImage();
-    if (entry !== null && entry.frame === target) {
+    const image =
+      entry !== null && entry.frame === target
+        ? entry
+        : (this.prepared.get(target)?.anchor ?? null);
+    if (image !== null) {
       // A replay still in flight would land a moment later and move the playhead off what this has
       // just placed — the same supersession `jumpToFrame` gets from claiming the outstanding id.
       this.session.discardOutstandingJump();
-      this.session.restoreState(entry.machine, entry.registers, entry.frame);
+      this.session.restoreState(image.machine, image.registers, image.frame);
       return Promise.resolve();
     }
     return this.session.jumpToFrame(target);
@@ -459,8 +522,11 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
     // Every entry image describes a machine the re-init has just replaced — the track's own and
-    // whichever loop is presently active alike.
+    // whichever loop is presently active alike — and so does every frame declared against it. The
+    // declarations go before the recaptures below, which skip a declared frame.
     this.dropEntryImages();
+    this.declared.clear();
+    this.markDirty();
     void this.captureTrackLoopEntry();
     const activeLoop = this.activeLoop.get();
     if (activeLoop !== null) {
@@ -484,7 +550,8 @@ class SidPlayerCoordinator implements SidPlayer {
     // trigger, an audition or a queued hand-off makes right after this one lands instantly rather
     // than replaying — and so does its first wrap. Only a loop this machine has never held an image
     // for pays the one-time off-thread capture `captureTrackLoopEntry` already pays for the track's
-    // own loop.
+    // own loop. A start the host declared is not captured here at all: the build scheduler owns
+    // that frame and hands the image to the loop when it lands.
     const cached = this.entryImageFor(loop);
     this.activeLoop.setEntryImage(cached);
     if (loop !== null && cached === null) {
@@ -492,6 +559,35 @@ class SidPlayerCoordinator implements SidPlayer {
       // end for a whole pass yet.
       void this.captureActiveLoopEntry(loop);
     }
+    this.markDirty();
+  }
+
+  setJumpTargets(requested: readonly Frames[]): void {
+    this.declared.clear();
+    for (const requestedFrame of requested) {
+      if (!Number.isFinite(requestedFrame)) {
+        console.warn(`SID player: ignoring a jump target of ${requestedFrame}.`);
+        continue;
+      }
+      this.declared.add(Math.max(0, Math.round(requestedFrame)));
+    }
+
+    for (const frame of this.prepared.keys()) {
+      if (!this.declared.has(frame)) this.prepared.delete(frame);
+    }
+    // The host usually captures a position and declares it afterwards, so an image already in the
+    // cache at a declared frame is the main way a frame becomes ready — with no replay at all.
+    this.buildQueue.clear();
+    for (const frame of this.declared) {
+      if (!this.prepared.has(frame)) {
+        const cached = this.loopEntries.get(frame);
+        if (cached !== undefined) this.prepared.set(frame, cached);
+      }
+      const held = this.prepared.get(frame);
+      if (held === undefined || held.mutedAtCapture) this.buildQueue.add(frame);
+    }
+
+    this.scheduleBuilds();
     this.markDirty();
   }
 
@@ -504,16 +600,34 @@ class SidPlayerCoordinator implements SidPlayer {
    * that loop afterwards through `setActiveLoop` finds this image already cached and never falls
    * back to `captureActiveLoopEntry`'s off-thread replay, so even that loop's very first trigger is
    * instant rather than paying a cost proportional to how deep it sits in the tune.
+   *
+   * A frame that is already declared is ready the moment this returns. If a voice was muted as the
+   * image was taken, it stands in until a clean one is built, since a muted voice's control register
+   * is zeroed in it.
    */
-  capturePosition(): void {
+  capturePosition(): Frames | null {
     const machine = this.session.machine;
     const frame = this.session.frame;
-    if (machine === null || frame === null) return;
-    this.rememberEntryImage({
-      frame: this.session.framesRendered,
-      machine: machine.snapshot(),
-      registers: frame.snapshotValues(),
-    });
+    if (machine === null || frame === null) return null;
+
+    const position = this.session.framesRendered;
+    const image: HeldImage = {
+      anchor: { frame: position, machine: machine.snapshot(), registers: frame.snapshotValues() },
+      chainable: false,
+      mutedAtCapture: this.anyVoiceMuted(),
+    };
+    this.rememberEntryImage(image);
+    if (this.declared.has(position)) {
+      this.prepared.set(position, image);
+      if (image.mutedAtCapture) {
+        this.buildQueue.add(position);
+      } else {
+        this.buildQueue.delete(position);
+      }
+      this.scheduleBuilds();
+      this.markDirty();
+    }
+    return position;
   }
 
   setTrackStructure(loop: DetectedLoopFrames | null): void {
@@ -522,6 +636,9 @@ class SidPlayerCoordinator implements SidPlayer {
     // detection answered nothing and the fixed ceiling stands in.
     this.session.setIndexedLengthFrames(this.track.trackEndFrame());
     this.dropEntryImages();
+    // The declared frames stay declared; only their images went, so each is built again.
+    for (const frame of this.declared) this.buildQueue.add(frame);
+    this.scheduleBuilds();
     this.markDirty();
     // Not awaited: nothing on this path needs the image, and playback cannot reach the loop's end
     // for a whole lap yet.
@@ -730,7 +847,12 @@ class SidPlayerCoordinator implements SidPlayer {
   dispose(): void {
     this.clock.stop();
     this.session.discardOutstandingJump();
+    this.declared.clear();
+    this.dropPreparedImages();
     this.session.dispose();
+    if (this.prepareRunner !== undefined && this.prepareRunner !== this.replayRunner) {
+      this.prepareRunner.dispose();
+    }
     this.fieldHolds.clear();
     this.fieldOffsets.clear();
     if (this.transport === 'playing' || this.transport === 'paused') {
@@ -902,16 +1024,19 @@ class SidPlayerCoordinator implements SidPlayer {
    * `captureActiveLoopEntry`, which each layer on the staleness check specific to what they are
    * caching the image for.
    */
-  private async captureEntryImage(startFrame: Frames): Promise<PositionAnchor | null> {
+  private async captureEntryImage(startFrame: Frames): Promise<HeldImage | null> {
     if (startFrame === 0) return null;
     const file = this.session.file;
     if (file === null) return null;
     const subtune = this.session.currentSubtune;
 
+    // The session reads the mutes it seeds the replay with as it issues the request, so this is
+    // read at the same moment to say what the image was taken under.
+    const mutedAtCapture = this.anyVoiceMuted();
     const result = await this.session.replayImage(startFrame);
     if (result === null) return null;
     if (this.session.file !== file || this.session.currentSubtune !== subtune) return null;
-    return result;
+    return { anchor: result, chainable: !mutedAtCapture, mutedAtCapture };
   }
 
   /**
@@ -929,10 +1054,10 @@ class SidPlayerCoordinator implements SidPlayer {
     if (result === null) return;
     if (this.track.loopStartFrame() !== startFrame) return;
 
-    this.trackLoopEntry = result;
+    this.trackLoopEntry = result.anchor;
     this.rememberEntryImage(result);
     if (this.activeLoop.get() === null || this.activeLoop.get()?.startFrame === startFrame) {
-      this.activeLoop.setEntryImage(result);
+      this.activeLoop.setEntryImage(result.anchor);
     }
   }
 
@@ -955,9 +1080,12 @@ class SidPlayerCoordinator implements SidPlayer {
    * through this very image.
    */
   private async captureActiveLoopEntry(loop: ActiveLoop): Promise<void> {
-    if (loop === null || this.capturesInFlight.has(loop.startFrame)) return;
+    // A declared start is the build scheduler's: it lands the image and hands it to the loop, so a
+    // capture here would replay the same frame a second time.
+    if (loop === null || this.declared.has(loop.startFrame)) return;
+    if (this.capturesInFlight.has(loop.startFrame)) return;
     this.capturesInFlight.add(loop.startFrame);
-    let result: PositionAnchor | null = null;
+    let result: HeldImage | null = null;
     try {
       result = await this.captureEntryImage(loop.startFrame);
     } finally {
@@ -967,31 +1095,35 @@ class SidPlayerCoordinator implements SidPlayer {
 
     this.rememberEntryImage(result);
     if (this.activeLoop.get()?.startFrame !== loop.startFrame) return;
-    this.activeLoop.setEntryImage(result);
+    this.activeLoop.setEntryImage(result.anchor);
   }
 
-  /** Whichever image already stands at `loop`'s own start frame, or the track's own loop's entry
-   *  when nothing is looping — what `setActiveLoop` arms a loop with in place of a fresh capture. */
+  /** Whichever image already stands at `loop`'s own start frame — prepared first, then the cache —
+   *  or the track's own loop's entry when nothing is looping. What `setActiveLoop` arms a loop with
+   *  in place of a fresh capture. */
   private entryImageFor(loop: ActiveLoop): PositionAnchor | null {
     if (loop === null) return this.trackLoopEntry;
-    return this.loopEntries.get(loop.startFrame) ?? null;
+    const held = this.prepared.get(loop.startFrame) ?? this.loopEntries.get(loop.startFrame);
+    return held?.anchor ?? null;
   }
 
   /** Files `entry` under the frame it was taken at, evicting the oldest once the cache is full.
    *  Re-inserted rather than overwritten in place, so a loop being armed again counts as the newest
    *  and a set of loops played against each other keeps every one of their images. */
-  private rememberEntryImage(entry: PositionAnchor): void {
-    this.loopEntries.delete(entry.frame);
-    this.loopEntries.set(entry.frame, entry);
+  private rememberEntryImage(entry: HeldImage): void {
+    const frame = entry.anchor.frame;
+    this.loopEntries.delete(frame);
+    this.loopEntries.set(frame, entry);
     if (this.loopEntries.size > LOOP_ENTRY_CACHE_SIZE) {
       const oldest = this.loopEntries.keys().next();
       if (!oldest.done) this.loopEntries.delete(oldest.value);
     }
   }
 
-  /** Drops every cached entry image along with whatever the tracker presently holds — the same call
-   *  whether an image came from the track's own loop or a marker's, since all of them describe a
-   *  machine a subtune re-init or a fresh detection has just invalidated. */
+  /** Drops every cached entry image, and the prepared ones with them, along with whatever the
+   *  tracker presently holds — the same call whether an image came from the track's own loop or a
+   *  marker's, since all of them describe a machine a subtune re-init or a fresh detection has just
+   *  invalidated. The declared frames are the caller's to keep or clear. */
   private dropEntryImages(): void {
     this.trackLoopEntry = null;
     this.loopEntries.clear();
@@ -1000,6 +1132,93 @@ class SidPlayerCoordinator implements SidPlayer {
     // follows.
     this.capturesInFlight.clear();
     this.activeLoop.setEntryImage(null);
+    this.dropPreparedImages();
+  }
+
+  /** Drops every prepared image and the builds still owed, and strands the one in flight: its answer
+   *  fails the generation check when it arrives, and a new build need not wait for it. */
+  private dropPreparedImages(): void {
+    this.prepared.clear();
+    this.buildQueue.clear();
+    this.activeBuild = null;
+    this.preparedGeneration++;
+  }
+
+  /** Starts the lowest-framed owed build unless one is already running. Reached only from promise
+   *  callbacks and the discrete calls that change what is owed — never from a tick. */
+  private scheduleBuilds(): void {
+    if (this.activeBuild !== null) return;
+    const file = this.session.file;
+    if (file === null) return;
+
+    let next: number | null = null;
+    for (const frame of this.buildQueue) {
+      if (next === null || frame < next) next = frame;
+    }
+    if (next === null) return;
+
+    const build: PreparedBuild = {
+      frame: next,
+      generation: this.preparedGeneration,
+      file,
+      subtune: this.session.currentSubtune,
+    };
+    this.activeBuild = build;
+    void this.runBuild(build);
+  }
+
+  /**
+   * Replays one declared frame unmuted, continuing from the nearest earlier chainable image so a set
+   * costs about one pass to its deepest frame, and lands the answer if it still describes what is
+   * declared. Builds one frame and then starts the next.
+   *
+   * A failed replay is logged by the session and drops the frame from the queue without a retry:
+   * the next declaration that names it asks again.
+   */
+  private async runBuild(build: PreparedBuild): Promise<void> {
+    const start = this.chainStartFor(build.frame);
+    const result = await this.session.replayImage(frames(build.frame), {
+      mutes: NO_VOICES_MUTED,
+      ...(start === null ? {} : { start }),
+      ...(this.prepareRunner === undefined ? {} : { runner: this.prepareRunner }),
+    });
+    if (this.activeBuild === build) this.activeBuild = null;
+
+    const current =
+      this.preparedGeneration === build.generation &&
+      this.session.file === build.file &&
+      this.session.currentSubtune === build.subtune &&
+      this.declared.has(build.frame);
+    if (current) {
+      this.buildQueue.delete(build.frame);
+      if (result !== null) {
+        this.prepared.set(build.frame, { anchor: result, chainable: true, mutedAtCapture: false });
+        if (this.activeLoop.get()?.startFrame === build.frame) {
+          this.activeLoop.setEntryImage(result);
+        }
+        this.markDirty();
+      }
+    }
+    this.scheduleBuilds();
+  }
+
+  /** The chainable prepared image closest to `target` without passing it, or null to build from
+   *  init. */
+  private chainStartFor(target: number): PositionAnchor | null {
+    let nearest: PositionAnchor | null = null;
+    for (const held of this.prepared.values()) {
+      const frame = held.anchor.frame;
+      if (held.chainable && frame <= target && (nearest === null || frame > nearest.frame)) {
+        nearest = held.anchor;
+      }
+    }
+    return nearest;
+  }
+
+  /** Whether any voice is silenced right now, by a latched mute or a held button — the same
+   *  `effectiveMutes` every replay is seeded with. */
+  private anyVoiceMuted(): boolean {
+    return this.effectiveMutes().some((muted) => muted);
   }
 
   private fail(reason: string): void {
@@ -1117,6 +1336,9 @@ class SidPlayerCoordinator implements SidPlayer {
               subtune: this.session.currentSubtune,
               subtuneCount: this.session.subtuneCount,
               lengthFrames: trackEndFrame,
+              preparedFrames: Array.from(this.prepared.keys())
+                .sort((a, b) => a - b)
+                .map((frame) => frames(frame)),
             },
       tempo: {
         multiplier: this.tempoMultiplier,

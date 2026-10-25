@@ -40,14 +40,19 @@ export interface SidPlayer {
   previousSubtune(): void;
   setActiveLoop(loop: { startFrame: Frames; endFrame: Frames } | null): void;
   /**
-   * Snapshots the live machine and register frame at the current position into the entry-image
-   * cache `setActiveLoop` and `seek` already read from, for the cost of a memory copy — the machine
-   * is already sitting here, so nothing replays. Meant to be called at the moment a caller marks
-   * this exact frame as a loop's future start: arming that loop later finds the image already
-   * cached and skips the off-thread replay `setActiveLoop` otherwise falls back to, so even that
-   * loop's very first trigger is instant. A no-op with nothing loaded.
+   * Declares the frames the host wants to jump to instantly — loop starts and cue points alike —
+   * replacing the previous set; an empty list withdraws all. Each declared frame gets its own
+   * snapshot, built off the main thread without moving the playhead; readiness is published in
+   * `getSnapshot().tune.preparedFrames`. Cleared by `loadTune` and by a subtune change, so the host
+   * declares again after either.
    */
-  capturePosition(): void;
+  setJumpTargets(frames: readonly Frames[]): void;
+  /**
+   * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
+   * returns the frame it captured (the same frame `getPosition()` reports), or null with nothing
+   * loaded. When that frame is declared, it is ready at once.
+   */
+  capturePosition(): Frames | null;
   /** What detection found about this tune: its loop, its end, its measured length. The
    *  application supplies it; core turns it into the position basis and the end behaviour. */
   setTrackStructure(loop: DetectedLoopFrames | null): void;

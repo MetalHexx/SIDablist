@@ -13,6 +13,9 @@ export interface ReplayRequest {
   readonly subtune: number;
   readonly targetFrame: Frames;
   readonly mutes: readonly boolean[];
+  /** Begin the replay from this image instead of from init at frame 0; its frame must not be past
+   *  `targetFrame`. The result equals a replay from the top. */
+  readonly start?: ReplayResult;
 }
 
 /** A replay's outcome. A failure comes back as a message rather than a thrown error, because it
