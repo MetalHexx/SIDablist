@@ -1101,6 +1101,8 @@ describe('createSidPlayer', () => {
         subtuneCount: 3,
         lengthFrames: null,
         preparedFrames: [],
+        queuedJump: null,
+        handOffs: 0,
       });
       expect(player.getSnapshot().repeatTrack).toBe(true);
     });
@@ -2271,6 +2273,339 @@ describe('createSidPlayer', () => {
       await flushEntryImageCapture();
 
       expect(preparedFrames(player)).toEqual([]);
+    });
+  });
+
+  describe('queued jumps', () => {
+    /** The byte `counterTune` writes to $D400 on the frame after `frame`. */
+    const counterAfter = (frame: number): number => (frame + 1) & 0xff;
+
+    /** Ticks one frame at a time until `done` holds, so a landing is observed on the very tick it
+     *  happens rather than somewhere after it. */
+    function runUntil(clock: FakeClock, done: () => boolean, limit = 400): void {
+      for (let tick = 0; tick < limit && !done(); tick++) run(clock, 1);
+      expect(done()).toBe(true);
+    }
+
+    const handOffs = (player: SidPlayer): number | undefined => player.getSnapshot().tune?.handOffs;
+    const queued = (player: SidPlayer): unknown => player.getSnapshot().tune?.queuedJump;
+
+    /** A counter tune playing inside a ten-frame loop at 100, with 500 and 600 declared and ready. */
+    async function loopingPlayer(h: Harness = harness()): Promise<Harness> {
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      h.player.setJumpTargets([frames(500), frames(600)]);
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      return h;
+    }
+
+    it('continues from the queued start on the frame after the wrap, never from the running loop', async () => {
+      const { player, clock, sink } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
+
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(player.getPosition()).toBe(500);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 500, endFrame: 520 });
+      expect(queued(player)).toBeNull();
+      run(clock, 2); // the gate-off the landing owes, then the first frame played from the image
+      expect(valueOf(lastDelivered(sink), 0)).toBe(counterAfter(500));
+      expect(player.getPosition()).toBe(501);
+    });
+
+    it('enforces the queued loop on later laps', async () => {
+      const { player, clock } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      runUntil(clock, () => handOffs(player) === 1);
+
+      runUntil(clock, () => player.getPosition() > 515);
+      runUntil(
+        clock,
+        () => player.getPosition() === 500 && player.getStats().resync.inFlightDepth === 1,
+      );
+
+      expect(handOffs(player)).toBe(1);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 500, endFrame: 520 });
+    });
+
+    it('lands a cue by clearing the loop, after which track repeat still re-arms at the track end', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(510),
+      });
+      player.setRepeatTrack(true);
+      await player.play();
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(500), endFrame: null });
+
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(player.getPosition()).toBe(500);
+      expect(player.getSnapshot().loop).toBeNull();
+      expect(queued(player)).toBeNull();
+
+      runUntil(clock, () => player.getSnapshot().loop !== null);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 0, endFrame: 510 });
+      expect(player.getPosition()).toBe(0);
+      expect(handOffs(player)).toBe(1);
+    });
+
+    it('lets laps continue until the target is ready, then lands at the first wrap after it arrives', async () => {
+      const { player, clock, prepare } = splitHarness();
+      prepare.manual = true;
+      player.loadTune(counterTune());
+      await player.play();
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+
+      run(clock, 60);
+
+      expect(handOffs(player)).toBe(0);
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 100, endFrame: 110 });
+      expect(player.getPosition()).toBeLessThan(111);
+
+      prepare.resolveAll();
+      await flushEntryImageCapture();
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(player.getPosition()).toBe(500);
+    });
+
+    it('captures an undeclared target once, off-thread, and lands on it', async () => {
+      const { player, clock, replay } = await loopingPlayer();
+      const requests = replay.requests.length;
+
+      player.queueJump({ startFrame: frames(300), endFrame: frames(320) });
+      await flushEntryImageCapture();
+
+      expect(replay.requests.slice(requests).map((request) => request.targetFrame)).toEqual([300]);
+      runUntil(clock, () => handOffs(player) === 1);
+      expect(player.getPosition()).toBe(300);
+    });
+
+    it('needs no replay for a target whose image was captured from the live position', async () => {
+      const { player, clock, replay } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 300);
+      expect(player.capturePosition()).toBe(300);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(320) });
+      await flushEntryImageCapture();
+      const requests = replay.requests.length;
+
+      player.queueJump({ startFrame: frames(300), endFrame: null });
+      await flushEntryImageCapture();
+
+      expect(replay.requests).toHaveLength(requests);
+      runUntil(clock, () => handOffs(player) === 1);
+      expect(player.getPosition()).toBe(300);
+    });
+
+    it('replaces the queued jump, and a cancel keeps the loop running', async () => {
+      const { player, clock } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.queueJump({ startFrame: frames(600), endFrame: frames(630) });
+      expect(queued(player)).toEqual({ startFrame: 600, endFrame: 630 });
+
+      runUntil(clock, () => handOffs(player) === 1);
+      expect(player.getPosition()).toBe(600);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 600, endFrame: 630 });
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.queueJump(null);
+      expect(queued(player)).toBeNull();
+      runUntil(clock, () => player.getPosition() > 625);
+      runUntil(clock, () => player.getPosition() === 600);
+
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 600, endFrame: 630 });
+      expect(handOffs(player)).toBe(1);
+    });
+
+    it('normalises the target the way a seek does', async () => {
+      const { player } = await loopingPlayer();
+
+      player.queueJump({ startFrame: frames(499.6), endFrame: frames(520.4) });
+
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
+    });
+
+    it('counts a landing and nothing else', async () => {
+      const { player, clock } = await loopingPlayer();
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.queueJump({ startFrame: frames(600), endFrame: null });
+      player.queueJump(null);
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      expect(handOffs(player)).toBe(0);
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      runUntil(clock, () => handOffs(player) === 1);
+
+      player.queueJump({ startFrame: frames(600), endFrame: frames(610) });
+      player.setActiveLoop({ startFrame: frames(500), endFrame: frames(520) });
+      expect(handOffs(player)).toBe(1);
+      player.queueJump({ startFrame: frames(600), endFrame: frames(610) });
+      player.stop();
+      expect(handOffs(player)).toBe(1);
+      expect(queued(player)).toBeNull();
+    });
+
+    it('drops the queue on setActiveLoop, stop, loadTune and a subtune change', async () => {
+      const { player } = await loopingPlayer();
+      const loop = { startFrame: frames(100), endFrame: frames(110) };
+      const queueAgain = (): void => {
+        player.setActiveLoop(loop);
+        player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+        expect(queued(player)).not.toBeNull();
+      };
+
+      queueAgain();
+      player.setActiveLoop(loop);
+      expect(queued(player)).toBeNull();
+
+      queueAgain();
+      player.setActiveLoop(null);
+      expect(queued(player)).toBeNull();
+
+      queueAgain();
+      player.stop();
+      expect(queued(player)).toBeNull();
+
+      queueAgain();
+      player.loadTune(silentTune(3));
+      expect(queued(player)).toBeNull();
+
+      player.setActiveLoop(loop);
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.selectSubtune(2);
+      expect(queued(player)).toBeNull();
+    });
+
+    it('resets the count on loadTune and on a subtune change, and not on selecting the same subtune', async () => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune(3));
+      await player.play();
+      player.setJumpTargets([frames(50)]);
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(50), endFrame: frames(60) });
+      runUntil(clock, () => handOffs(player) === 1);
+
+      player.selectSubtune(1);
+      expect(handOffs(player)).toBe(1);
+      player.selectSubtune(2);
+      expect(handOffs(player)).toBe(0);
+
+      player.setJumpTargets([frames(50)]);
+      player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(50), endFrame: frames(60) });
+      runUntil(clock, () => handOffs(player) === 1);
+      player.loadTune(silentTune(3));
+
+      expect(handOffs(player)).toBe(0);
+    });
+
+    it('ignores a queue with no loop running, a start that is not a number and an end that is not after the start', () => {
+      const { player } = harness();
+      player.loadTune(counterTune());
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('SID player: ignoring'));
+      expect(queued(player)).toBeNull();
+
+      player.queueJump(null);
+      expect(console.warn).toHaveBeenCalledTimes(1);
+
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      for (const target of [
+        { startFrame: frames(NaN), endFrame: null },
+        { startFrame: frames(Infinity), endFrame: frames(520) },
+        { startFrame: frames(500), endFrame: frames(500) },
+        { startFrame: frames(500), endFrame: frames(400) },
+        { startFrame: frames(500), endFrame: frames(NaN) },
+      ]) {
+        player.queueJump(target);
+        expect(queued(player)).toBeNull();
+      }
+      expect(console.warn).toHaveBeenCalledTimes(6);
+    });
+
+    it('keeps the queued jump when a later call is rejected', async () => {
+      const { player } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+
+      player.queueJump({ startFrame: frames(NaN), endFrame: null });
+
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
+    });
+
+    it('notifies on queue, replace and cancel, and once on the landing with a consistent snapshot', async () => {
+      const { player, clock } = await loopingPlayer();
+      const seen: unknown[] = [];
+      player.subscribe(() => {
+        const { loop, tune } = player.getSnapshot();
+        seen.push({ loop, queued: tune?.queuedJump, handOffs: tune?.handOffs });
+      });
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.queueJump({ startFrame: frames(600), endFrame: frames(620) });
+      player.queueJump(null);
+      expect(seen).toHaveLength(3);
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      seen.length = 0;
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(seen).toEqual([
+        { loop: { startFrame: 500, endFrame: 520 }, queued: null, handOffs: 1 },
+      ]);
+    });
+
+    it('lets a host call made from the landing notification stand', async () => {
+      const { player, clock } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      const loop = { startFrame: frames(600), endFrame: frames(630) };
+      const unsubscribe = player.subscribe(() => {
+        if (handOffs(player) === 1) {
+          unsubscribe();
+          player.setActiveLoop(loop);
+        }
+      });
+
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(player.getSnapshot().loop).toEqual(loop);
+      expect(handOffs(player)).toBe(1);
+    });
+
+    it('leaves the tempo and the rate alone across a landing', async () => {
+      const { player, clock } = harness();
+      player.loadTune(doubleSpeedTune());
+      player.setTempo(1.5);
+      await player.play();
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      const tempo = player.getSnapshot().tempo;
+      const rate = player.getStats().rate;
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+
+      runUntil(clock, () => handOffs(player) === 1);
+
+      expect(player.getSnapshot().tempo).toEqual(tempo);
+      expect(player.getStats().rate).toEqual(rate);
     });
   });
 });

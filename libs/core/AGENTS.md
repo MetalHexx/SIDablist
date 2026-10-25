@@ -83,6 +83,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
   long as it stays declared. The four-image cache for undeclared captures does not bound them; the
   host's declaration does.
+- **A queued jump never lands without a held image.** A target that is not yet built waits whole
+  laps for it rather than replaying on the main thread inside the tick, so a host that queues an
+  unprepared frame sees the running loop continue. `tune.handOffs` is how it tells a landing from a
+  dropped queue; clearing a queue never touches it.
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
   the shadow makes a cue re-entered at another setting apply it twice.
@@ -115,6 +119,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 
+- **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
+  `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
+  unhandled variant leaves the player's position and the stream out of step without a compile
+  error. Handle it there, then run `player/create-sid-player.spec.ts`.
 - **Changed `ReplayRequest`'s shape (`replay/replay-runner.ts`)?** `replay/replay.worker.ts` unpacks
   the request field by field into `replayToFrame`, and every host `ReplayRunner` implementation
   forwards it in its own way. A field one of them drops compiles fine and degrades quietly: a

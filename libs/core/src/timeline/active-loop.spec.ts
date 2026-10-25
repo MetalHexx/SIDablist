@@ -211,4 +211,100 @@ describe('createActiveLoopTracker', () => {
     expect(result).toEqual({ action: 'looped', frame: 20 });
     expect(liveState()).toEqual(runUnbrokenTo(frames(20)));
   });
+
+  describe('a queued hand-off', () => {
+    /** The image of `at`, taken from an unbroken run. */
+    function imageAt(at: number): PositionAnchor {
+      return { frame: frames(at), ...runUnbrokenTo(frames(at)) };
+    }
+
+    it('lands the queued loop at the wrap instead of re-entering the running one', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      const next = { startFrame: frames(60), endFrame: frames(90) };
+      const image = imageAt(60);
+      tracker.queue({ startFrame: frames(60), loop: next });
+      tracker.setQueuedImage(image);
+      play(100);
+
+      const result = tracker.advance(machine, registers, ring, track, frames(100));
+
+      expect(result).toEqual({ action: 'handed-off', frame: 60 });
+      expect(tracker.get()).toBe(next);
+      expect(tracker.entryImage()).toBe(image);
+      expect(liveState()).toEqual(runUnbrokenTo(frames(60)));
+    });
+
+    it('empties the queue on landing, so the next wrap is an ordinary lap of the new loop', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({
+        startFrame: frames(60),
+        loop: { startFrame: frames(60), endFrame: frames(90) },
+      });
+      tracker.setQueuedImage(imageAt(60));
+      play(100);
+      tracker.advance(machine, registers, ring, track, frames(100));
+
+      play(30);
+      const result = tracker.advance(machine, registers, ring, track, frames(90));
+
+      expect(result).toEqual({ action: 'looped', frame: 60 });
+    });
+
+    it('lands a cue by clearing the loop and leaving the entry image alone', () => {
+      const entry = imageAt(10);
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.setEntryImage(entry);
+      tracker.queue({ startFrame: frames(60), loop: null });
+      tracker.setQueuedImage(imageAt(60));
+      play(100);
+
+      const result = tracker.advance(machine, registers, ring, track, frames(100));
+
+      expect(result).toEqual({ action: 'handed-off', frame: 60 });
+      expect(tracker.get()).toBeNull();
+      expect(tracker.entryImage()).toBe(entry);
+    });
+
+    it('re-enters the running loop while the queued target has no image', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({
+        startFrame: frames(60),
+        loop: { startFrame: frames(60), endFrame: frames(90) },
+      });
+      play(100);
+
+      const result = tracker.advance(machine, registers, ring, track, frames(100));
+
+      expect(result).toEqual({ action: 'looped', frame: 10 });
+      expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 100 });
+
+      play(90);
+      tracker.setQueuedImage(imageAt(60));
+      expect(tracker.advance(machine, registers, ring, track, frames(100))).toEqual({
+        action: 'handed-off',
+        frame: 60,
+      });
+    });
+
+    it('drops the queue on set and on cancel, and a replace forgets the old image', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({ startFrame: frames(60), loop: null });
+      tracker.setQueuedImage(imageAt(60));
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      play(100);
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+
+      tracker.queue({ startFrame: frames(60), loop: null });
+      tracker.setQueuedImage(imageAt(60));
+      tracker.queue(null);
+      play(90);
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+
+      tracker.queue({ startFrame: frames(70), loop: null });
+      tracker.setQueuedImage(imageAt(60));
+      tracker.queue({ startFrame: frames(80), loop: null });
+      play(90);
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+    });
+  });
 });

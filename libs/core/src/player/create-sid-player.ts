@@ -38,7 +38,7 @@ import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-struc
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
 import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import type { SidPlayer } from './sid-player.js';
-import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
+import type { PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
 import { createTuneSession } from './tune-session.js';
@@ -233,6 +233,14 @@ class SidPlayerCoordinator implements SidPlayer {
    *  identical replay ahead of the jump that is about to want it. */
   private readonly capturesInFlight = new Set<number>();
 
+  /** The jump queued for the running loop's next wrap, as the host asked for it (normalised). The
+   *  tracker holds its own `QueuedNext` for the same jump; this record is what is published, and
+   *  what an in-flight capture checks it is still answering for. */
+  private queuedJump: QueuedJump | null = null;
+
+  /** Queued jumps handed off to since the tune and subtune loaded. Incremented on a landing only. */
+  private handOffs = 0;
+
   private scheduledFrames = 0;
   private lateFrames = 0;
   private sumLagMs = 0;
@@ -348,6 +356,8 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.discardOutstandingJump();
     this.declared.clear();
     this.dropPreparedImages();
+    this.queuedJump = null;
+    this.activeLoop.queue(null);
     this.session.load(file);
 
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
@@ -380,6 +390,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // The outgoing tune's detected structure describes a file this session no longer holds, and its
     // loop is measured in frames of it.
     this.setTrackStructure(null);
+    this.handOffs = 0;
     this.setActiveLoop(null);
 
     if (this.session.initSubtune(file.startSong)) {
@@ -526,6 +537,9 @@ class SidPlayerCoordinator implements SidPlayer {
     // declarations go before the recaptures below, which skip a declared frame.
     this.dropEntryImages();
     this.declared.clear();
+    this.queuedJump = null;
+    this.activeLoop.queue(null);
+    this.handOffs = 0;
     this.markDirty();
     void this.captureTrackLoopEntry();
     const activeLoop = this.activeLoop.get();
@@ -545,6 +559,7 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   setActiveLoop(loop: ActiveLoop): void {
+    this.queuedJump = null;
     this.activeLoop.set(loop);
     // A loop already captured for this machine is armed with its image straight away, so the seek a
     // trigger, an audition or a queued hand-off makes right after this one lands instantly rather
@@ -559,6 +574,40 @@ class SidPlayerCoordinator implements SidPlayer {
       // end for a whole pass yet.
       void this.captureActiveLoopEntry(loop);
     }
+    this.markDirty();
+  }
+
+  queueJump(target: QueuedJump | null): void {
+    if (target === null) {
+      this.queuedJump = null;
+      this.activeLoop.queue(null);
+      this.markDirty();
+      return;
+    }
+    if (!Number.isFinite(target.startFrame)) {
+      console.warn(`SID player: ignoring a queued jump to ${target.startFrame}.`);
+      return;
+    }
+    const startFrame = frames(Math.max(0, Math.round(target.startFrame)));
+    const endFrame = target.endFrame === null ? null : frames(Math.round(target.endFrame));
+    if (endFrame !== null && !(endFrame > startFrame)) {
+      console.warn(
+        `SID player: ignoring a queued jump to ${startFrame} ending at ${target.endFrame}.`,
+      );
+      return;
+    }
+    if (this.activeLoop.get() === null) {
+      console.warn(`SID player: ignoring a queued jump to ${startFrame} with no loop running.`);
+      return;
+    }
+
+    const record: QueuedJump = { startFrame, endFrame };
+    this.queuedJump = record;
+    this.activeLoop.queue({
+      startFrame,
+      loop: endFrame === null ? null : { startFrame, endFrame },
+    });
+    this.armQueuedImage(record);
     this.markDirty();
   }
 
@@ -617,6 +666,7 @@ class SidPlayerCoordinator implements SidPlayer {
       mutedAtCapture: this.anyVoiceMuted(),
     };
     this.rememberEntryImage(image);
+    if (this.queuedJump?.startFrame === position) this.activeLoop.setQueuedImage(image.anchor);
     if (this.declared.has(position)) {
       this.prepared.set(position, image);
       if (image.mutedAtCapture) {
@@ -639,6 +689,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // The declared frames stay declared; only their images went, so each is built again.
     for (const frame of this.declared) this.buildQueue.add(frame);
     this.scheduleBuilds();
+    if (this.queuedJump !== null) this.armQueuedImage(this.queuedJump);
     this.markDirty();
     // Not awaited: nothing on this path needs the image, and playback cannot reach the loop's end
     // for a whole lap yet.
@@ -934,7 +985,8 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /** Runs whatever loop is in force against the frame just rendered: a lap re-enters and owes the
-   *  stream a resync, a track end with repeat off ends the track. */
+   *  stream a resync, as does a hand-off to a queued jump; a track end with repeat off ends the
+   *  track. */
   private enforceLoop(machine: C64Machine, frame: RegisterFrame): void {
     const outcome = this.activeLoop.advance(
       machine,
@@ -948,6 +1000,18 @@ class SidPlayerCoordinator implements SidPlayer {
       this.queueResync();
       // The track's own loop may have just armed itself, which is a discrete change to the loop a
       // consumer reads.
+      this.markDirty();
+      return;
+    }
+    if (outcome.action === 'handed-off') {
+      // Every coordinator and tracker update comes before `markDirty`, whose listeners run
+      // synchronously and may call straight back in: they must see a consistent snapshot, and what
+      // they do must not be overwritten afterwards.
+      this.session.framesRendered = outcome.frame;
+      this.queuedJump = null;
+      this.handOffs++;
+      if (this.activeLoop.get() === null) this.activeLoop.setEntryImage(this.trackLoopEntry);
+      this.queueResync();
       this.markDirty();
       return;
     }
@@ -1098,6 +1162,29 @@ class SidPlayerCoordinator implements SidPlayer {
     this.activeLoop.setEntryImage(result.anchor);
   }
 
+  /**
+   * Hands the tracker the image for the queued jump `record`: whichever already stands at its start
+   * frame, else — for a frame no one declared — a one-off capture. A declared frame's build hands
+   * the image over when it lands.
+   */
+  private armQueuedImage(record: QueuedJump): void {
+    const held = this.prepared.get(record.startFrame) ?? this.loopEntries.get(record.startFrame);
+    this.activeLoop.setQueuedImage(held?.anchor ?? null);
+    if (held === undefined && !this.declared.has(record.startFrame)) {
+      void this.captureQueuedImage(record);
+    }
+  }
+
+  /** Captures the start frame of `record` once, off-thread, and hands it over if `record` is still
+   *  the jump queued when the image arrives. */
+  private async captureQueuedImage(record: QueuedJump): Promise<void> {
+    const result = await this.captureEntryImage(record.startFrame);
+    if (result === null) return;
+
+    this.rememberEntryImage(result);
+    if (this.queuedJump === record) this.activeLoop.setQueuedImage(result.anchor);
+  }
+
   /** Whichever image already stands at `loop`'s own start frame — prepared first, then the cache —
    *  or the track's own loop's entry when nothing is looping. What `setActiveLoop` arms a loop with
    *  in place of a fresh capture. */
@@ -1132,6 +1219,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // follows.
     this.capturesInFlight.clear();
     this.activeLoop.setEntryImage(null);
+    this.activeLoop.setQueuedImage(null);
     this.dropPreparedImages();
   }
 
@@ -1195,6 +1283,9 @@ class SidPlayerCoordinator implements SidPlayer {
         this.prepared.set(build.frame, { anchor: result, chainable: true, mutedAtCapture: false });
         if (this.activeLoop.get()?.startFrame === build.frame) {
           this.activeLoop.setEntryImage(result);
+        }
+        if (this.queuedJump?.startFrame === build.frame) {
+          this.activeLoop.setQueuedImage(result);
         }
         this.markDirty();
       }
@@ -1339,6 +1430,8 @@ class SidPlayerCoordinator implements SidPlayer {
               preparedFrames: Array.from(this.prepared.keys())
                 .sort((a, b) => a - b)
                 .map((frame) => frames(frame)),
+              queuedJump: this.queuedJump,
+              handOffs: this.handOffs,
             },
       tempo: {
         multiplier: this.tempoMultiplier,

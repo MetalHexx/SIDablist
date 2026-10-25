@@ -4,7 +4,7 @@ import type { DetectedLoopFrames } from '../timeline/track-structure.js';
 import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
 import type { SidField } from '../registers/sid-fields.js';
-import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
+import type { PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
@@ -47,6 +47,12 @@ export interface SidPlayer {
    * declares again after either.
    */
   setJumpTargets(frames: readonly Frames[]): void;
+  /** Queues `target` to land at the end of the running loop's current lap, replacing any queued
+   *  jump; null cancels. It lands at the first wrap at which its start frame's snapshot is ready —
+   *  until then laps continue — and is dropped by `setActiveLoop`, `stop`, `loadTune` and a subtune
+   *  change. Ignored, with a warning, when no loop is running: jump now with `setActiveLoop` and
+   *  `seek` instead. */
+  queueJump(target: QueuedJump | null): void;
   /**
    * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
    * returns the frame it captured (the same frame `getPosition()` reports), or null with nothing
