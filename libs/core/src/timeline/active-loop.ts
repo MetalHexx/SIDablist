@@ -18,7 +18,15 @@ export type ActiveLoop = { readonly startFrame: Frames; readonly endFrame: Frame
 export type AdvanceResult =
   | { readonly action: 'none' }
   | { readonly action: 'looped'; readonly frame: Frames }
+  | { readonly action: 'handed-off'; readonly frame: Frames }
   | { readonly action: 'stopped' };
+
+/** A jump queued for the end of the running loop's lap: the frame it starts at, and the loop it
+ *  runs from there — null for a cue, which plays on with no loop. */
+export interface QueuedNext {
+  readonly startFrame: Frames;
+  readonly loop: ActiveLoop;
+}
 
 /** Holds the loop presently running and enforces it, frame by frame, against the track it plays
  *  over. */
@@ -47,11 +55,23 @@ export interface ActiveLoopTracker {
    *  would do, and paying a replay for it instead is the cost this image exists to avoid. */
   entryImage(): PositionAnchor | null;
   /**
+   * Queues the jump the next wrap of the running loop makes instead of re-entering that loop,
+   * replacing any already queued; null cancels. Holds the object it is given, so the wrap allocates
+   * nothing for it. Drops the queued image — the caller hands over the new target's through
+   * `setQueuedImage`.
+   */
+  queue(next: QueuedNext | null): void;
+  /** The image of the queued jump's start frame. A queued jump lands only while one is held, so a
+   *  wrap with none re-enters the running loop and the queue waits another lap. */
+  setQueuedImage(entry: PositionAnchor | null): void;
+  /**
    * Enforces whatever is running against `framesRendered`: the active loop if one is set, else the
    * track's own end.
    *
    * Reaching the active loop's end re-enters its start — through the entry image if one is held,
-   * else by seeking along the anchor path — and reports the frame landed on.
+   * else by seeking along the anchor path — and reports the frame landed on. With a jump queued and
+   * its image held, it restores that image instead, makes the queued loop (or none, for a cue) the
+   * active one, empties the queue and reports `handed-off` at the frame landed on.
    *
    * Reaching the track's end with no active loop set decides between replaying and stopping per
    * `track.repeatEnabled()`: off stops, leaving the pair exactly where it stands — what stopping
@@ -76,6 +96,8 @@ export interface ActiveLoopTracker {
 export function createActiveLoopTracker(): ActiveLoopTracker {
   let loop: ActiveLoop = null;
   let entryImage: PositionAnchor | null = null;
+  let queued: QueuedNext | null = null;
+  let queuedImage: PositionAnchor | null = null;
 
   /** Re-enters `startFrame`, preferring the held entry image over a seek. Returns the frame landed
    *  on, or null when neither is possible and the pair was left untouched. */
@@ -98,6 +120,8 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
 
     set(next: ActiveLoop): void {
       loop = next;
+      queued = null;
+      queuedImage = null;
     },
 
     setEntryImage(entry: PositionAnchor | null): void {
@@ -106,9 +130,28 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
 
     entryImage: (): PositionAnchor | null => entryImage,
 
+    queue(next: QueuedNext | null): void {
+      queued = next;
+      queuedImage = null;
+    },
+
+    setQueuedImage(entry: PositionAnchor | null): void {
+      queuedImage = entry;
+    },
+
     advance(machine, frame, ring, track, framesRendered): AdvanceResult {
       if (loop !== null) {
         if (framesRendered < loop.endFrame) return { action: 'none' };
+        if (queued !== null && queuedImage !== null) {
+          const image = queuedImage;
+          machine.restore(image.machine);
+          frame.restoreValues(image.registers);
+          loop = queued.loop;
+          if (queued.loop !== null) entryImage = image;
+          queued = null;
+          queuedImage = null;
+          return { action: 'handed-off', frame: image.frame };
+        }
         const landed = enter(machine, frame, ring, loop.startFrame);
         return landed === null ? { action: 'none' } : { action: 'looped', frame: landed };
       }

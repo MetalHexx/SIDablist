@@ -4,7 +4,7 @@ import type { DetectedLoopFrames } from '../timeline/track-structure.js';
 import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
 import type { SidField } from '../registers/sid-fields.js';
-import type { PlayerSnapshot, PlayerStats } from './snapshot.js';
+import type { PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
@@ -40,14 +40,25 @@ export interface SidPlayer {
   previousSubtune(): void;
   setActiveLoop(loop: { startFrame: Frames; endFrame: Frames } | null): void;
   /**
-   * Snapshots the live machine and register frame at the current position into the entry-image
-   * cache `setActiveLoop` and `seek` already read from, for the cost of a memory copy — the machine
-   * is already sitting here, so nothing replays. Meant to be called at the moment a caller marks
-   * this exact frame as a loop's future start: arming that loop later finds the image already
-   * cached and skips the off-thread replay `setActiveLoop` otherwise falls back to, so even that
-   * loop's very first trigger is instant. A no-op with nothing loaded.
+   * Declares the frames the host wants to jump to instantly — loop starts and cue points alike —
+   * replacing the previous set; an empty list withdraws all. Each declared frame gets its own
+   * snapshot, built off the main thread without moving the playhead; readiness is published in
+   * `getSnapshot().tune.preparedFrames`. Cleared by `loadTune` and by a subtune change, so the host
+   * declares again after either.
    */
-  capturePosition(): void;
+  setJumpTargets(frames: readonly Frames[]): void;
+  /** Queues `target` to land at the end of the running loop's current lap, replacing any queued
+   *  jump; null cancels. It lands at the first wrap at which its start frame's snapshot is ready —
+   *  until then laps continue — and is dropped by `setActiveLoop`, `stop`, `loadTune` and a subtune
+   *  change. Ignored, with a warning, when no loop is running: jump now with `setActiveLoop` and
+   *  `seek` instead. */
+  queueJump(target: QueuedJump | null): void;
+  /**
+   * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
+   * returns the frame it captured (the same frame `getPosition()` reports), or null with nothing
+   * loaded. When that frame is declared, it is ready at once.
+   */
+  capturePosition(): Frames | null;
   /** What detection found about this tune: its loop, its end, its measured length. The
    *  application supplies it; core turns it into the position basis and the end behaviour. */
   setTrackStructure(loop: DetectedLoopFrames | null): void;

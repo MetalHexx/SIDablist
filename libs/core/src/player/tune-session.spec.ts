@@ -4,6 +4,7 @@ import type { C64Machine } from '../cpu/c64-machine.js';
 import type { RegisterFrame } from '../registers/register-frame.js';
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import { replayToFrame } from '../replay/replay-to-frame.js';
+import type { ReplayResult } from '../replay/replay-to-frame.js';
 import { frames } from '../units.js';
 import { JUMP_CEILING_SECONDS, createTuneSession } from './tune-session.js';
 import type { TuneSessionHost } from './tune-session.js';
@@ -47,7 +48,13 @@ function answer(request: ReplayRequest): ReplayResponse {
     return {
       id: request.id,
       ok: true,
-      result: replayToFrame(request.file, request.subtune, request.targetFrame, request.mutes),
+      result: replayToFrame(
+        request.file,
+        request.subtune,
+        request.targetFrame,
+        request.mutes,
+        request.start,
+      ),
     };
   } catch (error) {
     return {
@@ -515,6 +522,51 @@ describe('TuneSession', () => {
       expect(session.framesRendered).toBe(50);
       expect(result?.frame).toBe(10);
       expect(replay.requests[0].id).not.toBe(replay.requests[1].id);
+    });
+
+    it('carries a start image into the request, and lands where a replay from the top would', async () => {
+      replay = new FakeReplayRunner();
+      const session = createTuneSession(replay, fakeHost());
+      session.load(counterTune());
+      session.initSubtune(1);
+
+      const first = await session.replayImage(frames(10));
+      const chained = await session.replayImage(frames(25), { start: first as ReplayResult });
+      const straight = await session.replayImage(frames(25));
+
+      expect(replay.requests[1].start).toBe(first);
+      expect(replay.requests[2].start).toBeUndefined();
+      expect(chained).toEqual(straight);
+    });
+
+    it('seeds the replay with the mutes it is given in place of the host’s', async () => {
+      replay = new FakeReplayRunner();
+      const host = fakeHost({ effectiveMutes: () => [true, true, true] });
+      const session = createTuneSession(replay, host);
+      session.load(counterTune());
+      session.initSubtune(1);
+
+      await session.replayImage(frames(5));
+      await session.replayImage(frames(5), { mutes: [false, false, false] });
+
+      expect(replay.requests.map((request) => request.mutes)).toEqual([
+        [true, true, true],
+        [false, false, false],
+      ]);
+    });
+
+    it('sends the request to the runner it is given, leaving the session’s own untouched', async () => {
+      replay = new FakeReplayRunner();
+      const other = new FakeReplayRunner();
+      const session = createTuneSession(replay, fakeHost());
+      session.load(counterTune());
+      session.initSubtune(1);
+
+      const result = await session.replayImage(frames(10), { runner: other });
+
+      expect(result?.frame).toBe(10);
+      expect(other.requests).toHaveLength(1);
+      expect(replay.requests).toHaveLength(0);
     });
   });
 

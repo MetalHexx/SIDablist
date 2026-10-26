@@ -73,6 +73,12 @@ The corollary that catches most cases: **core owns the operations, the applicati
 collections.**
 
 - Core holds the _active_ loop, because it has to enforce it on every frame.
+- Core holds a snapshot for each frame the host declares as a jump target, because returning to a
+  frame instantly is a timeline operation. Which of those frames are loops, which are cues, and
+  what they are called stays with the application.
+- Core holds the one _queued_ hand-off, and makes it at the running loop's wrap itself. Only core
+  sees the wrap on the frame it happens; a host guessing it from a polled playhead acts after the
+  old loop's start has already sounded. Which jump to queue, and when, stays with the application.
 - The application holds the list of saved cues and loops, their names, their pad assignments, and
   whether they survive a reload.
 - A cue is a loop without an end marker. Both are _a frame number someone remembered_ plus _an
@@ -87,6 +93,10 @@ Worked examples of the same test:
 | Persistence                                                                           | application | A preference, not a timeline fact               |
 | A control's position                                                                  | application | Intent                                          |
 | Applying gain and filter scaling, and offsetting or holding chip fields, on registers | core        | Register state on the frame path                |
+
+The `LoopPositionsStore` port that holds a tune's saved loop markers lives in `libs/tunes`; the
+storage behind it is still the application's. Core never imports `tunes`: the application rebuilds
+core's loop snapshots from the stored positions.
 
 ## The output stage
 
@@ -207,12 +217,12 @@ and Angular wraps it in a signal updated from an effect.
 
 Everything is a plain read. The only distinction is **whether a change notifies you**:
 
-| Read            | Notifies | Carries                                                      |
-| --------------- | -------- | ------------------------------------------------------------ |
-| `getSnapshot()` | yes      | Transport state, tune, tempo, the active loop, voices, error |
-| `getPosition()` | no       | The playhead frame                                           |
-| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth          |
-| `readRegisters` | no       | Every register, as written and as sent                       |
+| Read            | Notifies | Carries                                                                                                                 |
+| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `getSnapshot()` | yes      | Transport state, tune with its ready jump frames, queued jump and hand-off count, tempo, the active loop, voices, error |
+| `getPosition()` | no       | The playhead frame                                                                                                      |
+| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                                                     |
+| `readRegisters` | no       | Every register, as written and as sent                                                                                  |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 

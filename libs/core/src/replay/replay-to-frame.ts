@@ -27,16 +27,25 @@ export interface ReplayResult {
  *
  * @param mutes the effective mute per voice, seeded onto the replay frame so a muted voice's control
  *   register stays 0 through the whole replay exactly as it would live.
- * @throws when `init` or a replayed frame fails, or a frame exceeds its cycle budget. The message is
- *   the one the diagnostics readout shows verbatim.
+ * @param start an image of this same file, subtune and mutes to continue from instead of running
+ *   from the top. Every frame is a single `runFrame` call whose whole state the image carries, so
+ *   the result is identical to a replay from `init` — the saving is the frames before `start`.
+ * @throws when `init` or a replayed frame fails, a frame exceeds its cycle budget, or `start` lies
+ *   past `targetFrame`. The message is the one the diagnostics readout shows verbatim.
  */
 export function replayToFrame(
   file: SidFile,
   subtune: number,
   targetFrame: Frames,
   mutes: readonly boolean[],
+  start?: ReplayResult,
 ): ReplayResult {
   const target = frames(Math.max(0, Math.round(targetFrame)));
+  if (start !== undefined && start.frame > target) {
+    throw new Error(
+      `jump to frame ${target} failed during replay — the starting image is at frame ${start.frame}, past the target`,
+    );
+  }
 
   const frame = createRegisterFrame();
   mutes.forEach((muted, voice) => frame.setVoiceMuted(voice, muted));
@@ -48,8 +57,13 @@ export function replayToFrame(
     throw new Error(`jump to frame ${target} failed during init — ${describeError(error)}`);
   }
 
+  if (start !== undefined) {
+    machine.restore(start.machine);
+    frame.restoreValues(start.registers);
+  }
+
   try {
-    runFramesTo(machine, frames(0), target, () => {
+    runFramesTo(machine, start?.frame ?? frames(0), target, () => {
       frame.takeSnapshot(); // discarded — resets per-frame duplicate-write tracking only;
       // the accumulated register values persist across the call regardless
     });

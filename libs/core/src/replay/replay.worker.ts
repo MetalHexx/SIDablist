@@ -14,7 +14,13 @@ self.onmessage = (event: MessageEvent<ReplayRequest>): void => {
     response = {
       id: request.id,
       ok: true,
-      result: replayToFrame(request.file, request.subtune, request.targetFrame, request.mutes),
+      result: replayToFrame(
+        request.file,
+        request.subtune,
+        request.targetFrame,
+        request.mutes,
+        request.start,
+      ),
     };
   } catch (error) {
     response = { id: request.id, ok: false, error: describeError(error) };

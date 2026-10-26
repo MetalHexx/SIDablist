@@ -27,7 +27,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
   operations core owns.
 - `player/` — `createSidPlayer`, the composition root wiring the above into `SidPlayer`, plus
-  `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads.
+  `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
+  surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
+  queue are published under `tune.preparedFrames`, `tune.queuedJump` and `tune.handOffs`);
+  `queueJump` queues a hand-off for the running loop's next wrap; `capturePosition()` returns the
+  frame it captured. `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for
+  those builds, so a scrub does not wait behind a batch of them; without it they share the scrub
+  runner.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -75,6 +81,19 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
+- **An entry image is a pure function of (file, subtune, frame, mutes at capture).** Prepared
+  images are built with every voice unmuted, so a restore into an unmuted player sounds; a muted
+  voice's control register is zeroed in an image taken muted. Only an image built by an unmuted
+  replay may start a chained build — a live `capturePosition()` never does, and a capture taken
+  after a mute and unmute can carry a stale control register until the tune next writes it.
+- **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
+  long as it stays declared. The four-image cache for undeclared captures does not bound them; the
+  host's declaration does.
+- **A queued jump never lands without a held image.** A target that is not yet built waits whole
+  laps for it rather than replaying on the main thread inside the tick, so a host that queues an
+  unprepared frame sees the running loop continue. Frame 0 is no exception: an undeclared target
+  is replayed off-thread like any other, since a queued hand-off restores only from an image. `tune.handOffs` is how it tells a landing from a
+  dropped queue; clearing a queue never touches it.
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
   the shadow makes a cue re-entered at another setting apply it twice.
@@ -107,6 +126,18 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 
+- **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
+  `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
+  unhandled variant leaves the player's position and the stream out of step without a compile
+  error. Handle it there, then run `player/create-sid-player.spec.ts`.
+- **Changed `ReplayRequest`'s shape (`replay/replay-runner.ts`)?** `replay/replay.worker.ts` unpacks
+  the request field by field into `replayToFrame`, and every host `ReplayRunner` implementation
+  forwards it in its own way. A field one of them drops compiles fine and degrades quietly: a
+  dropped `start` makes every prepared build replay from the top, and a dropped `mutes` builds
+  frames that sound wrong once unmuted. Update the worker and each runner, then run
+  `replay/replay.worker.spec.ts`, which pins that the worker forwards `start`. No spec catches a
+  `ReplayRunner` implementation that drops it, since the in-spec fakes forward it themselves. Detail:
+  [`replay/replay.worker.ts`](./src/replay/replay.worker.ts)
 - **Made a deliberate change to how multiply, offset or hold compose?**
   `registers/register-frame.equivalence.spec.ts` fails against the frozen reference in
   `registers/__reference__/`, because the reference still composes them the old way. Confirm the

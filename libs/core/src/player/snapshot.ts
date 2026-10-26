@@ -3,6 +3,13 @@ import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { FrameClockStats } from '../ports/clock.js';
 import type { FarEndConsumption, SinkCapabilities } from '../ports/sink.js';
 
+/** A jump the host queued for the end of the running loop's current lap: a loop when
+ *  `endFrame` is set, a cue (play on from `startFrame`, no loop) when it is null. */
+export interface QueuedJump {
+  readonly startFrame: Frames;
+  readonly endFrame: Frames | null;
+}
+
 /**
  * The read side of `SidPlayer`: everything a consumer's change detection should wake up for,
  * grouped into named objects rather than a flat property bag so a field added later lands inside
@@ -18,6 +25,14 @@ export interface PlayerSnapshot {
     readonly subtune: number;
     readonly subtuneCount: number;
     readonly lengthFrames: Frames | null;
+    /** Declared jump frames whose snapshot is ready, ascending. */
+    readonly preparedFrames: readonly Frames[];
+    /** The jump queued for the end of the running loop's lap, or null. */
+    readonly queuedJump: QueuedJump | null;
+    /** How many queued jumps the engine has handed off to since this tune and subtune loaded. It
+     *  increments once per hand-off and never on a cancel, a replace or a clear, so a host can tell
+     *  a landing from a dropped queue. */
+    readonly handOffs: number;
   } | null;
   readonly tempo: {
     readonly multiplier: number;

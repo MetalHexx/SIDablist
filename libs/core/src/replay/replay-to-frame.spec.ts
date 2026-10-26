@@ -199,3 +199,89 @@ describe('replayToFrame', () => {
     );
   });
 });
+
+/** init programs CIA 1 timer A for exactly two play calls per frame. */
+function doubleSpeedTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+  });
+}
+
+/** init programs CIA 1 timer A to a latch of $1FFD, so 19656 / 8190 = 2.4 calls per frame — a rate
+ *  that does not divide the frame evenly. */
+function fractionalSpeedTune(): SidFile {
+  return tune({
+    blocks: [
+      { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+  });
+}
+
+describe('replayToFrame from a start image', () => {
+  const unmuted = [false, false, false];
+
+  describe.each([
+    ['a counting tune', counterTune],
+    ['a double-speed tune', doubleSpeedTune],
+    ['a fractional-speed tune', fractionalSpeedTune],
+  ])('on %s', (_name, build) => {
+    it('lands byte-identical to a replay from the top, in memory, registers and CPU state', () => {
+      const file = build();
+
+      const straight = replayToFrame(file, 1, frames(90), unmuted);
+      const chained = replayToFrame(
+        file,
+        1,
+        frames(90),
+        unmuted,
+        replayToFrame(file, 1, frames(35), unmuted),
+      );
+
+      expect(chained.frame).toBe(90);
+      expect(chained.machine.memory).toEqual(straight.machine.memory);
+      expect(chained.registers.values).toEqual(straight.registers.values);
+      expect(chained.machine.cpu).toEqual(straight.machine.cpu);
+      expect(chained).toEqual(straight);
+    });
+
+    it('stays identical across a chain of starts, each built from the one before', () => {
+      const file = build();
+
+      const first = replayToFrame(file, 1, frames(20), unmuted);
+      const second = replayToFrame(file, 1, frames(55), unmuted, first);
+      const third = replayToFrame(file, 1, frames(70), unmuted, second);
+
+      expect(third).toEqual(replayToFrame(file, 1, frames(70), unmuted));
+    });
+  });
+
+  it('returns the start image’s own state when the target is its frame', () => {
+    const file = counterTune();
+    const start = replayToFrame(file, 1, frames(30), unmuted);
+
+    expect(replayToFrame(file, 1, frames(30), unmuted, start)).toEqual(start);
+  });
+
+  it('runs only the frames after the start', () => {
+    const file = counterTune();
+    const start = replayToFrame(file, 1, frames(30), unmuted);
+
+    const chained = replayToFrame(file, 1, frames(31), unmuted, start);
+
+    // $D400 carries the play-call count: one more call than the start image, not 31 from init.
+    expect(chained.registers.values[0]).toBe(start.registers.values[0] + 1);
+  });
+
+  it('refuses a start image past the target with the replay error text', () => {
+    const file = counterTune();
+    const start = replayToFrame(file, 1, frames(30), unmuted);
+
+    expect(() => replayToFrame(file, 1, frames(20), unmuted, start)).toThrow(
+      /^jump to frame 20 failed during replay — /,
+    );
+  });
+});

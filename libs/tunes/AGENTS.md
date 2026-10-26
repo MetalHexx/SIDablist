@@ -1,21 +1,25 @@
 # tunes
 
-The DJ's knowledge of a tune: what one _is_ (`TuneIdentity`, `TuneReference`, `Playable`), the two
-ports a host supplies to store and index it (`TuneStore`, `TuneIndexer`), and the one rule —
-index once per hash and subtune, look up before scanning — that lives here instead of in every
-deck that plays a tune.
+The DJ's knowledge of a tune: what one _is_ (`TuneIdentity`, `TuneReference`, `Playable`,
+`LoopMarker`), the ports a host supplies to store and index it (`TuneStore`, `TuneIndexer`,
+`LoopPositionsStore`), and the one rule — index once per hash and subtune, look up before scanning —
+that lives here instead of in every deck that plays a tune.
 
 ## How it works
 
 The public surface is `src/index.ts`; nothing under `__fixtures__` or `testing/` is exported from
-it except `InMemoryTuneStore`.
+it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
 
 - `identity.ts`, `reference.ts`, `playable.ts` — the values: `TuneIdentity` (content hash plus
   1-based subtune), `TuneReference` (header facts plus identity, and `referenceFor` that builds
   one from a parsed `SidFile`), `Playable` (bytes plus reference plus index — never one without
   the other).
-- `ports.ts` — `TuneStore` and `TuneIndexer`, the seams a host implements. `TuneStore` is
-  deliberately dumb: no rules, just storage.
+- `loop-marker.ts` — `LoopMarker` and `LoopBoundary`: the positions a performer marked in one tune,
+  as plain frame-and-offset numbers. A storage shape only; no engine snapshot or readiness flag
+  belongs on it, since `@sidablist/core` rebuilds snapshots from these positions and never depends
+  on this package.
+- `ports.ts` — `TuneStore`, `TuneIndexer` and `LoopPositionsStore`, the seams a host implements.
+  `TuneStore` and `LoopPositionsStore` are deliberately dumb: no rules, just storage.
 - `inserter.ts` — `TuneInserter` / `createTuneInserter`: hashes and stores a tune's bytes,
   idempotent by construction.
 - `resolver.ts` — `TuneResolver` / `createTuneResolver`: the lookup-or-index rule, the in-flight
@@ -25,6 +29,9 @@ it except `InMemoryTuneStore`.
   MD5 and nothing else here needs a hashing library.
 - `testing/in-memory-tune-store.ts` — `InMemoryTuneStore`, a `Map`-backed `TuneStore` exported
   from the package root the way `core` exports `FakeSink`.
+- `testing/in-memory-loop-positions-store.ts` — `InMemoryLoopPositionsStore`, a `Map`-backed
+  `LoopPositionsStore` that copies lists on save and load. It is the session implementation a host
+  uses until a permanent store replaces it behind the same port, and a stand-in in consumers' specs.
 - `__fixtures__/` — a bundled real tune (Still Time) `md5.spec.ts`, `inserter.spec.ts` and
   `resolver.spec.ts` run against. Internal only; never exported from the package root.
 
@@ -51,10 +58,14 @@ it except `InMemoryTuneStore`.
 
 ## When a change here ripples
 
-- **Changed `TuneStore` or `TuneIndexer`'s method signatures?** Every host adapter that implements
-  them breaks at its call site, not here — this package has no adapter of its own to catch it.
-  Grep the host application for `TuneStore`/`TuneIndexer` implementations before shipping the
-  change.
+- **Changed `TuneStore`, `TuneIndexer` or `LoopPositionsStore`'s method signatures?** Every host
+  adapter that implements them breaks at its call site, not here — this package has no adapter of
+  its own to catch it. Grep the host application for `TuneStore`/`TuneIndexer`/`LoopPositionsStore`
+  implementations before shipping the change.
+- **Changed `LoopMarker` or `LoopBoundary`'s fields?** Every host's permanent `LoopPositionsStore`
+  holds markers in this shape, so a field change is a storage-format change, not a refactor —
+  markers already saved stop loading. Grep the host application for `LoopPositionsStore`
+  implementations before shipping the change. Detail: [`src/ports.ts`](./src/ports.ts).
 - **Changed what `md5Hex` returns, or how a `sidHash` is derived?** Every previously computed
   `sidHash` stops matching what a fresh insert produces — treat it like a storage key format
   change, not a refactor. `md5.spec.ts`'s HVSC-sourced Still Time digest is the check that this
