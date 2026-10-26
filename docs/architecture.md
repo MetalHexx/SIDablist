@@ -79,6 +79,10 @@ collections.**
 - Core holds the one _queued_ hand-off, and makes it at the running loop's wrap itself. Only core
   sees the wrap on the frame it happens; a host guessing it from a polled playhead acts after the
   old loop's start has already sounded. Which jump to queue, and when, stays with the application.
+- A jump can carry settings the engine applies as it lands: voice pitch, field offsets and holds,
+  and voice mutes. Only core sees the landing frame, and the settings must go in before the image
+  is restored, so a voice they unmute sounds from the image rather than from silence. Which
+  settings a saved loop uses, and where they are kept, stays with the application.
 - The application holds the list of saved cues and loops, their names, their pad assignments, and
   whether they survive a reload.
 - A cue is a loop without an end marker. Both are _a frame number someone remembered_ plus _an

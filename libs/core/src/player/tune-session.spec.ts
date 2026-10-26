@@ -596,4 +596,112 @@ describe('TuneSession', () => {
       expect(runner.disposed).toBe(true);
     });
   });
+
+  describe('jumpToFrame options', () => {
+    it('runs the hook on landing, ahead of the mute re-assertion and the restore, and notifies after the restore', async () => {
+      const order: string[] = [];
+      replay = new FakeReplayRunner();
+      replay.manual = true;
+      const session = createTuneSession(
+        replay,
+        fakeHost({
+          effectiveMutes: () => {
+            order.push('mutes');
+            return [false, false, false];
+          },
+          queueResync: () => {
+            order.push('restore');
+          },
+          markDirty: () => {
+            order.push('dirty');
+          },
+        }),
+      );
+      session.load(counterTune());
+      session.initSubtune(1);
+
+      const landed = session.jumpToFrame(frames(5), {
+        beforeLanding: () => {
+          order.push('hook');
+        },
+      });
+      order.length = 0;
+      replay.resolveAll();
+      await landed;
+
+      expect(order).toEqual(['hook', 'mutes', 'restore', 'dirty']);
+      expect(session.framesRendered).toBe(5);
+    });
+
+    it('never runs the hook of a request that is superseded or discarded', async () => {
+      replay = new FakeReplayRunner();
+      replay.manual = true;
+      const session = createTuneSession(replay, fakeHost());
+      session.load(counterTune());
+      session.initSubtune(1);
+      const superseded = vi.fn();
+      const standing = vi.fn();
+      const discarded = vi.fn();
+
+      const first = session.jumpToFrame(frames(3), { beforeLanding: superseded });
+      const second = session.jumpToFrame(frames(4), { beforeLanding: standing });
+      replay.resolveAll();
+      await Promise.all([first, second]);
+      const third = session.jumpToFrame(frames(6), { beforeLanding: discarded });
+      session.discardOutstandingJump();
+      replay.resolveAll();
+      await third;
+
+      expect(superseded).not.toHaveBeenCalled();
+      expect(standing).toHaveBeenCalledTimes(1);
+      expect(discarded).not.toHaveBeenCalled();
+    });
+
+    it('fails the host without running the hook when the replay cannot complete', async () => {
+      replay = new FakeReplayRunner();
+      const host = fakeHost();
+      const session = createTuneSession(replay, host);
+      session.load(runawayTune());
+      session.initSubtune(1);
+      const beforeLanding = vi.fn();
+
+      await session.jumpToFrame(frames(1), { beforeLanding });
+
+      expect(beforeLanding).not.toHaveBeenCalled();
+      expect(host.failures.some((reason) => reason.includes('during replay'))).toBe(true);
+    });
+
+    it('notifies only when a hook ran', async () => {
+      replay = new FakeReplayRunner();
+      const host = fakeHost();
+      const session = createTuneSession(replay, host);
+      session.load(counterTune());
+      session.initSubtune(1);
+      const before = host.dirtyCount.count;
+
+      await session.jumpToFrame(frames(5));
+      expect(host.dirtyCount.count).toBe(before);
+
+      await session.jumpToFrame(frames(6), { beforeLanding: () => undefined });
+      expect(host.dirtyCount.count).toBe(before + 1);
+    });
+
+    it('seeds the replay with options.mutes in place of the host’s, and with the host’s without', async () => {
+      replay = new FakeReplayRunner();
+      const session = createTuneSession(
+        replay,
+        fakeHost({ effectiveMutes: () => [true, true, true] }),
+      );
+      session.load(counterTune());
+      session.initSubtune(1);
+
+      await session.jumpToFrame(frames(5));
+      await session.jumpToFrame(frames(6), { mutes: [false, false, false] });
+
+      expect(replay.requests.map((request) => request.mutes)).toEqual([
+        [true, true, true],
+        [false, false, false],
+      ]);
+    });
+  });
 });

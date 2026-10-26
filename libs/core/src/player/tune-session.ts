@@ -124,8 +124,16 @@ export interface TuneSession {
    *
    * Only the newest request may land. A response carrying any other id is dropped — a second jump
    * supersedes the first rather than queueing behind it.
+   *
+   * `options.beforeLanding`, when given, runs only if this request lands — after the response is
+   * accepted as the outstanding one, before the mutes are re-asserted and the state restored — and
+   * the session notifies (`host.markDirty()`) after the restore. `options.mutes` replaces the
+   * host's effective mutes as the replay's seed.
    */
-  jumpToFrame(targetFrame: Frames): Promise<void>;
+  jumpToFrame(
+    targetFrame: Frames,
+    options?: { readonly beforeLanding?: () => void; readonly mutes?: readonly boolean[] },
+  ): Promise<void>;
 
   /**
    * Replays off-thread to `targetFrame` and hands the result back instead of adopting it onto the
@@ -339,7 +347,10 @@ class TuneSessionImpl implements TuneSession {
     return frames(Math.round((clamped / 100) * this.positionBasisFrames));
   }
 
-  jumpToFrame(targetFrame: Frames): Promise<void> {
+  jumpToFrame(
+    targetFrame: Frames,
+    options: { readonly beforeLanding?: () => void; readonly mutes?: readonly boolean[] } = {},
+  ): Promise<void> {
     const file = this._file;
     if (file === null || this._machine === null || this._frame === null) return Promise.resolve();
 
@@ -350,10 +361,10 @@ class TuneSessionImpl implements TuneSession {
       targetFrame,
       // The mutes as they stand now; `awaitJump` re-asserts whatever they have become by the time
       // the result lands.
-      mutes: this.host.effectiveMutes(),
+      mutes: options.mutes ?? this.host.effectiveMutes(),
     };
     this.outstandingJumpId = request.id;
-    return this.awaitJump(request);
+    return this.awaitJump(request, options.beforeLanding);
   }
 
   async replayImage(
@@ -394,8 +405,10 @@ class TuneSessionImpl implements TuneSession {
     return response.result;
   }
 
-  /** Waits out one replay request and applies its result if it is still the one being waited on. */
-  private async awaitJump(request: ReplayRequest): Promise<void> {
+  /** Waits out one replay request and applies its result if it is still the one being waited on.
+   *  `beforeLanding` runs only for a request that lands, ahead of the mute re-assertion, which then
+   *  reads the mutes it left behind. */
+  private async awaitJump(request: ReplayRequest, beforeLanding?: () => void): Promise<void> {
     let response: ReplayResponse;
     try {
       response = await this.replayRunner.run(request);
@@ -417,6 +430,8 @@ class TuneSessionImpl implements TuneSession {
       return;
     }
 
+    beforeLanding?.();
+
     // The operator can move a mute while the replay is in flight, so what the request carried may
     // already be stale. This has to land before `restoreState` takes the resync snapshot:
     // `restoreValues` re-zeroes exactly the voices the live frame knows about at that moment.
@@ -425,6 +440,9 @@ class TuneSessionImpl implements TuneSession {
       this._frame?.setVoiceMuted(voice, mutes[voice]);
     }
     this.restoreState(response.result.machine, response.result.registers, response.result.frame);
+    // After the restore, so a listener the notification wakes sees the landed state and what it
+    // does in turn is not overwritten by it.
+    if (beforeLanding !== undefined) this.host.markDirty();
   }
 
   restoreState(

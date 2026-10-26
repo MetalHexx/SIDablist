@@ -2,12 +2,34 @@ import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { FrameClockStats } from '../ports/clock.js';
 import type { FarEndConsumption, SinkCapabilities } from '../ports/sink.js';
+import type { SidField } from '../registers/sid-fields.js';
 
 /** A jump the host queued for the end of the running loop's current lap: a loop when
  *  `endFrame` is set, a cue (play on from `startFrame`, no loop) when it is null. */
 export interface QueuedJump {
   readonly startFrame: Frames;
   readonly endFrame: Frames | null;
+}
+
+/** Output-stage settings a jump applies as it lands, in the engine's own terms. It applies
+ *  exactly what it lists and leaves every other setting as it is. Tempo and the momentary voice
+ *  holds are never part of it. */
+export interface JumpSettings {
+  /** Voice 0…2's pitch coefficient, by index — see `setVoicePitch`. A voice past the end of a
+   *  shorter array keeps its own. */
+  readonly voicePitch?: readonly number[];
+  /** Fields offset by a signed amount in their raw units — see `setFieldOffset`; 0 hands one back. */
+  readonly fieldOffsets?: readonly { readonly field: SidField; readonly amount: number }[];
+  /** Fields held at a raw value, `amount` 0…1 (default 1) — see `holdField` — or released when
+   *  `value` is null. */
+  readonly fieldHolds?: readonly {
+    readonly field: SidField;
+    readonly value: number | null;
+    readonly amount?: number;
+  }[];
+  /** Voice 0…2's latched mute, by index — see `setVoiceMuted`. A voice past the end of a
+   *  shorter array keeps its own. */
+  readonly voiceMutes?: readonly boolean[];
 }
 
 /**

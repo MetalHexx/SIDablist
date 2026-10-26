@@ -93,7 +93,12 @@ export {
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
 export { type SidPlayer } from './player/sid-player.js';
-export { type PlayerSnapshot, type PlayerStats, type QueuedJump } from './player/snapshot.js';
+export {
+  type JumpSettings,
+  type PlayerSnapshot,
+  type PlayerStats,
+  type QueuedJump,
+} from './player/snapshot.js';
 export { type PlayerSnapshotStore, createPlayerSnapshotStore } from './player/store.js';
 export {
   JUMP_CEILING_SECONDS,

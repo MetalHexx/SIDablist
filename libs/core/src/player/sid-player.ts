@@ -4,7 +4,7 @@ import type { DetectedLoopFrames } from '../timeline/track-structure.js';
 import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
 import type { SidField } from '../registers/sid-fields.js';
-import type { PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
+import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
@@ -32,7 +32,12 @@ export interface SidPlayer {
   play(): Promise<void>;
   pause(): void;
   stop(): void;
-  seek(frame: Frames): Promise<void>;
+  /** Moves the playhead to `frame`. A target on a held image lands at once; anything else replays
+   *  off this thread and resolves once that request has settled — landed, failed or superseded.
+   *  With `settings`, they are applied as the jump lands: at once for a frame restored from a held
+   *  image, when the replay lands otherwise, and never for a jump that is superseded or discarded
+   *  first. */
+  seek(frame: Frames, settings?: JumpSettings): Promise<void>;
   selectSubtune(song: number): void;
   /** Selects the next subtune, clamped to the tune's range. A no-op at the last subtune. */
   nextSubtune(): void;
@@ -51,8 +56,9 @@ export interface SidPlayer {
    *  jump; null cancels. It lands at the first wrap at which its start frame's snapshot is ready —
    *  until then laps continue — and is dropped by `setActiveLoop`, `stop`, `loadTune` and a subtune
    *  change. Ignored, with a warning, when no loop is running: jump now with `setActiveLoop` and
-   *  `seek` instead. */
-  queueJump(target: QueuedJump | null): void;
+   *  `seek` instead. `target.settings`, when given, are applied as the jump lands, never before,
+   *  and are dropped with the queue. */
+  queueJump(target: (QueuedJump & { readonly settings?: JumpSettings }) | null): void;
   /**
    * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
    * returns the frame it captured (the same frame `getPosition()` reports), or null with nothing
