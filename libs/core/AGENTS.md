@@ -30,10 +30,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
   surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
   queue are published under `tune.preparedFrames`, `tune.queuedJump` and `tune.handOffs`);
-  `queueJump` queues a hand-off for the running loop's next wrap; `capturePosition()` returns the
-  frame it captured. `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for
-  those builds, so a scrub does not wait behind a batch of them; without it they share the scrub
-  runner.
+  `queueJump` queues a hand-off for the running loop's next wrap; `queueJump` and `seek` can carry
+  `JumpSettings`, applied as the jump lands; `capturePosition()` returns the frame it captured.
+  `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for those builds, so a
+  scrub does not wait behind a batch of them; without it they share the scrub runner.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -94,6 +94,22 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   unprepared frame sees the running loop continue. Frame 0 is no exception: an undeclared target
   is replayed off-thread like any other, since a queued hand-off restores only from an image. `tune.handOffs` is how it tells a landing from a
   dropped queue; clearing a queue never touches it.
+- **A landing assigns settings prepared earlier and allocates nothing.** `queueJump` and `seek`
+  validate and resolve a jump's `JumpSettings` when they are called, building the records the
+  coordinator carries once; `applyPreparedSettings` only assigns, because it runs on the frame path.
+  Validating, resolving or building anything at the landing is an allocation on a tick.
+- **A jump's settings go in before its image is restored.** `RegisterFrame.restoreValues` re-zeroes
+  the control register of exactly the voices muted at that moment, so settings applied after the
+  restore leave a voice they unmute at 0 until the tune next writes its control register. A replayed
+  seek carrying settings is seeded with no voice muted for the same reason: a muted seed leaves that
+  voice's control register at 0 in the image, and no restore brings the voice back.
+- **The landing notifies only after the restore, never from inside a hook.** Listeners run
+  synchronously inside `markDirty` and may call straight back into the player, so `QueuedNext`'s
+  `beforeLanding` and `jumpToFrame`'s hook change state and leave the notification to the landing
+  that follows them.
+- **A superseded or discarded seek never applies its settings.** `TuneSession` runs the hook only
+  for the response that is still the outstanding one; anything that discards the jump takes its
+  settings with it.
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
   the shadow makes a cue re-entered at another setting apply it twice.
@@ -130,6 +146,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
   unhandled variant leaves the player's position and the stream out of step without a compile
   error. Handle it there, then run `player/create-sid-player.spec.ts`.
+- **Changed `QueuedNext` or the hand-off order in `advance` (`timeline/active-loop.ts`)?**
+  `queueJump` in `player/create-sid-player.ts` builds the `beforeLanding` hook and relies on it
+  running ahead of the image restore; moved after it, a voice a landing unmutes stays at 0 until the
+  tune writes its control register again, and nothing fails to compile. Update `queueJump`'s hook,
+  then run the `jump settings` specs in `player/create-sid-player.spec.ts` and
+  `timeline/active-loop.spec.ts`. Detail: [`src/player/create-sid-player.ts`](./src/player/create-sid-player.ts)
 - **Changed `ReplayRequest`'s shape (`replay/replay-runner.ts`)?** `replay/replay.worker.ts` unpacks
   the request field by field into `replayToFrame`, and every host `ReplayRunner` implementation
   forwards it in its own way. A field one of them drops compiles fine and degrades quietly: a

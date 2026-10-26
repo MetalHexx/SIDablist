@@ -38,7 +38,7 @@ import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-struc
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
 import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import type { SidPlayer } from './sid-player.js';
-import type { PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
+import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
 import { createTuneSession } from './tune-session.js';
@@ -85,6 +85,37 @@ const LOOP_ENTRY_CACHE_SIZE = 4;
 /** The mutes every prepared build is seeded with. An image taken with a voice muted carries that
  *  voice's control register zeroed, which is wrong for a restore into an unmuted player. */
 const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
+
+/** A field hold as the coordinator carries it into every tune loaded after. */
+interface FieldHoldRecord {
+  readonly field: SidField;
+  readonly value: number;
+  readonly amount: number;
+}
+
+/** A field offset as the coordinator carries it into every tune loaded after. */
+interface FieldOffsetRecord {
+  readonly field: SidField;
+  readonly amount: number;
+}
+
+/**
+ * `JumpSettings` resolved at the call that carried them: every entry validated, every field
+ * resolved to its table index, and every record the coordinator carries built once. Landing them is
+ * then only assignment, which is what keeps it off the allocation budget of the frame it lands on.
+ */
+interface PreparedSettings {
+  readonly pitches: readonly { readonly voice: number; readonly coefficient: number }[];
+  /** An amount of 0 hands the field back. */
+  readonly offsets: readonly { readonly index: number; readonly record: FieldOffsetRecord }[];
+  /** A null record releases the field. */
+  readonly holds: readonly {
+    readonly index: number;
+    readonly field: SidField;
+    readonly record: FieldHoldRecord | null;
+  }[];
+  readonly mutes: readonly { readonly voice: number; readonly muted: boolean }[];
+}
 
 /** What a player is built around: the far end it streams to, the cadence it rides, and the thread a
  *  jump replays on. Every one of them is injected — core constructs none of them. */
@@ -177,15 +208,9 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly registerScales = new Map<ScaledRegisterGroup, number>();
   /** Keyed by the field's table index, so the same field named by two different objects is one
    *  hold. The filter-type override is a hold of `filterType` here and has no state of its own. */
-  private readonly fieldHolds = new Map<
-    number,
-    { readonly field: SidField; readonly value: number; readonly amount: number }
-  >();
+  private readonly fieldHolds = new Map<number, FieldHoldRecord>();
   /** Keyed like `fieldHolds`; an amount of 0 is never stored. */
-  private readonly fieldOffsets = new Map<
-    number,
-    { readonly field: SidField; readonly amount: number }
-  >();
+  private readonly fieldOffsets = new Map<number, FieldOffsetRecord>();
 
   /** The clock pair rather than the ratio it derives, because a fresh `RegisterFrame` is handed the
    *  pair. Null until the application — the only thing that knows what machine is on the far end —
@@ -508,9 +533,16 @@ class SidPlayerCoordinator implements SidPlayer {
    *
    * A target before the start of the tune resolves to frame 0 rather than erroring: a scrub dragged
    * off the left end of the bar is a gesture, not a fault.
+   *
+   * `settings` are prepared here and applied as the jump lands: before the restore on the image
+   * path, so the restore re-zeroes the voices they leave muted, and when the replay lands otherwise.
+   * A replay carrying settings is seeded with no voice muted, since a muted seed would leave that
+   * voice's control register at 0 in the image and no restore could bring the voice back. A jump
+   * that is superseded or discarded never applies them.
    */
-  seek(frame: Frames): Promise<void> {
+  seek(frame: Frames, settings?: JumpSettings): Promise<void> {
     const target = frames(Math.max(0, Math.round(frame)));
+    const prepared = settings === undefined ? null : this.prepareSettings(settings);
     const entry = this.activeLoop.entryImage();
     const image =
       entry !== null && entry.frame === target
@@ -520,10 +552,17 @@ class SidPlayerCoordinator implements SidPlayer {
       // A replay still in flight would land a moment later and move the playhead off what this has
       // just placed — the same supersession `jumpToFrame` gets from claiming the outstanding id.
       this.session.discardOutstandingJump();
+      if (prepared !== null) this.applyPreparedSettings(prepared);
       this.session.restoreState(image.machine, image.registers, image.frame);
+      // Last, for the reason `enforceLoop` gives: a listener may call straight back in.
+      if (prepared !== null) this.markDirty();
       return Promise.resolve();
     }
-    return this.session.jumpToFrame(target);
+    if (prepared === null) return this.session.jumpToFrame(target);
+    return this.session.jumpToFrame(target, {
+      beforeLanding: () => this.applyPreparedSettings(prepared),
+      mutes: NO_VOICES_MUTED,
+    });
   }
 
   selectSubtune(song: number): void {
@@ -577,7 +616,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
-  queueJump(target: QueuedJump | null): void {
+  queueJump(target: (QueuedJump & { readonly settings?: JumpSettings }) | null): void {
     if (target === null) {
       this.queuedJump = null;
       this.activeLoop.queue(null);
@@ -601,11 +640,15 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
 
+    // The published record never carries settings: they live only on the tracker's queued object,
+    // and go when it does.
+    const prepared = target.settings === undefined ? null : this.prepareSettings(target.settings);
     const record: QueuedJump = { startFrame, endFrame };
     this.queuedJump = record;
     this.activeLoop.queue({
       startFrame,
       loop: endFrame === null ? null : { startFrame, endFrame },
+      ...(prepared === null ? {} : { beforeLanding: () => this.applyPreparedSettings(prepared) }),
     });
     this.armQueuedImage(record);
     this.markDirty();
@@ -832,6 +875,108 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     this.fieldOffsets.delete(index);
     this.session.frame?.clearFieldOffset(field);
+  }
+
+  /**
+   * Validates and resolves every entry of `settings` once, so landing them is only assignment. A
+   * refused entry is skipped with the warning its single-field method gives, and the rest still
+   * apply.
+   */
+  private prepareSettings(settings: JumpSettings): PreparedSettings {
+    const pitches: { voice: number; coefficient: number }[] = [];
+    const voicePitch = settings.voicePitch ?? [];
+    for (let voice = 0; voice < Math.min(voicePitch.length, VOICE_COUNT); voice++) {
+      const coefficient = voicePitch[voice];
+      if (!Number.isFinite(coefficient) || coefficient <= 0) {
+        console.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
+        continue;
+      }
+      pitches.push({ voice, coefficient });
+    }
+
+    const offsets: { index: number; record: FieldOffsetRecord }[] = [];
+    for (const { field, amount } of settings.fieldOffsets ?? []) {
+      const index = resolveSidField(field);
+      if (!isUsableOffset(index, amount)) {
+        console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+        continue;
+      }
+      offsets.push({ index, record: { field: { ...field }, amount } });
+    }
+
+    const holds: { index: number; field: SidField; record: FieldHoldRecord | null }[] = [];
+    for (const { field, value, amount } of settings.fieldHolds ?? []) {
+      const index = resolveSidField(field);
+      const carried = { ...field };
+      if (value === null) {
+        if (index < 0) {
+          console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+          continue;
+        }
+        holds.push({ index, field: carried, record: null });
+        continue;
+      }
+      const blend = amount ?? 1;
+      if (!isUsableHold(index, value, blend)) {
+        console.warn(
+          `SID player: ignoring a hold of ${value} (amount ${blend}) on ${describeField(field)}.`,
+        );
+        continue;
+      }
+      holds.push({ index, field: carried, record: { field: carried, value, amount: blend } });
+    }
+
+    const mutes: { voice: number; muted: boolean }[] = [];
+    const voiceMutes = settings.voiceMutes ?? [];
+    for (let voice = 0; voice < Math.min(voiceMutes.length, VOICE_COUNT); voice++) {
+      const muted = voiceMutes[voice];
+      if (typeof muted !== 'boolean') {
+        console.warn(`SID player: ignoring a mute of ${String(muted)} on voice ${voice}.`);
+        continue;
+      }
+      mutes.push({ voice, muted });
+    }
+
+    return { pitches, offsets, holds, mutes };
+  }
+
+  /**
+   * Lands `prepared` on the coordinator's carried state and on the live frame, exactly as the
+   * single-field methods do, so the next `loadTune` carries what landed. Builds no object, array or
+   * closure and notifies no one: it runs on the frame path, ahead of the image restore that
+   * re-zeroes the voices these mutes leave muted, and the landing's own `markDirty` follows the
+   * restore.
+   */
+  private applyPreparedSettings(prepared: PreparedSettings): void {
+    const frame = this.session.frame;
+    const { pitches, offsets, holds, mutes } = prepared;
+
+    for (const { voice, coefficient } of pitches) {
+      this.voicePitch[voice] = coefficient;
+      frame?.setVoicePitch(voice, coefficient);
+    }
+    for (const { index, record } of offsets) {
+      if (record.amount === 0) {
+        this.fieldOffsets.delete(index);
+        frame?.clearFieldOffset(record.field);
+      } else {
+        this.fieldOffsets.set(index, record);
+        frame?.setFieldOffset(record.field, record.amount);
+      }
+    }
+    for (const { index, field, record } of holds) {
+      if (record === null) {
+        this.fieldHolds.delete(index);
+        frame?.releaseField(field);
+      } else {
+        this.fieldHolds.set(index, record);
+        frame?.holdField(field, record.value, record.amount);
+      }
+    }
+    for (const { voice, muted } of mutes) {
+      this.mutedVoices[voice] = muted;
+      frame?.setVoiceMuted(voice, muted !== this.heldVoices[voice]);
+    }
   }
 
   /** Allocates nothing: both buffers are the caller's, and zero-filled by index when no tune is

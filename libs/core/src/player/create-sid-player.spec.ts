@@ -21,6 +21,7 @@ import { frames, microseconds, milliseconds } from '../units.js';
 import type { Microseconds, Milliseconds } from '../units.js';
 import { createSidPlayer } from './create-sid-player.js';
 import type { SidPlayer } from './sid-player.js';
+import type { JumpSettings, QueuedJump } from './snapshot.js';
 
 /**
  * Counts every `runFrame()` call across every `C64Machine` this test file's code creates — the live
@@ -2619,6 +2620,587 @@ describe('createSidPlayer', () => {
 
       expect(player.getSnapshot().tempo).toEqual(tempo);
       expect(player.getStats().rate).toEqual(rate);
+    });
+  });
+
+  describe('jump settings', () => {
+    const VOICE_0_CONTROL = 4;
+    const VOICE_1_FREQUENCY_HIGH = 8;
+    const VOICE_1_CONTROL = 11;
+    const VOLUME_REGISTER = 24;
+    const VOLUME = { name: 'volume' } as const;
+    const PULSE_WIDTH = { name: 'pulseWidth', voice: 0 } as const;
+    const LOOP = { startFrame: frames(100), endFrame: frames(110) };
+
+    /** LDA #value; STA $D4xx. */
+    const poke = (register: number, value: number): number[] => [0xa9, value, 0x8d, register, 0xd4];
+
+    /** play writes voice 0's frequency ($1234), pulse width ($0100) and control ($41), voice 1's
+     *  frequency ($1000) and control, and the volume byte ($0F) on every call: one register of
+     *  each kind a jump's settings reach. */
+    function settingsTune(songs = 1): SidFile {
+      return tune({
+        songs,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          {
+            at: 0x1010,
+            bytes: [
+              ...poke(0x00, 0x34),
+              ...poke(0x01, 0x12),
+              ...poke(0x02, 0x00),
+              ...poke(0x03, 0x01),
+              ...poke(0x04, 0x41),
+              ...poke(0x0b, 0x41),
+              ...poke(0x07, 0x00),
+              ...poke(0x08, 0x10),
+              ...poke(0x18, 0x0f),
+              RTS,
+            ],
+          },
+        ],
+      });
+    }
+
+    /** The registers `settingsTune` writes and the bytes it writes to them. */
+    const HOME: readonly (readonly [number, number])[] = [
+      [0, 0x34],
+      [1, 0x12],
+      [2, 0x00],
+      [3, 0x01],
+      [7, 0x00],
+      [8, 0x10],
+      [24, 0x0f],
+    ];
+
+    /** The registers `frame` carries at a byte other than the tune's own. */
+    const departures = (frame: SidFrame): number[] =>
+      HOME.filter(([register, value]) => {
+        const carried = valueOf(frame, register);
+        return carried !== undefined && carried !== value;
+      }).map(([register]) => register);
+
+    const handOffs = (player: SidPlayer): number | undefined => player.getSnapshot().tune?.handOffs;
+    const queued = (player: SidPlayer): unknown => player.getSnapshot().tune?.queuedJump;
+    const mutedVoices = (player: SidPlayer): boolean[] =>
+      player.getSnapshot().voices.map((voice) => voice.muted);
+
+    function registers(player: SidPlayer): { written: Uint8Array; sent: Uint8Array } {
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      player.readRegisters(written, sent);
+      return { written, sent };
+    }
+
+    function runUntil(clock: FakeClock, done: () => boolean, limit = 400): void {
+      for (let tick = 0; tick < limit && !done(); tick++) run(clock, 1);
+      expect(done()).toBe(true);
+    }
+
+    /** `file` playing inside a ten-frame loop at 100, with 500 and 600 declared and ready. */
+    async function looping(file: SidFile, h: Harness = harness()): Promise<Harness> {
+      h.player.loadTune(file);
+      await h.player.play();
+      h.player.setJumpTargets([frames(500), frames(600)]);
+      h.player.setActiveLoop(LOOP);
+      await flushEntryImageCapture();
+      return h;
+    }
+
+    type Jump = QueuedJump & { readonly settings?: JumpSettings };
+    const jump = (settings?: JumpSettings): Jump => ({
+      startFrame: frames(500),
+      endFrame: frames(520),
+      ...(settings === undefined ? {} : { settings }),
+    });
+
+    /** Ticks until the queued jump lands, then through the gate-off it owes and the resync after
+     *  it. `before` is every frame delivered up to and including the wrap. */
+    function landQueued(h: Harness): { before: SidFrame[]; gateOff: SidFrame; resync: SidFrame } {
+      const first = h.sink.deliveredFrames.length;
+      runUntil(h.clock, () => handOffs(h.player) === 1);
+      const before = h.sink.deliveredFrames.slice(first).map(({ frame }) => frame);
+      run(h.clock, 2);
+      const [gateOff, resync] = h.sink.deliveredFrames.slice(-2).map(({ frame }) => frame);
+      return { before, gateOff, resync };
+    }
+
+    async function landedWith(
+      settings: JumpSettings,
+      h?: Harness,
+    ): Promise<{ h: Harness; before: SidFrame[]; gateOff: SidFrame; resync: SidFrame }> {
+      const looped = await looping(settingsTune(), h);
+      looped.player.queueJump(jump(settings));
+      return { h: looped, ...landQueued(looped) };
+    }
+
+    describe('on a queued hand-off', () => {
+      it('applies a pitch, an offset, a hold and a mute in the resync after the gate-off, and on no frame before it', async () => {
+        const h = await looping(settingsTune());
+        h.player.queueJump(
+          jump({
+            voicePitch: [2],
+            fieldOffsets: [{ field: PULSE_WIDTH, amount: 512 }],
+            fieldHolds: [{ field: VOLUME, value: 5 }],
+            voiceMutes: [false, true],
+          }),
+        );
+        expect(mutedVoices(h.player)).toEqual([false, false, false]);
+
+        const { before, gateOff, resync } = landQueued(h);
+
+        expect(before.length).toBeGreaterThan(0);
+        expect(before.flatMap(departures)).toEqual([]);
+        expect(gateOff.count).toBe(VOICE_CONTROL_REGISTERS.length);
+        expect(departures(gateOff)).toEqual([]);
+        expect(resync.count).toBe(25);
+        expect([valueOf(resync, 0), valueOf(resync, 1)]).toEqual([0x68, 0x24]);
+        expect([valueOf(resync, 2), valueOf(resync, 3)]).toEqual([0x00, 0x03]);
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x05);
+        expect(valueOf(resync, VOICE_0_CONTROL)).toBe(0x41);
+        expect(valueOf(resync, VOICE_1_CONTROL)).toBe(0);
+        expect(mutedVoices(h.player)).toEqual([false, true, false]);
+      });
+
+      it('keeps the shadow as the tune wrote it, shaping only the bytes sent', async () => {
+        const { h } = await landedWith({
+          voicePitch: [2],
+          fieldOffsets: [{ field: PULSE_WIDTH, amount: 512 }],
+        });
+        run(h.clock, 1);
+
+        const { written, sent } = registers(h.player);
+
+        expect([written[0], written[1], written[2], written[3]]).toEqual([0x34, 0x12, 0x00, 0x01]);
+        expect([sent[0], sent[1], sent[2], sent[3]]).toEqual([0x68, 0x24, 0x00, 0x03]);
+      });
+
+      it('leaves every setting the jump does not list as it was', async () => {
+        const h = await looping(settingsTune());
+        h.player.setVoicePitch(1, 3);
+        h.player.holdField(VOLUME, 3);
+        h.player.setVoiceMuted(1, true);
+        h.player.queueJump(jump({ voicePitch: [2], voiceMutes: [false] }));
+
+        const { resync } = landQueued(h);
+
+        expect(valueOf(resync, 1)).toBe(0x24);
+        expect(valueOf(resync, VOICE_1_FREQUENCY_HIGH)).toBe(0x30);
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x03);
+        expect(valueOf(resync, VOICE_1_CONTROL)).toBe(0);
+        expect(mutedVoices(h.player)).toEqual([false, true, false]);
+      });
+
+      it('releases a hold and hands an offset back when the settings say so', async () => {
+        const h = await looping(settingsTune());
+        h.player.holdField(VOLUME, 3);
+        h.player.setFieldOffset(PULSE_WIDTH, 256);
+        h.player.queueJump(
+          jump({
+            fieldHolds: [{ field: VOLUME, value: null }],
+            fieldOffsets: [{ field: PULSE_WIDTH, amount: 0 }],
+          }),
+        );
+
+        const { resync } = landQueued(h);
+        h.player.loadTune(settingsTune());
+        await h.player.play();
+        run(h.clock, 1);
+
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x0f);
+        expect(valueOf(resync, 3)).toBe(0x01);
+        expect(departures(lastDelivered(h.sink))).toEqual([]);
+      });
+
+      it('blends a hold by its amount', async () => {
+        const { resync } = await landedWith({
+          fieldHolds: [{ field: VOLUME, value: 5, amount: 0.5 }],
+        });
+
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x0a);
+      });
+
+      it('leaves a voice a button holds to latched XOR held', async () => {
+        const h = await looping(heldNoteTune());
+        h.player.setVoiceHeld(0, true);
+        h.player.queueJump(jump({ voiceMutes: [true] }));
+
+        const { resync } = landQueued(h);
+
+        expect(valueOf(resync, VOICE_0_CONTROL)).toBe(0x41);
+        expect(h.player.getSnapshot().voices[0]).toEqual({ muted: true, held: true });
+      });
+
+      it('carries what landed into the next tune loaded', async () => {
+        const { h } = await landedWith({
+          voicePitch: [2],
+          fieldOffsets: [{ field: PULSE_WIDTH, amount: 512 }],
+          fieldHolds: [{ field: VOLUME, value: 5 }],
+        });
+
+        h.player.loadTune(settingsTune());
+        await h.player.play();
+        run(h.clock, 1);
+
+        const frame = lastDelivered(h.sink);
+        expect([valueOf(frame, 0), valueOf(frame, 1)]).toEqual([0x68, 0x24]);
+        expect(valueOf(frame, 3)).toBe(0x03);
+        expect(valueOf(frame, VOLUME_REGISTER)).toBe(0x05);
+      });
+
+      it('warns about each refused entry when the jump is queued, once, and applies the rest', async () => {
+        const warn = vi.spyOn(console, 'warn');
+        const h = await looping(settingsTune());
+        warn.mockClear();
+
+        h.player.queueJump(
+          jump({
+            voicePitch: [2, -1],
+            fieldOffsets: [
+              { field: { name: 'gate', voice: 0 }, amount: 1 },
+              { field: PULSE_WIDTH, amount: 512 },
+            ],
+            fieldHolds: [
+              { field: { name: 'cutoff' }, value: 5000 },
+              { field: { name: 'pulseWidth', voice: 3 }, value: null },
+              { field: VOLUME, value: 5 },
+            ],
+          }),
+        );
+        expect(warn).toHaveBeenCalledTimes(4);
+        for (const [message] of warn.mock.calls) {
+          expect(message).toEqual(expect.stringContaining('SID player: ignoring'));
+        }
+        const { resync } = landQueued(h);
+
+        expect(warn).toHaveBeenCalledTimes(4);
+        expect(valueOf(resync, 1)).toBe(0x24);
+        expect(valueOf(resync, VOICE_1_FREQUENCY_HIGH)).toBe(0x10);
+        expect(valueOf(resync, 3)).toBe(0x03);
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x05);
+      });
+
+      it('publishes the queued record as it always was, and counts a landing and nothing else', async () => {
+        const h = await looping(settingsTune());
+
+        h.player.queueJump(jump({ voicePitch: [2] }));
+        expect(queued(h.player)).toStrictEqual({ startFrame: 500, endFrame: 520 });
+        h.player.queueJump(jump({ voicePitch: [3] }));
+        h.player.queueJump(null);
+        h.player.queueJump(jump({ voicePitch: [2] }));
+        expect(handOffs(h.player)).toBe(0);
+
+        landQueued(h);
+
+        expect(handOffs(h.player)).toBe(1);
+        expect(queued(h.player)).toBeNull();
+      });
+
+      it('notifies once on the landing, with the changed mute and the new loop already in place', async () => {
+        const h = await looping(settingsTune());
+        h.player.queueJump(jump({ voiceMutes: [true] }));
+        const seen: unknown[] = [];
+        h.player.subscribe(() => {
+          const { loop, tune: published, voices } = h.player.getSnapshot();
+          seen.push({ loop, handOffs: published?.handOffs, muted: voices[0].muted });
+        });
+
+        landQueued(h);
+
+        expect(seen).toEqual([
+          { loop: { startFrame: 500, endFrame: 520 }, handOffs: 1, muted: true },
+        ]);
+      });
+
+      it('lets a seek made from the landing notification stand, after seeing the landed state', async () => {
+        const h = await looping(settingsTune());
+        h.player.queueJump(jump({ voicePitch: [2] }));
+        let seen: unknown = null;
+        const unsubscribe = h.player.subscribe(() => {
+          if (handOffs(h.player) !== 1) return;
+          unsubscribe();
+          seen = { position: h.player.getPosition(), pitch: registers(h.player).sent[1] };
+          h.player.setActiveLoop({ startFrame: frames(600), endFrame: frames(630) });
+          void h.player.seek(frames(600), { voicePitch: [3] });
+        });
+
+        runUntil(h.clock, () => handOffs(h.player) === 1);
+        run(h.clock, 2);
+
+        expect(seen).toEqual({ position: 500, pitch: 0x24 });
+        expect(h.player.getPosition()).toBe(601);
+        const resync = lastDelivered(h.sink);
+        expect([valueOf(resync, 0), valueOf(resync, 1)]).toEqual([0x9c, 0x36]);
+      });
+
+      it('lets a loop set from the landing notification stand, with the landed settings in force', async () => {
+        const h = await looping(settingsTune());
+        h.player.queueJump(jump({ voicePitch: [2] }));
+        const loop = { startFrame: frames(600), endFrame: frames(630) };
+        const unsubscribe = h.player.subscribe(() => {
+          if (handOffs(h.player) !== 1) return;
+          unsubscribe();
+          h.player.setActiveLoop(loop);
+        });
+
+        runUntil(h.clock, () => handOffs(h.player) === 1);
+        run(h.clock, 2);
+
+        expect(h.player.getSnapshot().loop).toEqual(loop);
+        expect(valueOf(lastDelivered(h.sink), 1)).toBe(0x24);
+      });
+
+      it('leaves the tempo and the rate alone', async () => {
+        const h = harness();
+        h.player.setTempo(1.5);
+        await looping(settingsTune(), h);
+        const tempo = h.player.getSnapshot().tempo;
+        const rate = h.player.getStats().rate;
+        h.player.queueJump(jump({ voicePitch: [2], voiceMutes: [true] }));
+
+        landQueued(h);
+
+        expect(h.player.getSnapshot().tempo).toEqual(tempo);
+        expect(h.player.getStats().rate).toEqual(rate);
+      });
+
+      it.each([
+        ['a replace by a jump without settings', (p: SidPlayer) => p.queueJump(jump())],
+        ['a cancel', (p: SidPlayer) => p.queueJump(null)],
+        ['setActiveLoop', (p: SidPlayer) => p.setActiveLoop(LOOP)],
+        ['a stop', (p: SidPlayer) => p.stop()],
+        ['a tune load', (p: SidPlayer) => p.loadTune(settingsTune(2))],
+        ['a subtune change', (p: SidPlayer) => p.selectSubtune(2)],
+      ])('drops the settings queued with a jump on %s', async (_, clear) => {
+        const h = await looping(settingsTune(2));
+        h.player.queueJump(jump({ voicePitch: [2], voiceMutes: [true] }));
+
+        clear(h.player);
+        await h.player.play();
+        h.player.setJumpTargets([frames(500)]);
+        h.player.setActiveLoop(LOOP);
+        await flushEntryImageCapture();
+        h.player.queueJump(jump());
+        const { resync } = landQueued(h);
+
+        expect(valueOf(resync, 1)).toBe(0x12);
+        expect(mutedVoices(h.player)).toEqual([false, false, false]);
+      });
+
+      it('applies the replacing jump’s settings and not the replaced one’s', async () => {
+        const h = await looping(settingsTune());
+        h.player.queueJump(jump({ voicePitch: [2], fieldHolds: [{ field: VOLUME, value: 5 }] }));
+        h.player.queueJump(jump({ voicePitch: [3] }));
+
+        const { resync } = landQueued(h);
+
+        expect([valueOf(resync, 0), valueOf(resync, 1)]).toEqual([0x9c, 0x36]);
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x0f);
+      });
+    });
+
+    describe('on an immediate seek', () => {
+      it.each([
+        ['a declared frame that is ready', 500],
+        ['the active loop’s own start', 100],
+      ])(
+        'applies the settings of a seek to %s before the next frame is delivered',
+        async (_, target) => {
+          const h = await looping(settingsTune());
+          const requests = h.replay.requests.length;
+          const delivered = h.sink.deliveredFrames.length;
+
+          const pending = h.player.seek(frames(target), {
+            voicePitch: [2],
+            fieldOffsets: [{ field: PULSE_WIDTH, amount: 512 }],
+            fieldHolds: [{ field: VOLUME, value: 5 }],
+            voiceMutes: [false, true],
+          });
+
+          const { sent } = registers(h.player);
+          expect([sent[1], sent[3], sent[VOLUME_REGISTER]]).toEqual([0x24, 0x03, 0x05]);
+          expect(mutedVoices(h.player)).toEqual([false, true, false]);
+          await pending;
+          expect(h.player.getPosition()).toBe(target);
+          expect(h.replay.requests).toHaveLength(requests);
+          expect(h.sink.deliveredFrames).toHaveLength(delivered);
+          run(h.clock, 2);
+          const resync = lastDelivered(h.sink);
+          expect(resync.count).toBe(25);
+          expect([
+            valueOf(resync, 1),
+            valueOf(resync, 3),
+            valueOf(resync, VOLUME_REGISTER),
+          ]).toEqual([0x24, 0x03, 0x05]);
+          expect(valueOf(resync, VOICE_1_CONTROL)).toBe(0);
+        },
+      );
+
+      it('notifies once, after the restore, with the changed mute', async () => {
+        const h = await looping(settingsTune());
+        const seen: unknown[] = [];
+        h.player.subscribe(() => {
+          seen.push({
+            position: h.player.getPosition(),
+            pitch: registers(h.player).sent[1],
+            muted: mutedVoices(h.player),
+          });
+        });
+
+        await h.player.seek(frames(500), { voicePitch: [2], voiceMutes: [false, true] });
+
+        expect(seen).toEqual([{ position: 500, pitch: 0x24, muted: [false, true, false] }]);
+      });
+
+      it('applies nothing and notifies no one when it carries no settings', async () => {
+        const h = await looping(settingsTune());
+        const listener = vi.fn();
+        h.player.subscribe(listener);
+
+        await h.player.seek(frames(500));
+
+        expect(listener).not.toHaveBeenCalled();
+        expect(registers(h.player).sent[1]).toBe(0x12);
+      });
+    });
+
+    describe('on a replayed seek', () => {
+      it('applies the settings when the replay lands, and not while it is in flight', async () => {
+        const h = await looping(settingsTune());
+        h.replay.manual = true;
+
+        const pending = h.player.seek(frames(300), { voicePitch: [2], voiceMutes: [true] });
+        run(h.clock, 2);
+        expect(registers(h.player).sent[1]).toBe(0x12);
+        expect(mutedVoices(h.player)).toEqual([false, false, false]);
+        h.replay.resolveAll();
+        await pending;
+
+        expect(h.player.getPosition()).toBe(300);
+        expect(registers(h.player).sent[1]).toBe(0x24);
+        expect(mutedVoices(h.player)).toEqual([true, false, false]);
+      });
+
+      it('notifies once, after the restore, with the changed mute', async () => {
+        const h = await looping(settingsTune());
+        const seen: unknown[] = [];
+        h.player.subscribe(() => {
+          seen.push({
+            position: h.player.getPosition(),
+            pitch: registers(h.player).sent[1],
+            muted: mutedVoices(h.player),
+          });
+        });
+
+        await h.player.seek(frames(300), { voicePitch: [2], voiceMutes: [true] });
+
+        expect(seen).toEqual([{ position: 300, pitch: 0x24, muted: [true, false, false] }]);
+      });
+
+      it('seeds the replay with no voice muted, and seeds as it always did without settings', async () => {
+        const h = await looping(settingsTune());
+        h.player.setVoiceMuted(0, true);
+
+        await h.player.seek(frames(300), { voicePitch: [2] });
+        expect(h.replay.requests.at(-1)?.mutes).toEqual([false, false, false]);
+
+        await h.player.seek(frames(350));
+        expect(h.replay.requests.at(-1)?.mutes).toEqual([true, false, false]);
+      });
+
+      it('never applies the settings of a seek a later seek superseded', async () => {
+        const h = await looping(settingsTune());
+        h.replay.manual = true;
+
+        const first = h.player.seek(frames(300), {
+          fieldHolds: [{ field: VOLUME, value: 5 }],
+          voiceMutes: [true],
+        });
+        const second = h.player.seek(frames(350), { voicePitch: [2] });
+        h.replay.resolveAll();
+        await Promise.all([first, second]);
+
+        expect(h.player.getPosition()).toBe(350);
+        run(h.clock, 2);
+        const resync = lastDelivered(h.sink);
+        expect(valueOf(resync, 1)).toBe(0x24);
+        expect(valueOf(resync, VOLUME_REGISTER)).toBe(0x0f);
+        expect(mutedVoices(h.player)).toEqual([false, false, false]);
+      });
+
+      it.each([
+        ['a stop', (p: SidPlayer) => p.stop()],
+        ['a tune load', (p: SidPlayer) => p.loadTune(settingsTune(2))],
+        ['a subtune change', (p: SidPlayer) => p.selectSubtune(2)],
+        ['a seek to a ready frame', (p: SidPlayer) => void p.seek(frames(500))],
+      ])('never applies the settings of a seek that %s discarded', async (_, discard) => {
+        const h = await looping(settingsTune(2));
+        h.replay.manual = true;
+
+        const pending = h.player.seek(frames(300), { voicePitch: [2], voiceMutes: [true] });
+        discard(h.player);
+        h.replay.resolveAll();
+        await pending;
+        await h.player.play();
+        run(h.clock, 3);
+
+        expect(registers(h.player).sent[1]).toBe(0x12);
+        expect(mutedVoices(h.player)).toEqual([false, false, false]);
+      });
+    });
+
+    describe('a voice a landing mutes or unmutes', () => {
+      type Landing = (h: Harness, settings: JumpSettings) => SidFrame | Promise<SidFrame>;
+      const landings: [string, Landing][] = [
+        [
+          'a queued hand-off',
+          (h, settings) => {
+            h.player.queueJump(jump(settings));
+            return landQueued(h).resync;
+          },
+        ],
+        [
+          'a seek to a ready frame',
+          async (h, settings) => {
+            await h.player.seek(frames(500), settings);
+            run(h.clock, 2);
+            return lastDelivered(h.sink);
+          },
+        ],
+        [
+          'a replayed seek',
+          async (h, settings) => {
+            await h.player.seek(frames(300), settings);
+            run(h.clock, 2);
+            return lastDelivered(h.sink);
+          },
+        ],
+      ];
+
+      it.each(landings)(
+        'sounds a voice unmuted by %s from the image’s control register in the resync frame',
+        async (_, land) => {
+          const h = await looping(heldNoteTune());
+          h.player.setVoiceMuted(0, true);
+
+          const resync = await land(h, { voiceMutes: [false] });
+
+          expect(resync.count).toBe(25);
+          expect(valueOf(resync, VOICE_0_CONTROL)).toBe(0x41);
+          expect(mutedVoices(h.player)).toEqual([false, false, false]);
+        },
+      );
+
+      it.each(landings)('keeps a voice muted by %s silent from the landing on', async (_, land) => {
+        const h = await looping(heldNoteTune());
+
+        const resync = await land(h, { voiceMutes: [true] });
+        run(h.clock, 3);
+
+        expect(valueOf(resync, VOICE_0_CONTROL)).toBe(0);
+        expect(registers(h.player).sent[VOICE_0_CONTROL]).toBe(0);
+        expect(mutedVoices(h.player)).toEqual([true, false, false]);
+      });
     });
   });
 });

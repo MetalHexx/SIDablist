@@ -1,18 +1,19 @@
-import type { LoopMarker } from '../loop-marker.js';
+import type { LoopMarker, PlainValue } from '../loop-marker.js';
 import type { LoopPositionsStore } from '../ports.js';
 import type { TuneIdentity } from '../identity.js';
 
 /**
  * A `Map`-backed `LoopPositionsStore`: the session implementation a host supplies until a permanent
  * one replaces it behind the same port, and a handy stand-in in consumers' specs. Lists are copied
- * on the way in and on the way out, so no caller can change what is stored by mutating its array.
+ * on the way in and on the way out, so no caller can change what is stored by mutating its array,
+ * and a marker's `settings` are deep-copied both ways, so no two lists share a reference into them.
  */
 export class InMemoryLoopPositionsStore implements LoopPositionsStore {
   private readonly markersByKey = new Map<string, readonly LoopMarker[]>();
 
   async load(identity: TuneIdentity): Promise<readonly LoopMarker[]> {
     const markers = this.markersByKey.get(`${identity.sidHash}:${identity.subtune}`);
-    return Object.freeze([...(markers ?? [])]);
+    return Object.freeze((markers ?? []).map(copyMarker));
   }
 
   async save(identity: TuneIdentity, markers: readonly LoopMarker[]): Promise<void> {
@@ -21,6 +22,20 @@ export class InMemoryLoopPositionsStore implements LoopPositionsStore {
       this.markersByKey.delete(key);
       return;
     }
-    this.markersByKey.set(key, Object.freeze([...markers]));
+    this.markersByKey.set(key, Object.freeze(markers.map(copyMarker)));
   }
+}
+
+/** `marker` with its `settings` copied; a marker that keeps none is returned as it is. */
+function copyMarker(marker: LoopMarker): LoopMarker {
+  return marker.settings === undefined ? marker : { ...marker, settings: copy(marker.settings) };
+}
+
+/** A deep copy of plain data: arrays and plain objects are rebuilt, primitives returned as they are. */
+function copy(value: PlainValue): PlainValue {
+  if (Array.isArray(value)) return (value as readonly PlainValue[]).map(copy);
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, copy(entry)]));
+  }
+  return value;
 }

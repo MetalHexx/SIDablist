@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createC64Machine, type C64Machine, type MachineSnapshot } from '../cpu/c64-machine.js';
 import {
   createRegisterFrame,
@@ -305,6 +305,83 @@ describe('createActiveLoopTracker', () => {
       tracker.queue({ startFrame: frames(80), loop: null });
       play(90);
       expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+    });
+  });
+
+  describe('a queued hand-off’s beforeLanding', () => {
+    const imageAt = (at: number): PositionAnchor => ({
+      frame: frames(at),
+      ...runUnbrokenTo(frames(at)),
+    });
+
+    it('is called once, before the queued image is restored, and not on a lap of the new loop', () => {
+      const restore = vi.spyOn(machine, 'restore');
+      const restoreValues = vi.spyOn(registers, 'restoreValues');
+      const beforeLanding = vi.fn();
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({
+        startFrame: frames(60),
+        loop: { startFrame: frames(60), endFrame: frames(90) },
+        beforeLanding,
+      });
+      tracker.setQueuedImage(imageAt(60));
+      play(100);
+
+      const result = tracker.advance(machine, registers, ring, track, frames(100));
+
+      expect(result).toEqual({ action: 'handed-off', frame: 60 });
+      expect(beforeLanding).toHaveBeenCalledTimes(1);
+      expect(beforeLanding.mock.invocationCallOrder[0]).toBeLessThan(
+        restore.mock.invocationCallOrder[0],
+      );
+      expect(beforeLanding.mock.invocationCallOrder[0]).toBeLessThan(
+        restoreValues.mock.invocationCallOrder[0],
+      );
+
+      play(30);
+      expect(tracker.advance(machine, registers, ring, track, frames(90)).action).toBe('looped');
+      expect(beforeLanding).toHaveBeenCalledTimes(1);
+    });
+
+    it('is not called on a lap while the queued target has no image, only on the landing', () => {
+      const beforeLanding = vi.fn();
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({ startFrame: frames(60), loop: null, beforeLanding });
+      play(100);
+
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+      expect(beforeLanding).not.toHaveBeenCalled();
+
+      play(90);
+      tracker.setQueuedImage(imageAt(60));
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe(
+        'handed-off',
+      );
+      expect(beforeLanding).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['a cancel', (next: ActiveLoopTracker) => next.queue(null)],
+      [
+        'a replace',
+        (next: ActiveLoopTracker) => next.queue({ startFrame: frames(70), loop: null }),
+      ],
+      [
+        'a set',
+        (next: ActiveLoopTracker) => next.set({ startFrame: frames(10), endFrame: frames(100) }),
+      ],
+    ])('is never called once the queue that carried it has gone to %s', (_, drop) => {
+      const beforeLanding = vi.fn();
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({ startFrame: frames(60), loop: null, beforeLanding });
+      tracker.setQueuedImage(imageAt(60));
+
+      drop(tracker);
+      tracker.setQueuedImage(imageAt(70));
+      play(100);
+      tracker.advance(machine, registers, ring, track, frames(100));
+
+      expect(beforeLanding).not.toHaveBeenCalled();
     });
   });
 });

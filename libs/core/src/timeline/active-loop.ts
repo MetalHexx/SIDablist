@@ -26,6 +26,10 @@ export type AdvanceResult =
 export interface QueuedNext {
   readonly startFrame: Frames;
   readonly loop: ActiveLoop;
+  /** Called once, on the hand-off frame, immediately before the queued image is restored —
+   *  never on a lap, a cancel, a replace or a clear. Built by the caller when it queues, so the
+   *  hand-off allocates nothing for it. */
+  readonly beforeLanding?: () => void;
 }
 
 /** Holds the loop presently running and enforces it, frame by frame, against the track it plays
@@ -70,8 +74,9 @@ export interface ActiveLoopTracker {
    *
    * Reaching the active loop's end re-enters its start — through the entry image if one is held,
    * else by seeking along the anchor path — and reports the frame landed on. With a jump queued and
-   * its image held, it restores that image instead, makes the queued loop (or none, for a cue) the
-   * active one, empties the queue and reports `handed-off` at the frame landed on.
+   * its image held, it calls the queued jump's `beforeLanding`, restores that image instead, makes
+   * the queued loop (or none, for a cue) the active one, empties the queue and reports `handed-off`
+   * at the frame landed on.
    *
    * Reaching the track's end with no active loop set decides between replaying and stopping per
    * `track.repeatEnabled()`: off stops, leaving the pair exactly where it stands — what stopping
@@ -144,6 +149,7 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
         if (framesRendered < loop.endFrame) return { action: 'none' };
         if (queued !== null && queuedImage !== null) {
           const image = queuedImage;
+          queued.beforeLanding?.();
           machine.restore(image.machine);
           frame.restoreValues(image.registers);
           loop = queued.loop;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { LoopMarker } from '../loop-marker.js';
+import type { LoopMarker, PlainValue } from '../loop-marker.js';
 import type { TuneIdentity } from '../identity.js';
 import { InMemoryLoopPositionsStore } from './in-memory-loop-positions-store.js';
 
@@ -75,5 +75,101 @@ describe('InMemoryLoopPositionsStore', () => {
 
     expect(first).not.toBe(second);
     expect(second).toEqual([marker('a', 100)]);
+  });
+
+  describe('marker settings', () => {
+    interface Shape {
+      [key: string]: PlainValue;
+      gains: number[];
+      nested: { label: string; flags: (boolean | null)[] };
+    }
+
+    const asShape = (settings: PlainValue | undefined): Shape => settings as Shape;
+
+    function withSettings(id: string, settings: Shape): LoopMarker {
+      return { ...marker(id, 100), settings, usesOwnSettings: true };
+    }
+
+    const settingsOf = (loaded: readonly LoopMarker[]): Shape => asShape(loaded[0].settings);
+
+    it('round-trips settings and the own-settings flag', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      const saved = withSettings('a', {
+        gains: [1, 0.5],
+        nested: { label: 'x', flags: [true, null] },
+      });
+
+      await store.save(IDENTITY, [saved]);
+
+      expect(await store.load(IDENTITY)).toEqual([saved]);
+    });
+
+    it('keeps settings kept apart from the flag, and the flag false', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      const saved: LoopMarker = {
+        ...marker('a', 100),
+        settings: { kept: 1 },
+        usesOwnSettings: false,
+      };
+
+      await store.save(IDENTITY, [saved]);
+
+      const [loaded] = await store.load(IDENTITY);
+      expect(loaded.settings).toEqual({ kept: 1 });
+      expect(loaded.usesOwnSettings).toBe(false);
+    });
+
+    it('is not changed by mutating the nested settings passed to save', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      const passed = withSettings('a', { gains: [1], nested: { label: 'x', flags: [true] } });
+
+      await store.save(IDENTITY, [passed]);
+      const shape = asShape(passed.settings);
+      shape.gains.push(2);
+      shape.nested.flags[0] = false;
+
+      expect(settingsOf(await store.load(IDENTITY))).toEqual({
+        gains: [1],
+        nested: { label: 'x', flags: [true] },
+      });
+    });
+
+    it('hands back settings that share nothing with the stored ones or with another load', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      await store.save(IDENTITY, [
+        withSettings('a', { gains: [1], nested: { label: 'x', flags: [true] } }),
+      ]);
+
+      const first = settingsOf(await store.load(IDENTITY));
+      first.gains.push(2);
+      first.nested.flags[0] = false;
+      const second = settingsOf(await store.load(IDENTITY));
+
+      expect(second).toEqual({ gains: [1], nested: { label: 'x', flags: [true] } });
+      expect(second.gains).not.toBe(first.gains);
+      expect(second.nested).not.toBe(first.nested);
+    });
+
+    it('leaves a marker with neither field without either', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      await store.save(IDENTITY, [marker('a', 100)]);
+
+      const [loaded] = await store.load(IDENTITY);
+
+      expect(loaded).toEqual(marker('a', 100));
+      expect('settings' in loaded).toBe(false);
+      expect('usesOwnSettings' in loaded).toBe(false);
+    });
+
+    it('copies a key named __proto__ as data', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      const settings = JSON.parse('{"__proto__": {"polluted": true}}') as PlainValue;
+      await store.save(IDENTITY, [{ ...marker('a', 100), settings }]);
+
+      const [loaded] = await store.load(IDENTITY);
+
+      expect(Object.keys(loaded.settings as object)).toEqual(['__proto__']);
+      expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
+    });
   });
 });

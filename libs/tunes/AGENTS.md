@@ -14,10 +14,11 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
   1-based subtune), `TuneReference` (header facts plus identity, and `referenceFor` that builds
   one from a parsed `SidFile`), `Playable` (bytes plus reference plus index — never one without
   the other).
-- `loop-marker.ts` — `LoopMarker` and `LoopBoundary`: the positions a performer marked in one tune,
-  as plain frame-and-offset numbers. A storage shape only; no engine snapshot or readiness flag
-  belongs on it, since `@sidablist/core` rebuilds snapshots from these positions and never depends
-  on this package.
+- `loop-marker.ts` — `LoopMarker`, `LoopBoundary` and `PlainValue`: the positions a performer marked
+  in one tune, as plain frame-and-offset numbers. The marker also carries `PlainValue` `settings`
+  and `usesOwnSettings`, which the library stores and copies but never reads. A storage shape only;
+  no engine snapshot or readiness flag belongs on it, since `@sidablist/core` rebuilds snapshots
+  from these positions and never depends on this package.
 - `ports.ts` — `TuneStore`, `TuneIndexer` and `LoopPositionsStore`, the seams a host implements.
   `TuneStore` and `LoopPositionsStore` are deliberately dumb: no rules, just storage.
 - `inserter.ts` — `TuneInserter` / `createTuneInserter`: hashes and stores a tune's bytes,
@@ -30,8 +31,9 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
 - `testing/in-memory-tune-store.ts` — `InMemoryTuneStore`, a `Map`-backed `TuneStore` exported
   from the package root the way `core` exports `FakeSink`.
 - `testing/in-memory-loop-positions-store.ts` — `InMemoryLoopPositionsStore`, a `Map`-backed
-  `LoopPositionsStore` that copies lists on save and load. It is the session implementation a host
-  uses until a permanent store replaces it behind the same port, and a stand-in in consumers' specs.
+  `LoopPositionsStore` that copies lists on save and load, and deep-copies each marker's `settings`.
+  It is the session implementation a host uses until a permanent store replaces it behind the same
+  port, and a stand-in in consumers' specs.
 - `__fixtures__/` — a bundled real tune (Still Time) `md5.spec.ts`, `inserter.spec.ts` and
   `resolver.spec.ts` run against. Internal only; never exported from the package root.
 
@@ -64,8 +66,10 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
   implementations before shipping the change.
 - **Changed `LoopMarker` or `LoopBoundary`'s fields?** Every host's permanent `LoopPositionsStore`
   holds markers in this shape, so a field change is a storage-format change, not a refactor —
-  markers already saved stop loading. Grep the host application for `LoopPositionsStore`
-  implementations before shipping the change. Detail: [`src/ports.ts`](./src/ports.ts).
+  markers already saved stop loading. The inner shape of `settings` is the host's to version: a
+  change to it is the host's migration, never this package's. Grep the host application for
+  `LoopPositionsStore` implementations before shipping the change. Detail:
+  [`src/ports.ts`](./src/ports.ts).
 - **Changed what `md5Hex` returns, or how a `sidHash` is derived?** Every previously computed
   `sidHash` stops matching what a fresh insert produces — treat it like a storage key format
   change, not a refactor. `md5.spec.ts`'s HVSC-sourced Still Time digest is the check that this
