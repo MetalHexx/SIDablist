@@ -61,8 +61,6 @@ jobs:
   core-isolated:
     name: core (isolated)
     runs-on: ubuntu-latest
-    env:
-      CORE_DIR: ${{ runner.temp }}/core-isolated
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,6 +69,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      - name: Resolve the isolated directory
+        # The runner context is not available in a job-level env block — GitHub rejects the whole
+        # workflow file, so no job runs and no check ever reports. Resolve it in a step instead;
+        # GITHUB_ENV carries it to every later step, working-directory included.
+        run: echo "CORE_DIR=$RUNNER_TEMP/core-isolated" >> "$GITHUB_ENV"
 
       - name: Copy core outside the workspace
         # The copy is the point: staying inside the repo lets Node's module resolution walk up
