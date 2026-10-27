@@ -1,6 +1,7 @@
 import type { TuneIndexRecord } from '@sidablist/analysis';
 import type { TuneIdentity } from './identity.js';
 import type { LoopMarker } from './loop-marker.js';
+import type { SetSummary, TuneMemory, TuneSet } from './tune-set.js';
 
 /**
  * The dumb storage a host supplies. No rules live here — insertion order, lookup-or-index
@@ -27,4 +28,25 @@ export interface LoopPositionsStore {
   load(identity: TuneIdentity): Promise<readonly LoopMarker[]>;
   /** Replaces the tune's markers with `markers`. An empty list removes the entry. */
   save(identity: TuneIdentity, markers: readonly LoopMarker[]): Promise<void>;
+}
+
+/** The dumb storage for sets. No rules: it never validates, orders or merges. */
+export interface SetStore {
+  /** Every saved set, in no particular order; an empty list when none. */
+  list(): Promise<readonly SetSummary[]>;
+  /** The set saved under `id`, or null when none is. */
+  load(id: string): Promise<TuneSet | null>;
+  /** Replaces the set saved under `set.id`, or saves it new. */
+  save(set: TuneSet): Promise<void>;
+  /** Removes the set saved under `id`; nothing happens when none is saved. */
+  delete(id: string): Promise<void>;
+}
+
+/** The dumb storage for each tune's latest memory, keyed by its hash. No rules: it never
+ *  validates or merges. */
+export interface TuneMemoryStore {
+  /** The memory saved for `sidHash`, or null when none is. */
+  load(sidHash: string): Promise<TuneMemory | null>;
+  /** Replaces the memory saved under `memory.sidHash`, or saves it new. */
+  save(memory: TuneMemory): Promise<void>;
 }

@@ -83,8 +83,9 @@ collections.**
   and voice mutes. Only core sees the landing frame, and the settings must go in before the image
   is restored, so a voice they unmute sounds from the image rather than from silence. Which
   settings a saved loop uses, and where they are kept, stays with the application.
-- The application holds the list of saved cues and loops, their names, their pad assignments, and
-  whether they survive a reload.
+- Marker names, and the model of sets and tune memory, live in `libs/tunes`. The application holds
+  where they are stored, the list of saved cues and loops, their pad assignments, and whether they
+  survive a reload.
 - A cue is a loop without an end marker. Both are _a frame number someone remembered_ plus _an
   operation core performs_. The remembering is application; the performing is core.
 
@@ -99,7 +100,8 @@ Worked examples of the same test:
 | Applying gain and filter scaling, and offsetting or holding chip fields, on registers | core        | Register state on the frame path                |
 
 The `LoopPositionsStore` port that holds a tune's saved loop markers lives in `libs/tunes`; the
-storage behind it is still the application's. Core never imports `tunes`: the application rebuilds
+storage behind it is still the application's. A host that keeps sets implements that port over the
+row a deck holds. Core never imports `tunes`: the application rebuilds
 core's loop snapshots from the stored positions.
 
 ## The output stage

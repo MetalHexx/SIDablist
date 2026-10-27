@@ -1,26 +1,34 @@
 # tunes
 
 The DJ's knowledge of a tune: what one _is_ (`TuneIdentity`, `TuneReference`, `Playable`,
-`LoopMarker`), the ports a host supplies to store and index it (`TuneStore`, `TuneIndexer`,
-`LoopPositionsStore`), and the one rule — index once per hash and subtune, look up before scanning —
-that lives here instead of in every deck that plays a tune.
+`LoopMarker`), the sets and tune memory a performer builds from it (`TuneSet`, `SetRow`,
+`TuneMemory`) with the rules that create, edit and order them, the ports a host supplies to store
+and index it (`TuneStore`, `TuneIndexer`, `LoopPositionsStore`, `SetStore`, `TuneMemoryStore`), and
+the one rule — index once per hash and subtune, look up before scanning — that lives here instead
+of in every deck that plays a tune.
 
 ## How it works
 
 The public surface is `src/index.ts`; nothing under `__fixtures__` or `testing/` is exported from
-it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
+it except the `InMemory*` doubles. `plain-copy.ts` is internal too.
 
 - `identity.ts`, `reference.ts`, `playable.ts` — the values: `TuneIdentity` (content hash plus
   1-based subtune), `TuneReference` (header facts plus identity, and `referenceFor` that builds
   one from a parsed `SidFile`), `Playable` (bytes plus reference plus index — never one without
   the other).
 - `loop-marker.ts` — `LoopMarker`, `LoopBoundary` and `PlainValue`: the positions a performer marked
-  in one tune, as plain frame-and-offset numbers. The marker also carries `PlainValue` `settings`
-  and `usesOwnSettings`, which the library stores and copies but never reads. A storage shape only;
+  in one tune, as plain frame-and-offset numbers. The marker also carries an optional `name`, and
+  `PlainValue` `settings` and `usesOwnSettings`, which the library stores and copies but never reads. A storage shape only;
   no engine snapshot or readiness flag belongs on it, since `@sidablist/core` rebuilds snapshots
   from these positions and never depends on this package.
-- `ports.ts` — `TuneStore`, `TuneIndexer` and `LoopPositionsStore`, the seams a host implements.
-  `TuneStore` and `LoopPositionsStore` are deliberately dumb: no rules, just storage.
+- `tune-set.ts` — `TuneSet`, `SetRow`, `SubtuneMemory`, `TuneMemory` and their companions: the
+  storage shape of a set and of a tune's latest memory.
+- `set-rules.ts` — the pure rules that create, edit and order sets and rows, keep a SID once per
+  set, and turn a row edit into the tune's latest memory.
+- `plain-copy.ts` — the deep copies of plain data, markers, memory, rows and sets that keep rules
+  and doubles from sharing references.
+- `ports.ts` — `TuneStore`, `TuneIndexer`, `LoopPositionsStore`, `SetStore` and `TuneMemoryStore`,
+  the seams a host implements. All but `TuneIndexer` are deliberately dumb: no rules, just storage.
 - `inserter.ts` — `TuneInserter` / `createTuneInserter`: hashes and stores a tune's bytes,
   idempotent by construction.
 - `resolver.ts` — `TuneResolver` / `createTuneResolver`: the lookup-or-index rule, the in-flight
@@ -34,6 +42,8 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
   `LoopPositionsStore` that copies lists on save and load, and deep-copies each marker's `settings`.
   It is the session implementation a host uses until a permanent store replaces it behind the same
   port, and a stand-in in consumers' specs.
+- `testing/in-memory-set-store.ts`, `testing/in-memory-tune-memory-store.ts` — `Map`-backed
+  `SetStore` and `TuneMemoryStore` that deep-copy on save and load.
 - `__fixtures__/` — a bundled real tune (Still Time) `md5.spec.ts`, `inserter.spec.ts` and
   `resolver.spec.ts` run against. Internal only; never exported from the package root.
 
@@ -46,6 +56,9 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
 
 ## Hazards
 
+- **The set rules never read a clock or mint an id.** Ids and `now` come from the caller; a rule
+  that reaches for `Date` or a generator makes every host's sets untestable and its stamps unequal.
+  A change that changes nothing returns its input object, and callers compare on that.
 - **The in-flight de-dup map is per-resolver-instance and rejection clears it.** `resolver.ts`
   keys `Map<string, InFlightEntry>` by `${sidHash}:${subtune}`, where each entry holds the shared
   promise, whether its scan has started, and the `onScanStart` hooks still waiting on it — and
@@ -70,6 +83,9 @@ it except `InMemoryTuneStore` and `InMemoryLoopPositionsStore`.
   change to it is the host's migration, never this package's. Grep the host application for
   `LoopPositionsStore` implementations before shipping the change. Detail:
   [`src/ports.ts`](./src/ports.ts).
+- **Changed `TuneSet`, `SetRow`, `SubtuneMemory` or `TuneMemory`'s shape?** It is a
+  storage-format change for every host's set and tune-memory stores: sets already saved stop
+  loading. `teensyrom-web`'s DJ library DTOs and validator must move with it.
 - **Changed what `md5Hex` returns, or how a `sidHash` is derived?** Every previously computed
   `sidHash` stops matching what a fresh insert produces — treat it like a storage key format
   change, not a refactor. `md5.spec.ts`'s HVSC-sourced Still Time digest is the check that this
