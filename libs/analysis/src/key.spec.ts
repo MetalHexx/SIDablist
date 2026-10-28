@@ -5,7 +5,9 @@ import {
   detectKeyPerSection,
   keyName,
   recoverTuning,
+  sharedScaleNotes,
   soundingKey,
+  type ScaleKey,
 } from './key.js';
 import type { Note } from './notes.js';
 
@@ -28,7 +30,10 @@ const B4 = 2;
 
 const PITCH_CLASS_C = 0;
 const PITCH_CLASS_CSHARP = 1;
+const PITCH_CLASS_E = 4;
+const PITCH_CLASS_F_SHARP = 6;
 const PITCH_CLASS_A = 9;
+const PITCH_CLASS_B = 11;
 
 /** One voice's line, written as [semitones from A4, frames] laid end to end. */
 type Line = readonly (readonly [number, number])[];
@@ -295,6 +300,64 @@ describe('camelotFor', () => {
       expect(camelotFor(tonic, 'minor').slice(0, -1)).toBe(
         camelotFor(tonic + 3, 'major').slice(0, -1),
       );
+    }
+  });
+});
+
+describe('sharedScaleNotes', () => {
+  const major = (tonic: number): ScaleKey => ({ tonic, mode: 'major' });
+  const minor = (tonic: number): ScaleKey => ({ tonic, mode: 'minor' });
+
+  it.each<[string, ScaleKey, ScaleKey, number]>([
+    ['a key with itself shares all seven notes', minor(PITCH_CLASS_A), minor(PITCH_CLASS_A), 7],
+    [
+      'a minor key and its relative major share all seven notes',
+      minor(PITCH_CLASS_A),
+      major(PITCH_CLASS_C),
+      7,
+    ],
+    [
+      'a minor key and the minor a fifth away share six notes',
+      minor(PITCH_CLASS_A),
+      minor(PITCH_CLASS_E),
+      6,
+    ],
+    [
+      'a minor key and the minor a whole step away share five notes',
+      minor(PITCH_CLASS_A),
+      minor(PITCH_CLASS_B),
+      5,
+    ],
+    [
+      'a minor key and the minor a major third away share three notes',
+      minor(PITCH_CLASS_A),
+      minor(PITCH_CLASS_CSHARP),
+      3,
+    ],
+    [
+      'a minor key and its parallel major share four notes',
+      minor(PITCH_CLASS_C),
+      major(PITCH_CLASS_C),
+      4,
+    ],
+    ['keys a tritone apart share two notes', major(PITCH_CLASS_C), major(PITCH_CLASS_F_SHARP), 2],
+  ])('%s', (_name, a, b, expected) => {
+    expect(sharedScaleNotes(a, b)).toBe(expected);
+  });
+
+  it('gives the same answer whichever key is named first, and stays within 0 to 7 for all 24 keys', () => {
+    const keys: ScaleKey[] = [];
+    for (let tonic = 0; tonic < 12; tonic++) {
+      keys.push(major(tonic), minor(tonic));
+    }
+
+    for (const a of keys) {
+      for (const b of keys) {
+        const shared = sharedScaleNotes(a, b);
+        expect(shared).toBe(sharedScaleNotes(b, a));
+        expect(shared).toBeGreaterThanOrEqual(0);
+        expect(shared).toBeLessThanOrEqual(7);
+      }
     }
   });
 });

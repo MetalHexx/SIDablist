@@ -276,6 +276,18 @@ export function scaleFor(tonic: number, mode: 'major' | 'minor'): readonly numbe
   return steps.map((step) => wrapPitchClass(tonic + step));
 }
 
+/** A key as the two facts that name its scale. */
+export interface ScaleKey {
+  readonly tonic: number; // pitch class; any integer, wrapped like scaleFor wraps it
+  readonly mode: 'major' | 'minor';
+}
+
+/** How many of the seven scale notes two keys share, 0–7. Counts notes, not names. */
+export function sharedScaleNotes(a: ScaleKey, b: ScaleKey): number {
+  const inB = new Set(scaleFor(b.tonic, b.mode));
+  return scaleFor(a.tonic, a.mode).filter((pitchClass) => inB.has(pitchClass)).length;
+}
+
 /**
  * Whether a pitch falls outside the key's scale — the overlay's test, folded against the same
  * recovered reference the chroma was built from so the marks and the verdict cannot disagree.
