@@ -150,6 +150,15 @@ describe('InMemoryLoopPositionsStore', () => {
       expect(second.nested).not.toBe(first.nested);
     });
 
+    it('round-trips a marker name', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      const saved: LoopMarker = { ...marker('a', 100), name: 'Drum break' };
+
+      await store.save(IDENTITY, [saved]);
+
+      expect(await store.load(IDENTITY)).toEqual([saved]);
+    });
+
     it('leaves a marker with neither field without either', async () => {
       const store = new InMemoryLoopPositionsStore();
       await store.save(IDENTITY, [marker('a', 100)]);

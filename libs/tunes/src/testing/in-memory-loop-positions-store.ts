@@ -1,4 +1,5 @@
-import type { LoopMarker, PlainValue } from '../loop-marker.js';
+import type { LoopMarker } from '../loop-marker.js';
+import { copyPlain } from '../plain-copy.js';
 import type { LoopPositionsStore } from '../ports.js';
 import type { TuneIdentity } from '../identity.js';
 
@@ -28,14 +29,7 @@ export class InMemoryLoopPositionsStore implements LoopPositionsStore {
 
 /** `marker` with its `settings` copied; a marker that keeps none is returned as it is. */
 function copyMarker(marker: LoopMarker): LoopMarker {
-  return marker.settings === undefined ? marker : { ...marker, settings: copy(marker.settings) };
-}
-
-/** A deep copy of plain data: arrays and plain objects are rebuilt, primitives returned as they are. */
-function copy(value: PlainValue): PlainValue {
-  if (Array.isArray(value)) return (value as readonly PlainValue[]).map(copy);
-  if (typeof value === 'object' && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, copy(entry)]));
-  }
-  return value;
+  return marker.settings === undefined
+    ? marker
+    : { ...marker, settings: copyPlain(marker.settings) };
 }

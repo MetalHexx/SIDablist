@@ -16,6 +16,8 @@ export type PlainValue =
 export interface LoopMarker {
   /** Minted by the host; stable across edits. */
   readonly id: string;
+  /** What the performer called it. Absent: unnamed. */
+  readonly name?: string;
   readonly start: LoopBoundary;
   readonly end: LoopBoundary | null;
   /** 0-based voice numbers, ascending; all three today. */
