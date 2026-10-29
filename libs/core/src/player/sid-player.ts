@@ -3,8 +3,16 @@ import type { SidFile } from '../sid/sid-file.model.js';
 import type { DetectedLoopFrames } from '../timeline/track-structure.js';
 import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
+import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidField } from '../registers/sid-fields.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
+
+/** Called once a tick while in varispeed, before the tick moves the position. `position` is the
+ *  playhead in play calls, fractional; `intervalUs` is this tick's interval. Returns the signed
+ *  rate for this tick, in play calls to advance: 1 is normal speed at the current tempo, 0 holds,
+ *  negative plays backward. A non-finite return reads as 0. Must not allocate or issue a player
+ *  command; pure reads (`getSnapshot`, `getPosition`) are allowed. */
+export type VarispeedRateSource = (position: number, intervalUs: number) => number;
 
 /**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
@@ -36,7 +44,8 @@ export interface SidPlayer {
    *  off this thread and resolves once that request has settled — landed, failed or superseded.
    *  With `settings`, they are applied as the jump lands: at once for a frame restored from a held
    *  image, when the replay lands otherwise, and never for a jump that is superseded or discarded
-   *  first. */
+   *  first. In varispeed it moves the varispeed position at once, clamped to the record, with no
+   *  replay; settings apply at once. */
   seek(frame: Frames, settings?: JumpSettings): Promise<void>;
   selectSubtune(song: number): void;
   /** Selects the next subtune, clamped to the tune's range. A no-op at the last subtune. */
@@ -62,13 +71,27 @@ export interface SidPlayer {
   /**
    * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
    * returns the frame it captured (the same frame `getPosition()` reports), or null with nothing
-   * loaded. When that frame is declared, it is ready at once.
+   * loaded. When that frame is declared, it is ready at once. In varispeed it returns the frame and
+   * caches nothing, since the live machine is not at the position.
    */
   capturePosition(): Frames | null;
   /** What detection found about this tune: its loop, its end, its measured length. The
    *  application supplies it; core turns it into the position basis and the end behaviour. */
   setTrackStructure(loop: DetectedLoopFrames | null): void;
   setRepeatTrack(enabled: boolean): void;
+
+  // Varispeed
+  /** The record of the tune and subtune loaded now, or null to withdraw it. Dropped by `loadTune`
+   *  and by a subtune change that changes the subtune. Refused, with a warning, while in varispeed
+   *  or when its shape is unusable. Notifies. */
+  setRegisterRecord(record: RegisterRecord | null): void;
+  /** Enters varispeed at the current position, or swaps the source when already in it (cancelling
+   *  a handback in progress). False, with no effect, when nothing is loaded, the transport is
+   *  `error`, there is no record, or the position lies past the record. Notifies. */
+  enterVarispeed(source: VarispeedRateSource): boolean;
+  /** Leaves varispeed. Playing: hands back to live playback with no seam. Otherwise: the player is
+   *  left paused at the position. A no-op outside varispeed. Notifies. */
+  leaveVarispeed(): void;
 
   // Rate
   setTempo(multiplier: number): void;

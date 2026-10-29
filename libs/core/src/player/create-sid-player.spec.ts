@@ -5,7 +5,9 @@ import {
   PLAY_BUDGET_FRAMES,
 } from '../cpu/cpu-constants.js';
 import type { FrameClock, FrameClockStats } from '../ports/clock.js';
-import { NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
+import { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from '../registers/clock-ratio.js';
+import { applyFrameToChip, recordFromTune } from '../registers/__fixtures__/record-from-tune.js';
+import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import {
   PAL_FRAME_INTERVAL_US,
@@ -20,7 +22,7 @@ import { FakeSink } from '../testing/fake-sink.js';
 import { frames, microseconds, milliseconds } from '../units.js';
 import type { Microseconds, Milliseconds } from '../units.js';
 import { createSidPlayer } from './create-sid-player.js';
-import type { SidPlayer } from './sid-player.js';
+import type { SidPlayer, VarispeedRateSource } from './sid-player.js';
 import type { JumpSettings, QueuedJump } from './snapshot.js';
 
 /**
@@ -1104,6 +1106,7 @@ describe('createSidPlayer', () => {
         preparedFrames: [],
         queuedJump: null,
         handOffs: 0,
+        recordedFrames: null,
       });
       expect(player.getSnapshot().repeatTrack).toBe(true);
     });
@@ -3200,6 +3203,1035 @@ describe('createSidPlayer', () => {
         expect(valueOf(resync, VOICE_0_CONTROL)).toBe(0);
         expect(registers(h.player).sent[VOICE_0_CONTROL]).toBe(0);
         expect(mutedVoices(h.player)).toEqual([true, false, false]);
+      });
+    });
+  });
+  describe('varispeed', () => {
+    /** HANDBACK_LEAD_SECONDS of a PAL tune, in play calls. */
+    const LEAD = 100;
+
+    /** play bumps a counter in $FB and writes it to voice 0's frequency low byte and pulse width low
+     *  byte, with $01 as the frequency high byte and the gate open: entry e of its record reads
+     *  frequency 0x100 + counter and no retrigger. */
+    function rampTune(songs = 1): SidFile {
+      return tune({
+        songs,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          {
+            at: 0x1010,
+            bytes: [
+              ...[0xe6, 0xfb], // INC $FB
+              ...[0xa5, 0xfb], // LDA $FB
+              ...[0x8d, 0x00, 0xd4], // STA $D400
+              ...[0x8d, 0x02, 0xd4], // STA $D402
+              ...[0xa9, 0x01], // LDA #$01
+              ...[0x8d, 0x01, 0xd4], // STA $D401
+              ...[0xa9, 0x41], // LDA #$41
+              ...[0x8d, 0x04, 0xd4], // STA $D404
+              RTS,
+            ],
+          },
+        ],
+      });
+    }
+
+    /** Odd calls write $40 then $41 to $D404 — a retrigger — and even calls write $40 alone, so the
+     *  gate closes on every second call. The counter rides $D400. */
+    function retriggerTune(): SidFile {
+      return tune({
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          {
+            at: 0x1010,
+            bytes: [
+              ...[0xe6, 0xfb], // INC $FB
+              ...[0xa5, 0xfb], // LDA $FB
+              ...[0x8d, 0x00, 0xd4], // STA $D400
+              ...[0x29, 0x01], // AND #$01
+              ...[0xf0, 0x0b], // BEQ even
+              ...[0xa9, 0x40], // LDA #$40
+              ...[0x8d, 0x04, 0xd4], // STA $D404
+              ...[0xa9, 0x41], // LDA #$41
+              ...[0x8d, 0x04, 0xd4], // STA $D404
+              RTS,
+              ...[0xa9, 0x40], // even: LDA #$40
+              ...[0x8d, 0x04, 0xd4], // STA $D404
+              RTS,
+            ],
+          },
+        ],
+      });
+    }
+
+    interface Held extends Harness {
+      readonly record: RegisterRecord;
+      readonly rate: { value: number };
+      readonly source: VarispeedRateSource;
+    }
+
+    /** A loaded tune with the record of its first `length` play calls, and a source that reads
+     *  `rate.value`. */
+    function withRecord(file: SidFile, length: number): Held {
+      const h = harness();
+      h.player.loadTune(file);
+      const record = recordFromTune(file, 1, length);
+      h.player.setRegisterRecord(record);
+      const rate = { value: 1 };
+      return { ...h, record, rate, source: () => rate.value };
+    }
+
+    function rowOf(record: RegisterRecord, entry: number): Uint8Array {
+      return record.values.slice(entry * SID_REGISTER_COUNT, (entry + 1) * SID_REGISTER_COUNT);
+    }
+
+    /** The chip after a tick at `rate` whose position is at `entry`: the record's row, with voice 0's
+     *  frequency scaled by the rate. */
+    function expectedChip(record: RegisterRecord, entry: number, rate: number): Uint8Array {
+      const chip = rowOf(record, entry);
+      const scaled = Math.min(0xffff, Math.round((chip[0] | (chip[1] << 8)) * Math.abs(rate)));
+      chip[0] = scaled & 0xff;
+      chip[1] = scaled >> 8;
+      return chip;
+    }
+
+    /** The chip image after each delivered frame, applying every frame's entries in order. */
+    function chipsOf(sink: RecordingSink): Uint8Array[] {
+      const chip = new Uint8Array(SID_REGISTER_COUNT);
+      return sink.deliveredFrames.map(({ frame }) => {
+        applyFrameToChip(chip, frame);
+        return chip.slice();
+      });
+    }
+
+    function writesOf(frame: SidFrame): [number, number][] {
+      const writes: [number, number][] = [];
+      for (let index = 0; index < frame.count; index++) {
+        writes.push([frame.registers[index], frame.values[index]]);
+      }
+      return writes;
+    }
+
+    const snapshotOf = (player: SidPlayer): ReturnType<SidPlayer['getSnapshot']> =>
+      player.getSnapshot();
+    const varispeedOn = (player: SidPlayer): boolean => snapshotOf(player).tempo.varispeed;
+    const handOffs = (player: SidPlayer): number | undefined => snapshotOf(player).tune?.handOffs;
+
+    function readSent(player: SidPlayer): { written: Uint8Array; sent: Uint8Array } {
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      player.readRegisters(written, sent);
+      return { written, sent };
+    }
+
+    const clockIsStopped = (clock: FakeClock): boolean => {
+      try {
+        clock.tick(milliseconds(performance.now()));
+        return false;
+      } catch {
+        return true;
+      }
+    };
+
+    describe('the record', () => {
+      it('publishes its length and withdraws it on null', () => {
+        const h = withRecord(rampTune(), 12);
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
+
+        h.player.setRegisterRecord(null);
+
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBeNull();
+      });
+
+      it('refuses a record of an unusable shape, with a warning', () => {
+        const h = withRecord(rampTune(), 12);
+
+        h.player.setRegisterRecord({ ...h.record, values: new Uint8Array(3) });
+
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
+        expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/^SID player:/));
+      });
+
+      it('refuses a record while in varispeed, with a warning', () => {
+        const h = withRecord(rampTune(), 12);
+        h.player.enterVarispeed(h.source);
+
+        h.player.setRegisterRecord(null);
+
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
+        expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/^SID player:/));
+      });
+
+      it('is dropped by loadTune and by a subtune change, and kept by selecting the same subtune', () => {
+        const h = withRecord(rampTune(2), 12);
+
+        h.player.selectSubtune(1);
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
+
+        h.player.selectSubtune(2);
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBeNull();
+
+        h.player.setRegisterRecord(h.record);
+        h.player.loadTune(rampTune());
+        expect(snapshotOf(h.player).tune?.recordedFrames).toBeNull();
+        expect(h.player.enterVarispeed(h.source)).toBe(false);
+      });
+    });
+
+    describe('entering', () => {
+      it('is refused with nothing loaded', () => {
+        const { player } = harness();
+
+        expect(player.enterVarispeed(() => 1)).toBe(false);
+      });
+
+      it('is refused without a record, with no effect', () => {
+        const h = harness();
+        h.player.loadTune(rampTune());
+
+        expect(h.player.enterVarispeed(() => 1)).toBe(false);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.sink.beginCalls).toHaveLength(0);
+        expect(clockIsStopped(h.clock)).toBe(true);
+      });
+
+      it('is refused when the position lies past the record, with no effect', async () => {
+        const h = harness();
+        h.player.loadTune(rampTune());
+        await h.player.play();
+        run(h.clock, 30);
+        h.player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
+        const begins = h.sink.beginCalls.length;
+
+        expect(h.player.enterVarispeed(() => 1)).toBe(false);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.sink.beginCalls).toHaveLength(begins);
+        run(h.clock, 1);
+        expect(h.player.getPosition()).toBe(31);
+      });
+
+      it('is refused from the error transport', async () => {
+        const h = harness();
+        h.player.loadTune(runawayTune());
+        h.player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
+        await h.player.play();
+        run(h.clock, 1);
+        expect(snapshotOf(h.player).transport).toBe('error');
+
+        expect(h.player.enterVarispeed(() => 1)).toBe(false);
+      });
+
+      it('starts the clock and opens the sink from a stopped player, leaving the transport alone', () => {
+        const h = withRecord(rampTune(), 20);
+        const start = vi.spyOn(h.clock, 'start');
+
+        expect(h.player.enterVarispeed(h.source)).toBe(true);
+
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(h.sink.beginCalls).toHaveLength(1);
+        expect(snapshotOf(h.player).transport).toBe('stopped');
+        expect(varispeedOn(h.player)).toBe(true);
+      });
+
+      it('rides the clock a playing player already has, without a begin', async () => {
+        const h = withRecord(rampTune(), 20);
+        const start = vi.spyOn(h.clock, 'start');
+        await h.player.play();
+        run(h.clock, 3);
+
+        expect(h.player.enterVarispeed(h.source)).toBe(true);
+
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(h.sink.beginCalls).toHaveLength(1);
+        run(h.clock, 1);
+        expect(h.player.getPosition()).toBe(4);
+      });
+
+      it('restores all 25 registers on the first frame from a paused player', async () => {
+        const h = withRecord(rampTune(), 20);
+        await h.player.play();
+        run(h.clock, 3);
+        h.player.pause();
+
+        h.player.enterVarispeed(h.source);
+        run(h.clock, 1);
+
+        expect(lastDelivered(h.sink).count).toBeGreaterThanOrEqual(SID_REGISTER_COUNT);
+        expect(valueOf(lastDelivered(h.sink), 4)).toBe(0x41);
+        expect(snapshotOf(h.player).transport).toBe('paused');
+      });
+
+      it('takes a source change between ticks, without calling the old one again', async () => {
+        const h = withRecord(rampTune(), 40);
+        await h.player.seek(frames(10));
+        const first = vi.fn(() => 1);
+        const second = vi.fn(() => -1);
+        h.player.enterVarispeed(first);
+        run(h.clock, 1);
+        expect(first).toHaveBeenCalledWith(10, h.player.getStats().effectiveIntervalUs);
+
+        expect(h.player.enterVarispeed(second)).toBe(true);
+        run(h.clock, 1);
+
+        expect(first).toHaveBeenCalledTimes(1);
+        expect(second).toHaveBeenCalledWith(11, h.player.getStats().effectiveIntervalUs);
+        expect(h.player.getPosition()).toBe(10);
+      });
+
+      it('reads a source that returns something non-finite as 0', () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.enterVarispeed(() => Number.NaN);
+
+        run(h.clock, 3);
+
+        expect(h.player.getPosition()).toBe(0);
+      });
+
+      it('fails the player when the rate source throws', () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.enterVarispeed(() => {
+          throw new Error('boom');
+        });
+
+        run(h.clock, 1);
+
+        expect(snapshotOf(h.player).transport).toBe('error');
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(clockIsStopped(h.clock)).toBe(true);
+      });
+    });
+
+    describe('the varispeed tick', () => {
+      it.each([
+        ['1', 1, 0],
+        ['2', 2, 0],
+        ['0.5', 0.5, 0],
+        ['-1', -1, 12],
+        ['-0.5', -0.5, 12],
+        ['0', 0, 8],
+      ])(
+        'follows rate %s: the position, the entry fed and the frequency scaled by the rate',
+        async (_label, rate, start) => {
+          const h = withRecord(rampTune(), 40);
+          if (start > 0) await h.player.seek(frames(start));
+          h.rate.value = rate;
+          expect(h.player.enterVarispeed(h.source)).toBe(true);
+
+          const positions: number[] = [];
+          let position = start;
+          for (let tick = 0; tick < 8; tick++) {
+            run(h.clock, 1);
+            position = Math.min(40, Math.max(0, position + rate));
+            positions.push(position);
+            expect(h.player.getPosition()).toBe(Math.floor(position));
+            expect(h.player.getStats().framesRendered).toBe(Math.floor(position));
+          }
+
+          expect(h.sink.deliveredFrames).toHaveLength(8);
+          chipsOf(h.sink).forEach((chip, tick) => {
+            const entry = Math.max(0, Math.floor(positions[tick]) - 1);
+            expect(chip).toEqual(expectedChip(h.record, entry, rate));
+          });
+        },
+      );
+
+      it('changes the entry on every second tick at rate 0.5', async () => {
+        const h = withRecord(rampTune(), 40);
+        await h.player.seek(frames(4));
+        h.rate.value = 0.5;
+        h.player.enterVarispeed(h.source);
+
+        run(h.clock, 6);
+
+        // Pulse width low rides the counter, so it is in a frame exactly when the entry changed.
+        const wrote = h.sink.deliveredFrames.map(({ frame }) => valueOf(frame, 2) !== undefined);
+        expect(wrote).toEqual([true, true, false, true, false, true]);
+      });
+
+      it('delivers a frame on every tick, even when nothing changed, and reports no cycles', () => {
+        const h = withRecord(rampTune(), 40);
+        h.rate.value = 0;
+        h.player.enterVarispeed(h.source);
+
+        run(h.clock, 4);
+
+        expect(h.sink.deliveredFrames).toHaveLength(4);
+        expect(h.player.getStats().cpu.cyclesUsed).toBe(0);
+        expect(h.player.getStats().delivery.scheduledFrames).toBe(4);
+      });
+
+      it('holds a stopped tune silent at rate 0, and a playing one', async () => {
+        const stopped = withRecord(rampTune(), 40);
+        stopped.rate.value = 0;
+        stopped.player.enterVarispeed(stopped.source);
+        run(stopped.clock, 3);
+        expect(chipsOf(stopped.sink)[2][0] | (chipsOf(stopped.sink)[2][1] << 8)).toBe(0);
+
+        const playing = withRecord(rampTune(), 40);
+        await playing.player.play();
+        run(playing.clock, 10);
+        playing.rate.value = 0;
+        playing.player.enterVarispeed(playing.source);
+        run(playing.clock, 3);
+
+        const chip = chipsOf(playing.sink).at(-1) as Uint8Array;
+        expect(chip[0] | (chip[1] << 8)).toBe(0);
+        expect(playing.player.getPosition()).toBe(10);
+      });
+
+      it('scales frequency by the rate on top of the clock correction and voice pitch, clamped to the register', async () => {
+        const h = withRecord(rampTune(), 60);
+        await h.player.seek(frames(20));
+        h.player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+        h.player.setVoicePitch(0, 2);
+        h.player.enterVarispeed(h.source);
+        const ratio = clockRatio(PAL_PHI2_HZ, NTSC_PHI2_HZ) as number;
+        const chip = new Uint8Array(SID_REGISTER_COUNT);
+
+        let position = 20;
+        for (const rate of [1.5, -2, 0, 1, 1000]) {
+          h.rate.value = rate;
+          run(h.clock, 1);
+          position = Math.min(60, Math.max(0, position + rate));
+          applyFrameToChip(chip, lastDelivered(h.sink));
+          const row = rowOf(h.record, Math.floor(position) - 1);
+          const raw = row[0] | (row[1] << 8);
+          const expected = Math.min(0xffff, Math.round(raw * (ratio * 2 * Math.abs(rate))));
+          expect(chip[0] | (chip[1] << 8)).toBe(expected);
+        }
+      });
+
+      it('keeps a muted voice silent and still applies a hold and an offset', () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.setVoiceMuted(0, true);
+        h.player.holdField({ name: 'pulseWidth', voice: 0 }, 0x234);
+        h.player.setFieldOffset({ name: 'frequency', voice: 0 }, 10);
+        h.rate.value = 2;
+        h.player.enterVarispeed(h.source);
+
+        run(h.clock, 3);
+
+        for (const { frame } of h.sink.deliveredFrames) {
+          expect(valueOf(frame, 4) ?? 0).toBe(0);
+        }
+        const chip = chipsOf(h.sink).at(-1) as Uint8Array;
+        const raw = rowOf(h.record, 5);
+        expect(chip[4]).toBe(0);
+        expect(chip[2]).toBe(0x34);
+        expect(chip[3]).toBe(0x02);
+        expect(chip[0] | (chip[1] << 8)).toBe(Math.round((raw[0] | (raw[1] << 8)) * 2) + 10);
+      });
+
+      it('delivers a retrigger as two control-register entries in one frame', () => {
+        const h = withRecord(retriggerTune(), 10);
+        h.player.enterVarispeed(h.source);
+
+        run(h.clock, 1);
+
+        expect(
+          writesOf(h.sink.deliveredFrames[0].frame).filter(([register]) => register === 4),
+        ).toEqual([
+          [4, 0x40],
+          [4, 0x41],
+        ]);
+      });
+
+      it('releases a gate the shadow would hide, as live playback does', async () => {
+        const live = harness();
+        live.player.loadTune(retriggerTune());
+        await live.player.play();
+        run(live.clock, 2);
+
+        const h = withRecord(retriggerTune(), 10);
+        h.player.enterVarispeed(h.source);
+        run(h.clock, 2);
+
+        const gate = (chips: Uint8Array[]): number => chips[1][4] & 0x01;
+        expect(gate(chipsOf(live.sink))).toBe(0);
+        expect(gate(chipsOf(h.sink))).toBe(0);
+        expect(chipsOf(h.sink)).toEqual(chipsOf(live.sink));
+      });
+    });
+
+    describe('transport inside varispeed', () => {
+      it('leaves the clock alone for play and pause, and sends no gate-off', async () => {
+        const h = withRecord(rampTune(), 40);
+        const start = vi.spyOn(h.clock, 'start');
+        const stop = vi.spyOn(h.clock, 'stop');
+        const before = h.sink.calls.length; // loadTune resets the sink
+        h.player.enterVarispeed(h.source);
+
+        await h.player.play();
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        h.player.pause();
+        expect(snapshotOf(h.player).transport).toBe('paused');
+        run(h.clock, 2);
+        await h.player.play();
+
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(stop).not.toHaveBeenCalled();
+        expect(h.sink.calls.slice(before)).toEqual(['begin', 'deliver', 'deliver']);
+        expect(h.player.getPosition()).toBe(2);
+      });
+
+      it('moves the position with seek and replays nothing', async () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.enterVarispeed(h.source);
+
+        await h.player.seek(frames(9999));
+        expect(h.player.getPosition()).toBe(40);
+        await h.player.seek(frames(7));
+        expect(h.player.getPosition()).toBe(7);
+        await h.player.seek(frames(-5));
+        expect(h.player.getPosition()).toBe(0);
+        await h.player.seek(frames(7));
+        run(h.clock, 1);
+
+        expect(h.player.getPosition()).toBe(8);
+        expect(h.replay.requests).toHaveLength(0);
+        expect(chipsOf(h.sink)[0]).toEqual(expectedChip(h.record, 7, 1));
+      });
+
+      it('applies the settings a seek carries at once', async () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.enterVarispeed(h.source);
+
+        await h.player.seek(frames(5), { voiceMutes: [true] });
+
+        expect(snapshotOf(h.player).voices[0].muted).toBe(true);
+        expect(h.replay.requests).toHaveLength(0);
+      });
+
+      it('caches no image when the position is captured', () => {
+        const h = withRecord(rampTune(), 40);
+        h.player.enterVarispeed(h.source);
+        run(h.clock, 5);
+
+        expect(h.player.capturePosition()).toBe(5);
+        h.player.setJumpTargets([frames(5)]);
+
+        expect(preparedFrames(h.player)).toEqual([]);
+      });
+
+      it('counts varispeed as a running clock when the tempo moves', () => {
+        const h = withRecord(rampTune(), 40);
+        const setInterval = vi.spyOn(h.clock, 'setIntervalUs');
+        const intervals: number[] = [];
+        h.player.enterVarispeed((_position, intervalUs) => {
+          intervals.push(intervalUs);
+          return 1;
+        });
+        run(h.clock, 1);
+
+        h.player.setTempo(2);
+        run(h.clock, 1);
+
+        expect(setInterval).toHaveBeenCalledTimes(1);
+        expect(h.sink.calls).toContain('retime');
+        expect(intervals[1]).toBeCloseTo(intervals[0] / 2);
+        expect(h.player.getStats().effectiveIntervalUs).toBe(intervals[1]);
+      });
+
+      it('does not wrap an active loop or land a queued jump, then enforces both on handing back', async () => {
+        const h = withRecord(rampTune(), 100);
+        h.player.setJumpTargets([frames(50)]);
+        h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
+        h.player.queueJump({ startFrame: frames(50), endFrame: null });
+        await flushEntryImageCapture();
+        expect(preparedFrames(h.player)).toEqual([50]);
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+
+        run(h.clock, 15);
+
+        expect(h.player.getPosition()).toBe(15);
+        expect(handOffs(h.player)).toBe(0);
+        expect(snapshotOf(h.player).tune?.queuedJump).toEqual({ startFrame: 50, endFrame: null });
+        expect(snapshotOf(h.player).loop).toEqual({ startFrame: 5, endFrame: 10 });
+
+        h.replay.manual = true;
+        h.player.leaveVarispeed();
+        run(h.clock, 1);
+
+        expect(handOffs(h.player)).toBe(1);
+        expect(h.player.getPosition()).toBe(50);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(snapshotOf(h.player).loop).toBeNull();
+      });
+    });
+
+    describe('leaving out of the playing transport: the handback', () => {
+      it('hands back with no gate-off, the chip and the frames after it equal to a straight live run', async () => {
+        const file = retriggerTune();
+        const live = harness();
+        live.player.loadTune(file);
+        await live.player.play();
+        run(live.clock, 130);
+
+        const h = withRecord(file, 200);
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 20);
+        h.player.leaveVarispeed();
+        expect(varispeedOn(h.player)).toBe(true);
+        await flushEntryImageCapture();
+
+        expect(h.replay.requests).toHaveLength(1);
+        expect(h.replay.requests[0].targetFrame).toBe(20 + LEAD);
+        expect(h.replay.requests[0].mutes).toEqual([false, false, false]);
+        run(h.clock, LEAD - 1);
+        expect(varispeedOn(h.player)).toBe(true);
+        run(h.clock, 1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(20 + LEAD);
+        run(h.clock, 10);
+
+        expect(h.sink.deliveredFrames).toHaveLength(130);
+        expect(h.sink.deliveredNowFrames).toHaveLength(0);
+        expect(h.sink.calls).not.toContain('deliverNow');
+        expect(chipsOf(h.sink)).toEqual(chipsOf(live.sink));
+        for (let index = 20 + LEAD; index < 130; index++) {
+          expect(writesOf(h.sink.deliveredFrames[index].frame)).toEqual(
+            writesOf(live.sink.deliveredFrames[index].frame),
+          );
+        }
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        expect(h.player.getPosition()).toBe(130);
+      });
+
+      it('never calls the source again, and brings the rate pitch home before the first frame', async () => {
+        const h = withRecord(rampTune(), 200);
+        h.rate.value = 3;
+        const source = vi.fn(() => h.rate.value);
+        h.player.enterVarispeed(source);
+        await h.player.play();
+        run(h.clock, 5);
+        const calls = source.mock.calls.length;
+        expect(readSent(h.player).sent[0]).not.toBe(readSent(h.player).written[0]);
+
+        h.player.leaveVarispeed();
+        run(h.clock, 3);
+
+        expect(source).toHaveBeenCalledTimes(calls);
+        expect(h.player.getPosition()).toBe(15 + 3);
+        expect(readSent(h.player).sent[0]).toBe(readSent(h.player).written[0]);
+      });
+
+      it('lands paused with a gate-off when paused during the handback', async () => {
+        const h = withRecord(rampTune(), 400);
+        h.replay.manual = true;
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 5);
+        h.player.leaveVarispeed();
+
+        h.player.pause();
+
+        expect(snapshotOf(h.player).transport).toBe('paused');
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(writesOf(lastDeliveredNow(h.sink))).toEqual([
+          [4, 0],
+          [11, 0],
+          [18, 0],
+        ]);
+        expect(h.sink.calls.lastIndexOf('deliverNow')).toBeLessThan(
+          h.sink.calls.lastIndexOf('end'),
+        );
+        expect(clockIsStopped(h.clock)).toBe(true);
+        expect(h.player.getPosition()).toBe(5);
+
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+
+        // The handback's image is stale; the landing's is not, and it is silent.
+        expect(h.replay.requests[1].targetFrame).toBe(5);
+        expect(h.player.getPosition()).toBe(5);
+        const landing = lastDeliveredNow(h.sink);
+        expect(landing.count).toBe(SID_REGISTER_COUNT);
+        for (const register of VOICE_CONTROL_REGISTERS) {
+          expect(valueOf(landing, register)).toBe(0);
+        }
+      });
+
+      it('restarts the image request at the new position on a seek, dropping the stale image', async () => {
+        const h = withRecord(rampTune(), 400);
+        h.replay.manual = true;
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 20);
+        h.player.leaveVarispeed();
+        expect(h.replay.requests.map((request) => request.targetFrame)).toEqual([20 + LEAD]);
+
+        await h.player.seek(frames(200));
+        expect(h.replay.requests.map((request) => request.targetFrame)).toEqual([
+          20 + LEAD,
+          200 + LEAD,
+        ]);
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+
+        // Had the old image, at 120, been kept it would sit behind the playhead and be asked for again.
+        expect(h.replay.requests).toHaveLength(2);
+        run(h.clock, LEAD - 1);
+        expect(varispeedOn(h.player)).toBe(true);
+        run(h.clock, 1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(200 + LEAD);
+      });
+
+      it('asks again with double the lead when the image arrives behind the playhead', async () => {
+        const h = withRecord(rampTune(), 400);
+        h.replay.manual = true;
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 20);
+        h.player.leaveVarispeed();
+        run(h.clock, 150);
+        expect(h.player.getPosition()).toBe(170);
+
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+
+        expect(h.replay.requests.map((request) => request.targetFrame)).toEqual([
+          20 + LEAD,
+          170 + 2 * LEAD,
+        ]);
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+        run(h.clock, 2 * LEAD - 1);
+        expect(varispeedOn(h.player)).toBe(true);
+        run(h.clock, 1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(170 + 2 * LEAD);
+      });
+
+      it('is cancelled by entering again, and the image that arrives is dropped', async () => {
+        const h = withRecord(rampTune(), 400);
+        h.replay.manual = true;
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 20);
+        h.player.leaveVarispeed();
+
+        expect(h.player.enterVarispeed(h.source)).toBe(true);
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+        run(h.clock, 2 * LEAD);
+
+        expect(varispeedOn(h.player)).toBe(true);
+        expect(h.player.getPosition()).toBe(20 + 2 * LEAD);
+        expect(h.replay.requests).toHaveLength(1);
+      });
+
+      it('wraps as a lap when the loop end is crossed during the handback', async () => {
+        const h = withRecord(rampTune(), 60);
+        h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
+        await flushEntryImageCapture();
+        await h.player.seek(frames(8));
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        h.replay.manual = true;
+        h.player.leaveVarispeed();
+
+        run(h.clock, 1);
+        expect(varispeedOn(h.player)).toBe(true);
+        run(h.clock, 1);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(5);
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        expect(h.player.getStats().resync.inFlightDepth).toBe(1);
+        run(h.clock, 1); // the gate-off the lap owes
+        for (const register of VOICE_CONTROL_REGISTERS) {
+          expect(valueOf(lastDelivered(h.sink), register)).toBe(0);
+        }
+        run(h.clock, 1); // the resync, riding the first frame played from the lap's image
+        expect(lastDelivered(h.sink).count).toBe(SID_REGISTER_COUNT);
+        expect(valueOf(lastDelivered(h.sink), 0)).toBe(6);
+        run(h.clock, 1);
+        expect(valueOf(lastDelivered(h.sink), 0)).toBe(7);
+
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+        expect(h.player.getPosition()).toBeLessThan(20);
+      });
+
+      it('ends the track when it starts past the track end with repeat off', async () => {
+        const h = withRecord(rampTune(), 100);
+        h.player.setTrackStructure({
+          loopStartFrame: null,
+          loopPeriodFrames: null,
+          endedAtFrame: frames(30),
+        });
+        h.player.setRepeatTrack(false);
+        await h.player.seek(frames(50));
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        h.replay.manual = true;
+        h.player.leaveVarispeed();
+
+        run(h.clock, 1);
+
+        expect(snapshotOf(h.player).transport).toBe('ended');
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(51);
+        expect(clockIsStopped(h.clock)).toBe(true);
+      });
+
+      it('laps to the loop start when it starts past the track end with repeat on', async () => {
+        const h = withRecord(rampTune(), 100);
+        h.player.setTrackStructure({
+          loopStartFrame: frames(4),
+          loopPeriodFrames: frames(26),
+          endedAtFrame: null,
+        });
+        h.player.setRepeatTrack(true);
+        await flushEntryImageCapture();
+        await h.player.seek(frames(50));
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        h.replay.manual = true;
+        h.player.leaveVarispeed();
+
+        run(h.clock, 1);
+
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(4);
+        expect(snapshotOf(h.player).loop).toEqual({ startFrame: 4, endFrame: 30 });
+        expect(h.player.getStats().resync.inFlightDepth).toBe(1);
+      });
+    });
+
+    describe('leaving out of a transport that is not playing', () => {
+      const setups: [string, (h: Held) => Promise<number>][] = [
+        [
+          'stopped',
+          (h) => {
+            h.player.enterVarispeed(h.source);
+            run(h.clock, 10);
+            return Promise.resolve(10);
+          },
+        ],
+        [
+          'paused',
+          async (h) => {
+            h.player.enterVarispeed(h.source);
+            await h.player.play();
+            run(h.clock, 10);
+            h.player.pause();
+            return 10;
+          },
+        ],
+        [
+          'ended',
+          async (h) => {
+            h.player.setTrackStructure({
+              loopStartFrame: null,
+              loopPeriodFrames: null,
+              endedAtFrame: frames(10),
+            });
+            await h.player.play();
+            run(h.clock, 10);
+            expect(snapshotOf(h.player).transport).toBe('ended');
+            h.player.enterVarispeed(h.source);
+            run(h.clock, 3);
+            return 13;
+          },
+        ],
+      ];
+
+      it.each(setups)(
+        'lands paused at the position with a gate-off at once and a silent landing from %s',
+        async (_label, setup) => {
+          const h = withRecord(rampTune(), 40);
+          const position = await setup(h);
+          expect(h.player.getPosition()).toBe(position);
+
+          h.player.leaveVarispeed();
+
+          expect(snapshotOf(h.player).transport).toBe('paused');
+          expect(varispeedOn(h.player)).toBe(false);
+          expect(h.player.getPosition()).toBe(position);
+          expect(writesOf(lastDeliveredNow(h.sink))).toEqual([
+            [4, 0],
+            [11, 0],
+            [18, 0],
+          ]);
+          expect(h.sink.calls.lastIndexOf('deliverNow')).toBeLessThan(
+            h.sink.calls.lastIndexOf('end'),
+          );
+          expect(clockIsStopped(h.clock)).toBe(true);
+
+          await flushEntryImageCapture();
+
+          expect(h.replay.requests.at(-1)?.targetFrame).toBe(position);
+          const landing = lastDeliveredNow(h.sink);
+          expect(landing.count).toBe(SID_REGISTER_COUNT);
+          for (const register of VOICE_CONTROL_REGISTERS) {
+            expect(valueOf(landing, register)).toBe(0);
+          }
+          expect(h.player.getPosition()).toBe(position);
+
+          await h.player.play();
+          run(h.clock, 1);
+          expect(valueOf(lastDelivered(h.sink), 0)).toBe(position + 1);
+        },
+      );
+
+      it('does nothing outside varispeed', () => {
+        const h = withRecord(rampTune(), 40);
+
+        h.player.leaveVarispeed();
+
+        expect(snapshotOf(h.player).transport).toBe('stopped');
+        expect(h.sink.calls).toEqual(['reset']); // loadTune's, and nothing since
+      });
+    });
+
+    describe('the exits that leave with no landing', () => {
+      it.each([
+        ['stop', (h: Held) => h.player.stop()],
+        ['a subtune change', (h: Held) => h.player.selectSubtune(2)],
+        ['leaving paused', (h: Held) => h.player.leaveVarispeed()],
+      ])('return the rate pitch to home on %s', async (_label, exit) => {
+        const h = withRecord(rampTune(2), 40);
+        h.rate.value = 0;
+        h.player.enterVarispeed(h.source);
+        run(h.clock, 2);
+        expect(readSent(h.player).sent[0]).toBe(0);
+
+        exit(h);
+        await flushEntryImageCapture();
+
+        const { written, sent } = readSent(h.player);
+        expect(sent[0]).toBe(written[0]);
+        expect(sent[1]).toBe(written[1]);
+        expect(varispeedOn(h.player)).toBe(false);
+      });
+
+      it('plays raw frequencies after a stop out of a hold at rate 0', async () => {
+        const h = withRecord(rampTune(), 40);
+        h.rate.value = 0;
+        h.player.enterVarispeed(h.source);
+        run(h.clock, 2);
+
+        h.player.stop();
+        await h.player.play();
+        run(h.clock, 1);
+
+        expect(valueOf(lastDelivered(h.sink), 0)).toBe(1);
+        expect(valueOf(lastDelivered(h.sink), 1)).toBe(1);
+      });
+
+      it.each([
+        ['stopped', false],
+        ['paused', true],
+      ])(
+        'stops the clock and ends the sink when %s varispeed meets loadTune or selectSubtune',
+        async (_label, pause) => {
+          for (const exit of [
+            (h: Held) => h.player.loadTune(rampTune(2)),
+            (h: Held) => h.player.selectSubtune(2),
+          ]) {
+            const h = withRecord(rampTune(2), 40);
+            h.player.enterVarispeed(h.source);
+            if (pause) {
+              await h.player.play();
+              h.player.pause();
+            }
+            run(h.clock, 2);
+            const ends = h.sink.endCallCount;
+
+            exit(h);
+
+            expect(clockIsStopped(h.clock)).toBe(true);
+            expect(h.sink.endCallCount).toBe(ends + 1);
+            expect(varispeedOn(h.player)).toBe(false);
+            expect(snapshotOf(h.player).tune?.recordedFrames).toBeNull();
+          }
+        },
+      );
+
+      it('keeps a playing clock running through a subtune change, with the machine live again', async () => {
+        const h = withRecord(rampTune(2), 40);
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        run(h.clock, 2);
+
+        h.player.selectSubtune(2);
+        run(h.clock, 1);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(snapshotOf(h.player).transport).toBe('playing');
+        expect(h.player.getPosition()).toBe(1);
+        expect(h.player.getStats().cpu.cyclesUsed).toBeGreaterThan(0);
+      });
+    });
+
+    describe('the clock a non-playing varispeed starts', () => {
+      /** A clock whose `start` stays pending until the test releases it. */
+      class DeferredStartClock extends FakeClock {
+        running = false;
+        private release: (() => void) | null = null;
+
+        override start(
+          intervalUs: Microseconds,
+          onFrame: (dueAtMs: Milliseconds, catchUpClamped: boolean) => void,
+        ): Promise<void> {
+          return new Promise<void>((resolve) => {
+            this.release = () => {
+              this.running = true;
+              void super.start(intervalUs, onFrame);
+              resolve();
+            };
+          });
+        }
+
+        override stop(): void {
+          this.running = false;
+          super.stop();
+        }
+
+        resolveStart(): void {
+          this.release?.();
+        }
+      }
+
+      it('is stopped again when it starts after its varispeed has already ended', async () => {
+        const sink = new RecordingSink();
+        const clock = new DeferredStartClock();
+        const player = createSidPlayer({ sink, clock, replayRunner: new FakeReplayRunner() });
+        player.loadTune(rampTune());
+        player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
+        player.enterVarispeed(() => 1);
+        player.leaveVarispeed();
+
+        clock.resolveStart();
+        await flushEntryImageCapture();
+
+        expect(clock.running).toBe(false);
+      });
+
+      it('fails the player, and closes the sink it opened, when it cannot start', async () => {
+        const sink = new RecordingSink();
+        const player = createSidPlayer({
+          sink,
+          clock: new FailingClock(),
+          replayRunner: new FakeReplayRunner(),
+        });
+        player.loadTune(rampTune());
+        player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
+
+        player.enterVarispeed(() => 1);
+        await flushEntryImageCapture();
+
+        expect(snapshotOf(player).transport).toBe('error');
+        expect(varispeedOn(player)).toBe(false);
+        expect(sink.calls.slice(1)).toEqual(['begin', 'end']);
       });
     });
   });
