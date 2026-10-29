@@ -11,10 +11,18 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 
 - `scan-tune.ts` — `TuneScan`/`scanTune`, the frame-by-frame emulation loop every detector reads
   its input from. Wraps `@sidablist/core`'s `C64Machine`, and is the one file here that runs the
-  6502 core rather than reading its output.
+  6502 core rather than reading its output. Also records each play call's chip control bytes and
+  in-frame retriggers beside the shadow values, which is what `register-record.ts` reads.
 - `scanner.ts` — the `AnalysisScanner` port and its message types (`ScanRequest`/`ScanMessage`/
   `ScanResult`), the seam a host's worker or main-thread scanner implements. Carries no
-  `InjectionToken` — that belongs to the host's DI framework, not this package.
+  `InjectionToken` — that belongs to the host's DI framework, not this package. `ScanRequest.keep`
+  (default true) says whether the scanner holds the scan for the session to deepen; `false` has it
+  dropped once answered, for a one-shot caller.
+- `register-record.ts` — `toRegisterRecord`, a `ScanOutput` as core's `RegisterRecord`, and
+  `recordRegisters(scanner, bytes, subtune, frames)`, the standalone record scan a host runs on
+  every load. Its own session and `keep: false`, so it never deepens an index ladder's held scan.
+- `scan-ids.ts` — the process-wide session and request id counters `indexTune` and `recordRegisters`
+  share, so one scanner is never handed the same session twice.
 - `scan-worker-handler.ts` / `scan.worker.ts` — the pure request handler and the thin
   `self.onmessage` shim wrapping it, split so the handler is testable under Node. Published as the
   `./scan.worker` subpath (see `package.json`'s `exports`).
@@ -67,6 +75,14 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   application stores the record itself — a bump invalidates every stored scan. Confirm the new
   shape and version are what the resolver and the application's storage migration actually expect
   before shipping the bump. Detail: [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
+- **Changed `TuneScan.recordControls` (`scan-tune.ts`) or `toRegisterRecord` (`register-record.ts`)?**
+  Both build the record from how core's `RegisterFrame` snapshots a doubled voice control write —
+  the first write, plus one retrigger entry carrying the last byte — and `libs/core`'s `feed`
+  (`player/varispeed.ts`) reads it back by the meaning `RegisterRecord` documents. A shifted
+  column, entry index or retrigger order compiles and passes the type-checker while recording a
+  stream that hangs or drops notes at the handback. Keep the three in step and run
+  `register-record.spec.ts` and core's `create-sid-player.spec.ts`. Detail:
+  [`libs/core/AGENTS.md`](../core/AGENTS.md).
 
 ## Commands
 

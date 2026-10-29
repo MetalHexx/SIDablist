@@ -75,7 +75,7 @@ const fourWriteTune: SidFile = tune([
   },
 ]);
 
-/** Writes $D404 twice per call � $40, then $41 � so every frame is a retrigger. */
+/** Writes $D404 twice per call, $40 then $41, so every frame is a retrigger. */
 const doubledWriteTune: SidFile = tune([
   { at: 0x1000, bytes: [RTS] },
   { at: 0x1010, bytes: [0xa9, 0x40, 0x8d, 0x04, 0xd4, 0xa9, 0x41, 0x8d, 0x04, 0xd4, RTS] },

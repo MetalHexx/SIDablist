@@ -163,6 +163,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   or `RegisterFrame`'s snapshot API?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+- **Changed `RegisterRecord` (`registers/register-record.ts`), or how `RegisterFrame` snapshots a
+  doubled voice control write?** `libs/analysis`'s `toRegisterRecord` and `TuneScan.recordControls`
+  build the record from that shape, and `feed` (`player/varispeed.ts`) plays it back. A shifted
+  meaning records a stream that hangs or drops notes at the handback, with no compile error. Update
+  both and run `libs/analysis/src/register-record.spec.ts`. Detail:
+  [`libs/analysis/src/register-record.ts`](../analysis/src/register-record.ts).
 
 - **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
