@@ -75,6 +75,31 @@ const fourWriteTune: SidFile = tune([
   },
 ]);
 
+/** Writes $D404 twice per call � $40, then $41 � so every frame is a retrigger. */
+const doubledWriteTune: SidFile = tune([
+  { at: 0x1000, bytes: [RTS] },
+  { at: 0x1010, bytes: [0xa9, 0x40, 0x8d, 0x04, 0xd4, 0xa9, 0x41, 0x8d, 0x04, 0xd4, RTS] },
+]);
+
+/** Odd calls write $D404 twice ($40, $41), even calls once ($40): the chip holds $41, $40, $41... */
+const alternatingTune: SidFile = tune([
+  { at: 0x1000, bytes: [RTS] },
+  {
+    at: 0x1010,
+    bytes: [
+      ...[0xe6, 0xfb], // INC $FB
+      ...[0xa5, 0xfb], // LDA $FB
+      ...[0x29, 0x01], // AND #$01
+      ...[0xf0, 0x0b], // BEQ even
+      ...[0xa9, 0x40, 0x8d, 0x04, 0xd4], // LDA #$40; STA $D404
+      ...[0xa9, 0x41, 0x8d, 0x04, 0xd4], // LDA #$41; STA $D404
+      RTS,
+      ...[0xa9, 0x40, 0x8d, 0x04, 0xd4], // even: LDA #$40; STA $D404
+      RTS,
+    ],
+  },
+]);
+
 /** The play routine never returns, so the frame burns its whole cycle budget. */
 const runawayTune: SidFile = tune([
   { at: 0x1000, bytes: [RTS] },
@@ -156,6 +181,8 @@ describe('TuneScan', () => {
     expect(deepened.callsPerFrame).toBe(oneShot.callsPerFrame);
     expect(deepened.writeCounts).toEqual(oneShot.writeCounts);
     expect(deepened.registerValues).toEqual(oneShot.registerValues);
+    expect(deepened.controlBytes).toEqual(oneShot.controlBytes);
+    expect(deepened.retriggers).toEqual(oneShot.retriggers);
     // Resumption is an efficiency property: the detector must reach the identical verdict either way.
     expect(detectLoop(deepened, DETECT_OPTIONS)).toEqual(detectLoop(oneShot, DETECT_OPTIONS));
   });
@@ -191,5 +218,47 @@ describe('TuneScan', () => {
     expect(scan.frames).toBe(0);
     expect(scan.output().registerValues.length).toBe(0);
     expect(scan.output().writeCounts.length).toBe(0);
+  });
+});
+
+describe('the register stream a scan keeps', () => {
+  it('records one retrigger per frame for a doubled control write, carrying the first byte', () => {
+    const output = scanTune(doubledWriteTune, 1, 6);
+
+    expect(Array.from(output.retriggers?.entries ?? [])).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(new Set(output.retriggers?.registers)).toEqual(new Set([4]));
+    expect(new Set(output.retriggers?.values)).toEqual(new Set([0x40]));
+  });
+
+  it('keeps the chip control byte where the shadow keeps the first byte of the doubled write', () => {
+    const output = scanTune(doubledWriteTune, 1, 3);
+
+    for (let frame = 0; frame < 3; frame++) {
+      expect(output.registerValues[frame * SID_REGISTER_COUNT + 4]).toBe(0x40);
+      expect(output.controlBytes?.[frame * 3]).toBe(0x41);
+    }
+  });
+
+  it('reads the chip byte each frame, and carries the previous one over a frame that wrote none', () => {
+    const output = scanTune(alternatingTune, 1, 6);
+    expect(Array.from(output.controlBytes ?? []).filter((_, index) => index % 3 === 0)).toEqual([
+      0x41, 0x40, 0x41, 0x40, 0x41, 0x40,
+    ]);
+    expect(Array.from(output.retriggers?.entries ?? [])).toEqual([0, 2, 4]);
+
+    const quiet = scanTune(counterTune, 1, 4);
+    expect(Array.from(quiet.controlBytes ?? [])).toEqual(new Array(12).fill(0));
+    expect(quiet.retriggers?.entries.length).toBe(0);
+  });
+
+  it('sizes both to what was recorded, and keeps retriggers past the first buffer growth', () => {
+    const frames = 300;
+    const output = scanTune(doubledWriteTune, 1, frames);
+
+    expect(output.controlBytes?.length).toBe(frames * 3);
+    expect(output.retriggers?.entries.length).toBe(frames);
+    expect(output.retriggers?.entries[frames - 1]).toBe(frames - 1);
+    expect(output.retriggers?.registers.length).toBe(frames);
+    expect(output.retriggers?.values.length).toBe(frames);
   });
 });

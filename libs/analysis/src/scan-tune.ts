@@ -1,5 +1,10 @@
-import { createC64Machine, createRegisterFrame, SID_REGISTER_COUNT } from '@sidablist/core';
-import type { C64Machine, FrameResult, SidFile } from '@sidablist/core';
+import {
+  createC64Machine,
+  createRegisterFrame,
+  SID_REGISTER_COUNT,
+  VOICE_CONTROL_REGISTERS,
+} from '@sidablist/core';
+import type { C64Machine, FrameResult, SidFile, SidFrame } from '@sidablist/core';
 
 /** A postMessage per scanned frame would cost more than the emulation itself. */
 const PROGRESS_INTERVAL_FRAMES = 256;
@@ -16,7 +21,29 @@ export interface ScanOutput {
   /** The un-rounded rate the machine's timer actually measured — the ladder's zero-frame probe reads
    *  this to size its rungs precisely, rather than off the rounded integer above. */
   readonly exactCallsPerFrame: number;
+  /** The chip's voice control bytes after each frame: frame f's voice v at f * 3 + v. Unlike
+   *  `registerValues`, which keeps the first byte of a doubled write, this is the byte the chip
+   *  holds. */
+  readonly controlBytes?: Uint8Array;
+  /** The frames in which a voice control register was written twice, ascending by frame, as three
+   *  parallel arrays. */
+  readonly retriggers?: {
+    readonly entries: Uint32Array;
+    /** 4, 11 or 18. */
+    readonly registers: Uint8Array;
+    /** The first byte, sent before the frame's own. */
+    readonly values: Uint8Array;
+  };
 }
+
+const VOICE_COUNT = VOICE_CONTROL_REGISTERS.length;
+const INITIAL_RETRIGGER_CAPACITY = 64;
+
+/** Register number -> voice index for the three voice control registers, -1 for every other. */
+const VOICE_OF_REGISTER = new Int8Array(SID_REGISTER_COUNT).fill(-1);
+VOICE_CONTROL_REGISTERS.forEach((register, voice) => {
+  VOICE_OF_REGISTER[register] = voice;
+});
 
 /**
  * A replay of one tune that can be deepened, recording every frame's register values and write
@@ -39,6 +66,15 @@ export class TuneScan {
   private readonly machine: C64Machine;
   private registerValues = new Uint8Array(0);
   private writeCounts = new Uint8Array(0);
+  private controlBytes = new Uint8Array(0);
+  private retriggerEntries = new Uint32Array(INITIAL_RETRIGGER_CAPACITY);
+  private retriggerRegisters = new Uint8Array(INITIAL_RETRIGGER_CAPACITY);
+  private retriggerValues = new Uint8Array(INITIAL_RETRIGGER_CAPACITY);
+  private retriggerCount = 0;
+  /** Per-frame scratch, reused: whether each voice's control register has been written yet this
+   *  frame, and the first byte it was written with. */
+  private readonly controlSeen = new Uint8Array(VOICE_COUNT);
+  private readonly controlFirst = new Uint8Array(VOICE_COUNT);
   private recorded = 0;
 
   constructor(file: SidFile, subtune: number) {
@@ -74,7 +110,9 @@ export class TuneScan {
 
       // Must run every frame: it is also what resets the per-frame duplicate-write tracking the next
       // frame's count depends on.
-      this.writeCounts[i] = this.frame.takeSnapshot().count;
+      const snapshot = this.frame.takeSnapshot();
+      this.writeCounts[i] = snapshot.count;
+      this.recordControls(i, snapshot);
 
       this.registerValues.set(this.frame.snapshotValues().values, i * SID_REGISTER_COUNT);
       this.recorded = i + 1;
@@ -88,7 +126,7 @@ export class TuneScan {
   /**
    * The frames recorded so far, in the shape the detectors read.
    *
-   * Both arrays are copies sized exactly to `frames`, never views over the working buffers: a caller
+   * Every array is a copy sized exactly to what was recorded, never views over the working buffers: a caller
    * posting this across a thread boundary would otherwise ship the spare capacity too, and would see
    * its output rewritten by the next `advanceTo`.
    */
@@ -99,10 +137,64 @@ export class TuneScan {
       frames: this.recorded,
       callsPerFrame: this.machine.callsPerFrame,
       exactCallsPerFrame: this.machine.exactCallsPerFrame,
+      controlBytes: this.controlBytes.slice(0, this.recorded * VOICE_COUNT),
+      retriggers: {
+        entries: this.retriggerEntries.slice(0, this.retriggerCount),
+        registers: this.retriggerRegisters.slice(0, this.retriggerCount),
+        values: this.retriggerValues.slice(0, this.retriggerCount),
+      },
     };
   }
 
-  /** Regrows both buffers to `frames`, carrying the recorded prefix over. O(recorded bytes) against
+  /**
+   * Reads frame `i`'s voice control writes off its snapshot. The chip's byte after the frame is the
+   * last entry for the register, or the previous frame's when the frame wrote none; the frame's
+   * retrigger is the first entry, noted when the register appears a second time. The first frame
+   * starts from zero, which is where the shadow starts too.
+   */
+  private recordControls(i: number, snapshot: SidFrame): void {
+    const base = i * VOICE_COUNT;
+    if (i > 0) {
+      this.controlBytes.copyWithin(base, base - VOICE_COUNT, base);
+    }
+    this.controlSeen.fill(0);
+    for (let index = 0; index < snapshot.count; index++) {
+      const register = snapshot.registers[index];
+      const voice = VOICE_OF_REGISTER[register];
+      if (voice < 0) {
+        continue;
+      }
+      const value = snapshot.values[index];
+      if (this.controlSeen[voice] === 0) {
+        this.controlSeen[voice] = 1;
+        this.controlFirst[voice] = value;
+      } else {
+        this.pushRetrigger(i, register, this.controlFirst[voice]);
+      }
+      this.controlBytes[base + voice] = value;
+    }
+  }
+
+  private pushRetrigger(frame: number, register: number, value: number): void {
+    if (this.retriggerCount === this.retriggerEntries.length) {
+      const capacity = this.retriggerCount * 2;
+      const entries = new Uint32Array(capacity);
+      entries.set(this.retriggerEntries);
+      const registers = new Uint8Array(capacity);
+      registers.set(this.retriggerRegisters);
+      const values = new Uint8Array(capacity);
+      values.set(this.retriggerValues);
+      this.retriggerEntries = entries;
+      this.retriggerRegisters = registers;
+      this.retriggerValues = values;
+    }
+    this.retriggerEntries[this.retriggerCount] = frame;
+    this.retriggerRegisters[this.retriggerCount] = register;
+    this.retriggerValues[this.retriggerCount] = value;
+    this.retriggerCount++;
+  }
+
+  /** Regrows the per-frame buffers to `frames`, carrying the recorded prefix over. O(recorded bytes) against
    *  the O(frames × cycles) of the emulation it saves. */
   private reserve(frames: number): void {
     if (frames <= this.writeCounts.length) {
@@ -112,8 +204,11 @@ export class TuneScan {
     registerValues.set(this.registerValues.subarray(0, this.recorded * SID_REGISTER_COUNT));
     const writeCounts = new Uint8Array(frames);
     writeCounts.set(this.writeCounts.subarray(0, this.recorded));
+    const controlBytes = new Uint8Array(frames * VOICE_COUNT);
+    controlBytes.set(this.controlBytes.subarray(0, this.recorded * VOICE_COUNT));
     this.registerValues = registerValues;
     this.writeCounts = writeCounts;
+    this.controlBytes = controlBytes;
   }
 }
 

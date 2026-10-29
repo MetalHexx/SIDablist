@@ -50,6 +50,12 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 - **The zero-frame probe is load-bearing, not an optimisation to skip.** It is what tells the ladder
   a multispeed tune's real `callsPerFrame` before committing to a rung depth — guessing single-speed
   instead sizes every rung wrong for any tune that is not.
+- **The scan's frame must stay at home.** `TuneScan` never mutes, multiplies, offsets or holds, so
+  every byte it records is raw. A shaped scan would write shaped bytes into the record, and the
+  player shapes them again on the way out.
+- **A record's voice control columns are the chip's, not the shadow's.** The shadow keeps the first
+  byte of a doubled write; `controlBytes` holds the last, and `toRegisterRecord` swaps it in. Entry
+  `i` is the chip after play call `i + 1`; off by one plays the tune a frame late.
 - **The dependency arrow is `analysis → core` only.** `core` must never import from this package.
   `indexTune` receiving the `sidHash` as a parameter, rather than reaching for a hashing routine
   itself, is what keeps that arrow one-directional — see Conventions above.
