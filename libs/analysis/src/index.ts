@@ -16,10 +16,12 @@ export {
   keyName,
   camelotFor,
   scaleFor,
+  sharedScaleNotes,
   isOutOfScale,
   PITCH_CLASS_NAMES,
   type TuningResult,
   type KeyResult,
+  type ScaleKey,
 } from './key.js';
 export {
   detectLoop,
