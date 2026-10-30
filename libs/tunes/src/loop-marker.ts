@@ -28,4 +28,8 @@ export interface LoopMarker {
   /** True while the marker plays with `settings` rather than the host's shared ones. Absent or
    *  false: it shares. Separate from `settings`, so going back to sharing keeps them. */
   readonly usesOwnSettings?: boolean;
+  /** True on a loop whose start wraps a scrubbed or thrown record round to its end, rather than
+   *  stopping it there. Absent or false: it stops. Meaningless on a cue. The library stores and
+   *  copies it and never reads it. */
+  readonly wraps?: boolean;
 }

@@ -5,6 +5,9 @@ import type { AnchorRing, PositionAnchor } from './anchor-ring.js';
 import { seekToFrame } from './seek.js';
 import type { TrackStructure } from './track-structure.js';
 
+/** What varispeed does at a held loop's start. */
+export type VarispeedLoopStart = 'stop' | 'wrap';
+
 /**
  * The loop core enforces on every frame: a start and an end, or null when nothing is looping.
  *
@@ -12,7 +15,14 @@ import type { TrackStructure } from './track-structure.js';
  * application, moved there in an earlier task. This is only ever the one presently running,
  * whichever saved loop it came from, or the track's own loop armed by `advance` below, or none.
  */
-export type ActiveLoop = { readonly startFrame: Frames; readonly endFrame: Frames } | null;
+export type ActiveLoop = {
+  readonly startFrame: Frames;
+  readonly endFrame: Frames;
+  /** Holds varispeed inside this loop once the playhead is in it: a move past the end wraps to
+   *  the start, and a move back past the start stops at the start ('stop') or wraps to the end
+   *  ('wrap'). Absent: varispeed moves through the loop freely. */
+  readonly varispeedStart?: VarispeedLoopStart;
+} | null;
 
 /** What `advance` did on a given frame. */
 export type AdvanceResult =

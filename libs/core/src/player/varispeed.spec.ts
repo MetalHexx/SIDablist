@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import type { SidWriteSink } from '../cpu/c64-machine.js';
 import type { RegisterRecord } from '../registers/register-record.js';
 import { SID_REGISTER_COUNT } from '../registers/sid-constants.js';
+import { frames } from '../units.js';
+import type { ActiveLoop, VarispeedLoopStart } from '../timeline/active-loop.js';
 import { createVarispeed } from './varispeed.js';
 
 interface Write {
@@ -239,5 +241,134 @@ describe('createVarispeed', () => {
 
     expect(sink.writes).toEqual([]);
     expect(varispeed.position).toBe(0);
+  });
+});
+
+describe('moveBy held by a loop', () => {
+  /** A loop over frames 20…30 in a 100-frame record, the playhead at `position`. */
+  function held(position: number, varispeedStart?: VarispeedLoopStart) {
+    const loop: ActiveLoop = {
+      startFrame: frames(20),
+      endFrame: frames(30),
+      ...(varispeedStart === undefined ? {} : { varispeedStart }),
+    };
+    return { varispeed: varispeedOver(recordOf(100, RAMP), position), loop };
+  }
+
+  it('wraps a move past the end to the start plus the overshoot, travelling the full rate', () => {
+    for (const start of ['stop', 'wrap'] as const) {
+      const { varispeed, loop } = held(28, start);
+
+      const travelled = varispeed.moveBy(5, loop);
+
+      expect(varispeed.position).toBe(23);
+      expect(travelled).toBe(5);
+    }
+  });
+
+  it('wraps a move longer than the loop as many times as it takes', () => {
+    const { varispeed, loop } = held(25, 'stop');
+
+    varispeed.moveBy(27, loop); // 52 is 22 past the end, and 22 mod 10 is 2
+
+    expect(varispeed.position).toBe(22);
+  });
+
+  it('lands on the start when the move ends exactly on the end', () => {
+    const { varispeed, loop } = held(25, 'stop');
+
+    varispeed.moveBy(5, loop);
+
+    expect(varispeed.position).toBe(20);
+  });
+
+  it('stops a move back past the start at the start, travelling only as far as it got', () => {
+    const { varispeed, loop } = held(22, 'stop');
+
+    const travelled = varispeed.moveBy(-5, loop);
+
+    expect(varispeed.position).toBe(20);
+    expect(travelled).toBe(-2);
+  });
+
+  it('travels nothing once held at a stopped start', () => {
+    const { varispeed, loop } = held(20, 'stop');
+
+    const travelled = varispeed.moveBy(-3, loop);
+
+    expect(varispeed.position).toBe(20);
+    expect(travelled).toBe(0);
+  });
+
+  it('wraps a move back past the start to the end less the undershoot, below the end', () => {
+    const { varispeed, loop } = held(22, 'wrap');
+
+    const travelled = varispeed.moveBy(-5, loop);
+
+    expect(varispeed.position).toBe(27);
+    expect(travelled).toBe(-5);
+  });
+
+  it('wraps a backward move longer than the loop, and never lands on the end', () => {
+    const { varispeed, loop } = held(22, 'wrap');
+    varispeed.moveBy(-37, loop); // 15 under the start, and 15 mod 10 is 5
+    expect(varispeed.position).toBe(25);
+
+    const exact = held(20, 'wrap');
+    exact.varispeed.moveBy(-10, exact.loop); // a whole length under: end is outside the loop
+    expect(exact.varispeed.position).toBe(20);
+  });
+
+  it('moves freely while before the loop, and is held once the move begins inside it', () => {
+    const { varispeed, loop } = held(10, 'wrap');
+
+    varispeed.moveBy(15, loop); // from 10 to 25: entering, not wrapping
+    expect(varispeed.position).toBe(25);
+
+    varispeed.moveBy(-10, loop); // now inside, 10 under 25 wraps
+    expect(varispeed.position).toBe(25);
+  });
+
+  it('moves freely past the end when the playhead starts at or after it', () => {
+    const { varispeed, loop } = held(30, 'wrap');
+
+    expect(varispeed.moveBy(5, loop)).toBe(5);
+    expect(varispeed.position).toBe(35);
+  });
+
+  it('moves freely through a loop without the field, and without a loop', () => {
+    const { varispeed, loop } = held(28);
+
+    varispeed.moveBy(5, loop);
+    expect(varispeed.position).toBe(33);
+
+    varispeed.moveBy(-20, null);
+    expect(varispeed.position).toBe(13);
+  });
+
+  it('still clamps to the record, and reports the distance it really moved', () => {
+    const varispeed = varispeedOver(recordOf(100, RAMP), 98);
+
+    expect(varispeed.moveBy(5)).toBe(2);
+    expect(varispeed.position).toBe(100);
+    expect(varispeed.moveBy(5)).toBe(0);
+
+    expect(varispeed.moveBy(-150)).toBe(-100);
+    expect(varispeed.position).toBe(0);
+  });
+
+  it('holds a loop that reaches the record end where the record ends', () => {
+    const varispeed = varispeedOver(recordOf(25, RAMP), 22);
+    const loop: ActiveLoop = {
+      startFrame: frames(20),
+      endFrame: frames(30),
+      varispeedStart: 'wrap',
+    };
+
+    varispeed.moveBy(2.5, loop);
+    const travelled = varispeed.moveBy(2, loop); // 26.5 is inside the loop but past the record
+
+    expect(varispeed.position).toBe(25);
+    expect(travelled).toBe(0.5);
   });
 });

@@ -18,8 +18,8 @@ it except the `InMemory*` doubles. `plain-copy.ts` is internal too.
   the other).
 - `loop-marker.ts` — `LoopMarker`, `LoopBoundary` and `PlainValue`: the positions a performer marked
   in one tune, as plain frame-and-offset numbers. The marker also carries an optional `name`, and
-  `PlainValue` `settings` and `usesOwnSettings`, which the library stores and copies but never
-  reads. A storage shape only; no engine snapshot or readiness flag belongs on it, since
+  `PlainValue` `settings`, `usesOwnSettings` and `wraps`, which the library stores and copies but
+  never reads. A storage shape only; no engine snapshot or readiness flag belongs on it, since
   `@sidablist/core` rebuilds snapshots from these positions and never depends on this package.
 - `tune-set.ts` — `TuneSet`, `SetRow`, `SubtuneMemory`, `TuneMemory` and their companions: the
   storage shape of a set and of a tune's latest memory.

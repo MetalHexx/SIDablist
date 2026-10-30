@@ -86,6 +86,27 @@ describe('createRow', () => {
     expect(created.subtunes).toEqual(memory.subtunes);
   });
 
+  it('carries a marker wraps flag through the copy, and leaves it absent when absent', () => {
+    const flagged: TuneMemory = {
+      ...memory,
+      subtunes: [
+        {
+          subtune: 1,
+          markers: [
+            { ...marker('w'), end: { frame: 9, offsetFrames: 0 }, wraps: true },
+            { ...marker('n'), end: { frame: 9, offsetFrames: 0 } },
+          ],
+        },
+      ],
+    };
+
+    const created = createRow({ id: 'r', tune: tune('h1'), memory: flagged, startSubtune: 1 });
+
+    const [wrapping, plain] = created.subtunes[0].markers;
+    expect(wrapping.wraps).toBe(true);
+    expect('wraps' in plain).toBe(false);
+  });
+
   it('starts empty on startSubtune, clamped, without a memory', () => {
     const created = createRow({ id: 'r', tune: tune('h1'), memory: null, startSubtune: 9 });
 

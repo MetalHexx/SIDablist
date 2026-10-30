@@ -91,6 +91,7 @@ export {
   type ActiveLoopTracker,
   type AdvanceResult,
   type QueuedNext,
+  type VarispeedLoopStart,
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
 export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';

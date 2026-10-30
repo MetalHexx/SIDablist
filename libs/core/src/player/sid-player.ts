@@ -5,6 +5,7 @@ import type { TimingMode } from '../clock/play-rate.js';
 import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-frame.js';
 import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidField } from '../registers/sid-fields.js';
+import type { ActiveLoop } from '../timeline/active-loop.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
 /** Called once a tick while in varispeed, before the tick moves the position. `position` is the
@@ -52,7 +53,9 @@ export interface SidPlayer {
   nextSubtune(): void;
   /** Selects the previous subtune, clamped to the tune's range. A no-op at the first subtune. */
   previousSubtune(): void;
-  setActiveLoop(loop: { startFrame: Frames; endFrame: Frames } | null): void;
+  /** Replaces the running loop; null clears it. A loop carrying `varispeedStart` also holds
+   *  varispeed inside it — see `ActiveLoop`. */
+  setActiveLoop(loop: ActiveLoop): void;
   /**
    * Declares the frames the host wants to jump to instantly — loop starts and cue points alike —
    * replacing the previous set; an empty list withdraws all. Each declared frame gets its own
