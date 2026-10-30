@@ -2,6 +2,7 @@ import { clamp } from '../common/math.js';
 import type { SidWriteSink } from '../cpu/c64-machine.js';
 import type { RegisterRecord } from '../registers/register-record.js';
 import { SID_REGISTER_COUNT } from '../registers/sid-constants.js';
+import type { ActiveLoop } from '../timeline/active-loop.js';
 
 /** `lastEntry` before anything has been fed: the next feed writes the whole entry. */
 const NOTHING_FED = -1;
@@ -24,8 +25,10 @@ export interface Varispeed {
   /** Puts the playhead at `position` (clamped to the record) and forgets what was fed, so the next
    *  feed writes all 25 registers of its entry. */
   begin(position: number): void;
-  /** Moves the playhead by `rate` play calls, clamped to the record. */
-  moveBy(rate: number): void;
+  /** Moves the playhead by `rate` play calls, held by `loop` when it carries `varispeedStart`
+   *  and the playhead starts inside it, then clamped to the record. Returns the distance
+   *  travelled along the record — a wrap counts as the full rate — for the rate pitch. */
+  moveBy(rate: number, loop?: ActiveLoop): number;
   /** Puts the playhead at `position`, clamped to the record. What was fed is kept: the next feed
    *  writes only what differs from it. */
   moveTo(position: number): void;
@@ -79,8 +82,33 @@ class VarispeedImpl implements Varispeed {
     this.lastEntry = NOTHING_FED;
   }
 
-  moveBy(rate: number): void {
-    this.moveTo(this.playhead + rate);
+  moveBy(rate: number, loop?: ActiveLoop): number {
+    const from = this.playhead;
+    const to = from + rate;
+    if (
+      loop?.varispeedStart !== undefined &&
+      this.recordHeld !== null &&
+      from >= loop.startFrame &&
+      from < loop.endFrame
+    ) {
+      const { startFrame, endFrame } = loop;
+      const length = endFrame - startFrame;
+      if (to >= endFrame) {
+        this.moveTo(startFrame + ((to - endFrame) % length));
+        return rate;
+      }
+      if (to < startFrame) {
+        if (loop.varispeedStart === 'stop') {
+          this.moveTo(startFrame);
+          return this.playhead - from;
+        }
+        const landing = endFrame - ((startFrame - to) % length);
+        this.moveTo(landing < endFrame ? landing : startFrame);
+        return rate;
+      }
+    }
+    this.moveTo(to);
+    return this.playhead - from;
   }
 
   moveTo(position: number): void {

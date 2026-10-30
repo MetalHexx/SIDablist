@@ -3594,11 +3594,13 @@ describe('createSidPlayer', () => {
         for (const rate of [1.5, -2, 0, 1, 1000]) {
           h.rate.value = rate;
           run(h.clock, 1);
-          position = Math.min(60, Math.max(0, position + rate));
+          const moved = Math.min(60, Math.max(0, position + rate));
+          const travelled = moved - position;
+          position = moved;
           applyFrameToChip(chip, lastDelivered(h.sink));
           const row = rowOf(h.record, Math.floor(position) - 1);
           const raw = row[0] | (row[1] << 8);
-          const expected = Math.min(0xffff, Math.round(raw * (ratio * 2 * Math.abs(rate))));
+          const expected = Math.min(0xffff, Math.round(raw * (ratio * 2 * Math.abs(travelled))));
           expect(chip[0] | (chip[1] << 8)).toBe(expected);
         }
       });
@@ -3652,6 +3654,174 @@ describe('createSidPlayer', () => {
         expect(gate(chipsOf(live.sink))).toBe(0);
         expect(gate(chipsOf(h.sink))).toBe(0);
         expect(chipsOf(h.sink)).toEqual(chipsOf(live.sink));
+      });
+    });
+
+    describe('a loop that holds varispeed', () => {
+      const frequencyOf = (chip: Uint8Array): number => chip[0] | (chip[1] << 8);
+
+      /** In varispeed over a 60-frame record, inside a loop over 5…10 that holds in `mode`, at
+       *  `position`. */
+      async function heldIn(mode: 'stop' | 'wrap', position: number, rate: number): Promise<Held> {
+        const h = withRecord(rampTune(), 60);
+        h.player.setActiveLoop({
+          startFrame: frames(5),
+          endFrame: frames(10),
+          varispeedStart: mode,
+        });
+        await flushEntryImageCapture();
+        h.rate.value = rate;
+        h.player.enterVarispeed(h.source);
+        await h.player.seek(frames(position));
+        return h;
+      }
+
+      it('wraps a move past the end to the start, keeping the pitch of the full rate', async () => {
+        const h = await heldIn('stop', 8, 3);
+
+        run(h.clock, 1); // 8 + 3 = 11, one past the end: lands at 6
+
+        expect(h.player.getPosition()).toBe(6);
+        expect(chipsOf(h.sink)[0]).toEqual(expectedChip(h.record, 5, 3));
+      });
+
+      it('goes silent while held at a stopped start, after the tick that reached it', async () => {
+        const h = await heldIn('stop', 6, -1);
+
+        run(h.clock, 3);
+
+        const chips = chipsOf(h.sink);
+        expect(h.player.getPosition()).toBe(5);
+        expect(frequencyOf(chips[0])).not.toBe(0); // 6 to 5: travelled a whole call
+        expect(frequencyOf(chips[1])).toBe(0);
+        expect(frequencyOf(chips[2])).toBe(0);
+      });
+
+      it('wraps backward past the start to just below the end, at the full pitch', async () => {
+        const h = await heldIn('wrap', 6, -3);
+
+        run(h.clock, 1); // 6 - 3 = 3, two under the start: lands at 10 - 2 = 8
+
+        expect(h.player.getPosition()).toBe(8);
+        expect(chipsOf(h.sink)[0]).toEqual(expectedChip(h.record, 7, 3));
+      });
+
+      it('leaves a queued jump, the hand-off count and the loop alone across wraps', async () => {
+        const h = withRecord(rampTune(), 60);
+        h.player.setJumpTargets([frames(30)]);
+        h.player.setActiveLoop({
+          startFrame: frames(5),
+          endFrame: frames(10),
+          varispeedStart: 'wrap',
+        });
+        await flushEntryImageCapture();
+        h.rate.value = 4;
+        h.player.enterVarispeed(h.source);
+        await h.player.seek(frames(8));
+        h.player.queueJump({ startFrame: frames(30), endFrame: frames(40) });
+        await flushEntryImageCapture();
+        const queuedBefore = snapshotOf(h.player).tune?.queuedJump;
+        const requests = h.replay.requests.length;
+
+        run(h.clock, 6); // 8 → 7 → 6 → 5 → 9 → 8 → 7: wraps on ticks 1 and 4
+
+        expect(h.player.getPosition()).toBeGreaterThanOrEqual(5);
+        expect(h.player.getPosition()).toBeLessThan(10);
+        expect(handOffs(h.player)).toBe(0);
+        expect(snapshotOf(h.player).tune?.queuedJump).toEqual(queuedBefore);
+        expect(snapshotOf(h.player).tune?.queuedJump).not.toBeNull();
+        expect(snapshotOf(h.player).loop).toEqual({
+          startFrame: 5,
+          endFrame: 10,
+          varispeedStart: 'wrap',
+        });
+        expect(h.player.getStats().resync.inFlightDepth).toBe(0);
+        expect(h.replay.requests).toHaveLength(requests);
+      });
+
+      it('keeps its mode on the loop a queued jump hands off to', async () => {
+        const h = withRecord(rampTune(), 60);
+        await h.player.play();
+        h.player.setJumpTargets([frames(30)]);
+        h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
+        await flushEntryImageCapture();
+
+        h.player.queueJump({
+          startFrame: frames(30),
+          endFrame: frames(40),
+          varispeedStart: 'stop',
+        });
+
+        expect(snapshotOf(h.player).tune?.queuedJump).toEqual({
+          startFrame: 30,
+          endFrame: 40,
+          varispeedStart: 'stop',
+        });
+        for (let tick = 0; tick < 100 && handOffs(h.player) !== 1; tick++) run(h.clock, 1);
+        expect(handOffs(h.player)).toBe(1);
+        expect(snapshotOf(h.player).loop).toEqual({
+          startFrame: 30,
+          endFrame: 40,
+          varispeedStart: 'stop',
+        });
+      });
+
+      it('drops the mode from a queued cue, which has no loop to hold', async () => {
+        const h = withRecord(rampTune(), 60);
+        h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
+        await flushEntryImageCapture();
+
+        h.player.queueJump({ startFrame: frames(30), endFrame: null, varispeedStart: 'wrap' });
+
+        expect(snapshotOf(h.player).tune?.queuedJump).toEqual({ startFrame: 30, endFrame: null });
+      });
+
+      it('reports the mode in the loop snapshot, and notifies when only the mode changes', () => {
+        const h = withRecord(rampTune(), 60);
+        const listener = vi.fn();
+        h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
+        h.player.subscribe(listener);
+
+        h.player.setActiveLoop({
+          startFrame: frames(5),
+          endFrame: frames(10),
+          varispeedStart: 'wrap',
+        });
+
+        expect(snapshotOf(h.player).loop).toEqual({
+          startFrame: 5,
+          endFrame: 10,
+          varispeedStart: 'wrap',
+        });
+        expect(listener).toHaveBeenCalledTimes(1);
+
+        h.player.setActiveLoop({
+          startFrame: frames(5),
+          endFrame: frames(10),
+          varispeedStart: 'wrap',
+        });
+        expect(listener).toHaveBeenCalledTimes(1);
+      });
+
+      it('still laps at the loop end during the handback', async () => {
+        const h = withRecord(rampTune(), 60);
+        h.player.setActiveLoop({
+          startFrame: frames(5),
+          endFrame: frames(10),
+          varispeedStart: 'wrap',
+        });
+        await flushEntryImageCapture();
+        await h.player.seek(frames(8));
+        h.player.enterVarispeed(h.source);
+        await h.player.play();
+        h.replay.manual = true;
+        h.player.leaveVarispeed();
+
+        run(h.clock, 2);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(5);
+        expect(h.player.getStats().resync.inFlightDepth).toBe(1);
       });
     });
 

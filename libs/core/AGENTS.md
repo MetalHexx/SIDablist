@@ -26,7 +26,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `clock/` — `FrameAccumulator`, `ClockStats` and the play-rate math a host clock is measured and
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
-  operations core owns.
+  operations core owns. An `ActiveLoop` may carry `varispeedStart`, which varispeed alone reads.
 - `player/` — `createSidPlayer`, the composition root wiring the above into `SidPlayer`, plus
   `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
   surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
@@ -35,8 +35,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `JumpSettings`, applied as the jump lands; `capturePosition()` returns the frame it captured.
   `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for those builds, so a
   scrub does not wait behind a batch of them; without it they share the scrub runner. Varispeed
-  (`enterVarispeed`/`leaveVarispeed`) plays a `RegisterRecord` at a rate the host names per tick;
-  `varispeed.ts` is the record-driven half the coordinator sequences.
+  (`enterVarispeed`/`leaveVarispeed`) plays a `RegisterRecord` at a rate the host names per tick,
+  held inside a loop that carries `varispeedStart`; `varispeed.ts` is the record-driven half the
+  coordinator sequences.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -133,6 +134,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Every exit from varispeed returns the rate pitch to home through `endVarispeed`.** The rate pitch
   lives on the `RegisterFrame`, which `stop()` and a subtune change keep, so one left at 0 silences
   the next play. A new exit calls the one routine rather than setting the pitch itself.
+- **A held loop moves the varispeed record, never the machine.** A wrap under varispeed must not
+  lap, restore an image or hand off: doing so would apply a queued jump mid-scratch. On a handback
+  tick the hold stands aside for `enforceLoop`, since wrapping the record there would hide the loop's
+  end from it and the queued jump would never fire.
 - **`capturePosition()` caches nothing while in varispeed.** The live machine is not at the
   position, so an image taken of it would be filed under a frame it does not describe.
 - **A spec that needs a DOM is a spec testing the wrong thing.** `vitest.config.ts` here runs

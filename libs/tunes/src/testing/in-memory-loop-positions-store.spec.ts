@@ -159,6 +159,21 @@ describe('InMemoryLoopPositionsStore', () => {
       expect(await store.load(IDENTITY)).toEqual([saved]);
     });
 
+    it('round-trips the wraps flag, true or false, and leaves it absent when absent', async () => {
+      const store = new InMemoryLoopPositionsStore();
+      await store.save(IDENTITY, [
+        { ...marker('a', 100), wraps: true },
+        { ...marker('b', 200), wraps: false },
+        marker('c', 300),
+      ]);
+
+      const [wrapping, stopping, unset] = await store.load(IDENTITY);
+
+      expect(wrapping.wraps).toBe(true);
+      expect(stopping.wraps).toBe(false);
+      expect('wraps' in unset).toBe(false);
+    });
+
     it('leaves a marker with neither field without either', async () => {
       const store = new InMemoryLoopPositionsStore();
       await store.save(IDENTITY, [marker('a', 100)]);

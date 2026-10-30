@@ -3,12 +3,16 @@ import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { FrameClockStats } from '../ports/clock.js';
 import type { FarEndConsumption, SinkCapabilities } from '../ports/sink.js';
 import type { SidField } from '../registers/sid-fields.js';
+import type { ActiveLoop, VarispeedLoopStart } from '../timeline/active-loop.js';
 
 /** A jump the host queued for the end of the running loop's current lap: a loop when
  *  `endFrame` is set, a cue (play on from `startFrame`, no loop) when it is null. */
 export interface QueuedJump {
   readonly startFrame: Frames;
   readonly endFrame: Frames | null;
+  /** How varispeed holds the queued loop once it is running — see `ActiveLoop`. Means something
+   *  only when `endFrame` is set. */
+  readonly varispeedStart?: VarispeedLoopStart;
 }
 
 /** Output-stage settings a jump applies as it lands, in the engine's own terms. It applies
@@ -69,7 +73,7 @@ export interface PlayerSnapshot {
      *  that drives it is never published: it moves every tick. */
     readonly varispeed: boolean;
   };
-  readonly loop: { readonly startFrame: Frames; readonly endFrame: Frames } | null;
+  readonly loop: ActiveLoop;
   readonly voices: readonly { readonly muted: boolean; readonly held: boolean }[];
   /** What the playhead is measured against, and where the track ends — both derived from the
    *  track structure the application supplied. */

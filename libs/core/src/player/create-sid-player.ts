@@ -712,11 +712,19 @@ class SidPlayerCoordinator implements SidPlayer {
     // The published record never carries settings: they live only on the tracker's queued object,
     // and go when it does.
     const prepared = target.settings === undefined ? null : this.prepareSettings(target.settings);
-    const record: QueuedJump = { startFrame, endFrame };
+    const varispeedStart = endFrame === null ? undefined : target.varispeedStart;
+    const record: QueuedJump = {
+      startFrame,
+      endFrame,
+      ...(varispeedStart === undefined ? {} : { varispeedStart }),
+    };
     this.queuedJump = record;
     this.activeLoop.queue({
       startFrame,
-      loop: endFrame === null ? null : { startFrame, endFrame },
+      loop:
+        endFrame === null
+          ? null
+          : { startFrame, endFrame, ...(varispeedStart === undefined ? {} : { varispeedStart }) },
       ...(prepared === null ? {} : { beforeLanding: () => this.applyPreparedSettings(prepared) }),
     });
     this.armQueuedImage(record);
@@ -1292,6 +1300,11 @@ class SidPlayerCoordinator implements SidPlayer {
    * under the playhead is fed through the live frame, and one frame goes out — even when nothing
    * changed, so the stream and the frame grid stay one-to-one. No machine runs.
    *
+   * A loop carrying `varispeedStart` holds the playhead inside it: a wrap is a move along the record,
+   * never a lap, so it restores no image, owes no resync and leaves the queued jump alone. The pitch
+   * follows the distance travelled, so a playhead held at a stopped start or the record's ends is
+   * silent.
+   *
    * While handing back the rate is 1 and the loop in force is enforced as a live tick enforces it.
    * Once the playhead reaches the frame of the image the handback is waiting on, the machine takes
    * over from it.
@@ -1314,9 +1327,10 @@ class SidPlayerCoordinator implements SidPlayer {
       if (!Number.isFinite(rate)) rate = 0;
     }
 
-    varispeed.moveBy(rate);
+    // A handback tick runs the loop through `enforceLoop`, so it is never held.
+    const travelled = varispeed.moveBy(rate, this.handingBack ? null : this.activeLoop.get());
     varispeed.feed(frame);
-    frame.setRatePitch(Math.abs(rate));
+    frame.setRatePitch(Math.abs(travelled));
     this.lastCyclesUsed = cycles(0);
     this.deliver(frame.takeSnapshot(), dueAtMs, catchUpClamped);
     this.session.framesRendered = frames(Math.floor(varispeed.position));
