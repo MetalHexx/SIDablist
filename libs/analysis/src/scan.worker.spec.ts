@@ -184,6 +184,23 @@ describe('the scan worker', () => {
     expect(outputOf(messages).frames).toBe(30);
   });
 
+  it('drops its held scan once a keep:false request has been answered', () => {
+    const session = newSession();
+    const messages: ScanMessage[] = [];
+    handleScanRequest(
+      { id: ++lastId, session, file: counterTune, subtune: 1, maxFrames: 30, keep: false },
+      (message) => messages.push(message),
+    );
+    expect(outputOf(messages).frames).toBe(30);
+    runFrameSpy.mockClear();
+    initSubtuneSpy.mockClear();
+
+    drive(counterTune, session, 1, 30);
+
+    expect(initSubtuneSpy).toHaveBeenCalledTimes(1);
+    expect(runFrameSpy).toHaveBeenCalledTimes(30);
+  });
+
   it('reports a cycle-budget failure as a message, and refuses to deepen the machine that failed', () => {
     const session = newSession();
 

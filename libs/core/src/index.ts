@@ -27,6 +27,7 @@ export {
   type SidFilterMode,
   type VoiceRegisterState,
 } from './registers/register-frame.js';
+export type { RegisterRecord } from './registers/register-record.js';
 export { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from './registers/clock-ratio.js';
 export {
   NTSC_FRAME_INTERVAL_US,
@@ -92,7 +93,7 @@ export {
   type QueuedNext,
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
-export { type SidPlayer } from './player/sid-player.js';
+export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
 export {
   type JumpSettings,
   type PlayerSnapshot,

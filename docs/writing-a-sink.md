@@ -30,7 +30,10 @@ almost nothing unused, while narrowing a shipped one means rewriting both ends.
   know its reading is a floor, not a fact. See the buffer-reuse rule below before storing `frame`.
 - **`deliverNow(frame)`** — sends immediately, outside the schedule and ahead of anything queued. This
   is the gate-off a pause needs: queued behind scheduled frames it would let notes ring on until the
-  queue drained.
+  queue drained. A sink that cannot cancel cannot get ahead of what it already committed — those
+  frames would land after the gate-off and re-open the voices — so it sends right behind them
+  instead, and keeps its schedule-ahead short enough that the wait is inaudible. ASID's
+  `sendUnscheduled` is the worked example.
 - **`retime(intervalUs)`** — re-times or withdraws whatever is still outstanding after a tempo change.
   A sink with no scheduling of its own implements this as a no-op.
 - **`reset()`** — drops everything outstanding without stopping the far end. Separate from `end()`

@@ -19,6 +19,7 @@ import { detectKey } from './key.js';
 import { segmentNotes } from './notes.js';
 import { detectLoop, IDLE_PERIOD_SECONDS, MIN_TAIL_SECONDS } from './loop-detect.js';
 import type { LoopDetection } from './loop-detect.js';
+import { nextRequestId, nextSessionId } from './scan-ids.js';
 import type { ScanOutput } from './scan-tune.js';
 import type { AnalysisScanner, ScanRequest, ScanResult } from './scanner.js';
 import { TUNE_INDEX_FORMAT_VERSION } from './tune-index.model.js';
@@ -33,11 +34,6 @@ export class ScanFailedError extends Error {}
 
 /** Seconds of music per rung — the depths the measured baseline was produced at. */
 export const SCAN_DEPTH_SECONDS: readonly number[] = [90, 210, 450, 750];
-
-// Session and request ids only need to be unique across the process, never persisted or compared
-// across one — a module counter is the whole requirement.
-let nextSessionId = 0;
-let nextRequestId = 0;
 
 /**
  * Runs the scan ladder over one tune and produces its persisted index record.
@@ -57,7 +53,7 @@ export async function indexTune(
 ): Promise<TuneIndexRecord> {
   const file = parseSidFile(bytes);
   const nominalIntervalUs = file.clock === 'ntsc' ? NTSC_FRAME_INTERVAL_US : PAL_FRAME_INTERVAL_US;
-  const session = ++nextSessionId;
+  const session = nextSessionId();
 
   const probe = await requestScan(scanner, {
     session,
@@ -140,7 +136,7 @@ async function requestScan(
   scanner: AnalysisScanner,
   rung: Omit<ScanRequest, 'id'>,
 ): Promise<ScanOutput> {
-  const result: ScanResult = await scanner.scan({ id: ++nextRequestId, ...rung });
+  const result: ScanResult = await scanner.scan({ id: nextRequestId(), ...rung });
   if (result.kind === 'failed') {
     throw new ScanFailedError(result.error);
   }

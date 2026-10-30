@@ -55,6 +55,8 @@ export interface PlayerSnapshot {
      *  increments once per hand-off and never on a cancel, a replace or a clear, so a host can tell
      *  a landing from a dropped queue. */
     readonly handOffs: number;
+    /** The register record's length in play calls, or null without a record. */
+    readonly recordedFrames: Frames | null;
   } | null;
   readonly tempo: {
     readonly multiplier: number;
@@ -63,6 +65,9 @@ export interface PlayerSnapshot {
     readonly callsPerFrame: number;
     readonly rate: PlayRate;
     readonly timingMode: TimingMode;
+    /** True from `enterVarispeed` until live playback or the paused landing takes over. The rate
+     *  that drives it is never published: it moves every tick. */
+    readonly varispeed: boolean;
   };
   readonly loop: { readonly startFrame: Frames; readonly endFrame: Frames } | null;
   readonly voices: readonly { readonly muted: boolean; readonly held: boolean }[];

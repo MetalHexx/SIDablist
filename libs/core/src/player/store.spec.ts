@@ -16,6 +16,7 @@ function baseSnapshot(): PlayerSnapshot {
       callsPerFrame: 1,
       rate: { callsPerFrame: 1, exactCallsPerFrame: 1, roundedCallsPerFrame: 1, mode: 'exact' },
       timingMode: 'exact',
+      varispeed: false,
     },
     loop: null,
     voices: [

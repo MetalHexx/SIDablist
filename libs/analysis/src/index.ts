@@ -51,6 +51,7 @@ export {
   type NoveltyResult,
 } from './novelty.js';
 export { computePulse, impliedTempo, type PulseResult } from './pulse.js';
+export { toRegisterRecord, recordRegisters } from './register-record.js';
 export { TuneScan, scanTune, type ScanOutput } from './scan-tune.js';
 export { computeStructure, type StructureResult } from './structure.js';
 export {

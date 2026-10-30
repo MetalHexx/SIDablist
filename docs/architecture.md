@@ -223,18 +223,22 @@ and Angular wraps it in a signal updated from an effect.
 
 Everything is a plain read. The only distinction is **whether a change notifies you**:
 
-| Read            | Notifies | Carries                                                                                                                 |
-| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `getSnapshot()` | yes      | Transport state, tune with its ready jump frames, queued jump and hand-off count, tempo, the active loop, voices, error |
-| `getPosition()` | no       | The playhead frame                                                                                                      |
-| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                                                     |
-| `readRegisters` | no       | Every register, as written and as sent                                                                                  |
+| Read            | Notifies | Carries                                                                                                                                                            |
+| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `getSnapshot()` | yes      | Transport state, tune with its ready jump frames, queued jump, hand-off count and record length, tempo and whether varispeed is on, the active loop, voices, error |
+| `getPosition()` | no       | The playhead frame                                                                                                                                                 |
+| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                                                                                                |
+| `readRegisters` | no       | Every register, as written and as sent                                                                                                                             |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 
 `readRegisters(written, sent)` is a pull read like `getPosition()`: it never notifies, and it fills
 two buffers the caller owns instead of returning a fresh object, so a consumer reading it every
 animation frame allocates nothing. With no tune loaded both buffers read zero.
+
+Varispeed follows the same rule from the other side. The host's rate is something time moves, so the
+player pulls it through a source it is handed, once a tick, and publishes nothing of it; entering and
+leaving varispeed are a person's actions and notify.
 
 This is not stylistic. The engine advances fifty times a second. Pushing the playhead
 through a subscription would wake every consumer's change detection fifty times a second to tell it

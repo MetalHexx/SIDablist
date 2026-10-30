@@ -1369,6 +1369,133 @@ describe('RegisterFrame', () => {
   });
 });
 
+describe('RegisterFrame rate pitch', () => {
+  /** Every voice's frequency written once as 0x1234, with that frame already delivered. */
+  function frameAtRest(): RegisterFrame {
+    const frame = createRegisterFrame();
+    FREQUENCY_REGISTERS.forEach(([low, high]) => {
+      frame.onSidWrite(low, 0x34);
+      frame.onSidWrite(high, 0x12);
+    });
+    frame.takeSnapshot();
+    return frame;
+  }
+
+  it('scales every voice by the same coefficient', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(2);
+
+    const snapshot = frame.takeSnapshot();
+
+    for (const [low, high] of FREQUENCY_REGISTERS) {
+      expect(emittedValue(snapshot, low)).toBe(0x68); // 0x1234 -> 0x2468
+      expect(emittedValue(snapshot, high)).toBe(0x24);
+    }
+  });
+
+  it('sends a frequency of 0 at 0, which every voice then holds until it moves', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(0);
+
+    const snapshot = frame.takeSnapshot();
+
+    for (const [low, high] of FREQUENCY_REGISTERS) {
+      expect(emittedValue(snapshot, low)).toBe(0);
+      expect(emittedValue(snapshot, high)).toBe(0);
+    }
+  });
+
+  it('saturates at the register ceiling rather than wrapping', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(100);
+
+    const snapshot = frame.takeSnapshot();
+
+    expect(emittedValue(snapshot, 0)).toBe(0xff);
+    expect(emittedValue(snapshot, 1)).toBe(0xff);
+  });
+
+  it('composes with the clock correction and the voice pitch, and disturbs neither', () => {
+    const frame = frameAtRest();
+    frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+    frame.setVoicePitch(1, 2);
+    frame.setRatePitch(0.5);
+    const composed = frame.takeSnapshot();
+
+    // The reference stage given the same factors as one voice pitch.
+    const reference = frameAtRest();
+    reference.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+    reference.setVoicePitch(0, 0.5);
+    reference.setVoicePitch(1, 1);
+    reference.setVoicePitch(2, 0.5);
+    const expected = reference.takeSnapshot();
+
+    for (const register of [0, 1, 7, 8, 14, 15]) {
+      expect(emittedValue(composed, register)).toBe(emittedValue(expected, register));
+    }
+
+    frame.setRatePitch(1);
+    frame.takeSnapshot();
+    frame.setVoicePitch(1, 1);
+    frame.takeSnapshot();
+    frame.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+    const home = writesOf(frame.takeSnapshot());
+    expect(valueFor(home, 0)).toBe(0x34);
+    expect(valueFor(home, 1)).toBe(0x12);
+  });
+
+  it('sends the raw bytes once when it returns to 1, and nothing more', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(3);
+    frame.takeSnapshot();
+
+    frame.setRatePitch(1);
+    const restore = writesOf(frame.takeSnapshot());
+    const settled = frame.takeSnapshot();
+
+    expect(valueFor(restore, 0)).toBe(0x34);
+    expect(valueFor(restore, 1)).toBe(0x12);
+    expect(settled.count).toBe(0);
+  });
+
+  it('arms nothing by being set to the value it already holds', () => {
+    const frame = frameAtRest();
+
+    frame.setRatePitch(1);
+
+    expect(frame.takeSnapshot().count).toBe(0);
+  });
+
+  it('ignores a coefficient that is negative or not finite', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(2);
+    frame.takeSnapshot();
+
+    frame.setRatePitch(-1);
+    frame.setRatePitch(Number.NaN);
+    frame.setRatePitch(Number.POSITIVE_INFINITY);
+
+    const snapshot = frame.takeSnapshot();
+    expect(emittedValue(snapshot, 0)).toBe(0x68);
+    expect(emittedValue(snapshot, 1)).toBe(0x24);
+  });
+
+  it('never enters the shadow, and the offset and hold layers still compose over it', () => {
+    const frame = frameAtRest();
+    frame.setRatePitch(2);
+    frame.setFieldOffset({ name: 'frequency', voice: 0 }, 5);
+    frame.holdField({ name: 'frequency', voice: 1 }, 0x0100);
+    const snapshot = frame.takeSnapshot();
+
+    expect(emittedValue(snapshot, 0)).toBe(0x6d); // 0x2468 + 5
+    expect(emittedValue(snapshot, 1)).toBe(0x24);
+    expect(emittedValue(snapshot, 7)).toBe(0x00); // held at 0x0100
+    expect(emittedValue(snapshot, 8)).toBe(0x01);
+    expect(frame.snapshotValues().values[0]).toBe(0x34);
+    expect(frame.snapshotValues().values[1]).toBe(0x12);
+  });
+});
+
 describe('RegisterFrame field holds', () => {
   const CUTOFF = { name: 'cutoff' } as const;
   const FILTER_TYPE = { name: 'filterType' } as const;

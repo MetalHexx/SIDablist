@@ -20,7 +20,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `vendor/mos6502/` implements.
 - `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
   stage — multiplier, offset, hold — that builds one), `sid-fields.ts` (the table of chip fields an
-  application can drive), `__reference__/` (the frozen pre-field-table implementation
+  application can drive), `register-record.ts` (`RegisterRecord`, a tune's register stream as data,
+  which varispeed plays), `__reference__/` (the frozen pre-field-table implementation
   `register-frame.equivalence.spec.ts` checks against), and the register and clock constants.
 - `clock/` — `FrameAccumulator`, `ClockStats` and the play-rate math a host clock is measured and
   paced by.
@@ -33,7 +34,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `queueJump` queues a hand-off for the running loop's next wrap; `queueJump` and `seek` can carry
   `JumpSettings`, applied as the jump lands; `capturePosition()` returns the frame it captured.
   `SidPlayerCollaborators.prepareRunner` is an optional second replay runner for those builds, so a
-  scrub does not wait behind a batch of them; without it they share the scrub runner.
+  scrub does not wait behind a batch of them; without it they share the scrub runner. Varispeed
+  (`enterVarispeed`/`leaveVarispeed`) plays a `RegisterRecord` at a rate the host names per tick;
+  `varispeed.ts` is the record-driven half the coordinator sequences.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -113,6 +116,25 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Offsets and multipliers never enter the shadow.** The shadow holds what the tune wrote, and the
   output stage shapes a copy of it on the way out. Writing a multiplied or offset value back into
   the shadow makes a cue re-entered at another setting apply it twice.
+- **The rate source must not issue a player command or allocate.** `VarispeedRateSource` is called
+  from inside the tick, before it moves the position: a `seek`, `pause`, `leaveVarispeed` or
+  `enterVarispeed` from there re-enters the tick that is calling it. Pure reads — `getSnapshot`,
+  `getPosition` — are fine. The rate is pulled, never published; only entering and leaving notify.
+- **The handback relies on the record's chip state matching replay's byte for byte.** Leaving
+  varispeed while playing sends no gate-off and no re-emit, because the chip state the record has
+  built to the image's frame is the state live playback would have built. A record built from a
+  shaped frame (multiplied, offset, held, muted) or from the shadow instead of the chip state —
+  where a doubled control write differs — breaks that silently: a hung or dropped note at the seam,
+  and no spec of the record's own will say so.
+- **A non-playing varispeed owns the running clock.** With the transport `paused`, `stopped` or
+  `ended`, nothing in the transport rules stops the clock varispeed started, so every exit from it
+  must — `loadTune`, `selectSubtune`, `stop`, `dispose` and the paused landing each do. A new exit
+  that forgets leaves a clock ticking a player that reads stopped.
+- **Every exit from varispeed returns the rate pitch to home through `endVarispeed`.** The rate pitch
+  lives on the `RegisterFrame`, which `stop()` and a subtune change keep, so one left at 0 silences
+  the next play. A new exit calls the one routine rather than setting the pitch itself.
+- **`capturePosition()` caches nothing while in varispeed.** The live machine is not at the
+  position, so an image taken of it would be filed under a frame it does not describe.
 - **A spec that needs a DOM is a spec testing the wrong thing.** `vitest.config.ts` here runs
   `environment: 'node'`, no `jsdom`, matching the "touches no browser global" invariant at the
   root. A `core` spec that reaches for `window` or `document` has crossed a port boundary that
@@ -141,11 +163,19 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   or `RegisterFrame`'s snapshot API?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+- **Changed `RegisterRecord` (`registers/register-record.ts`), or how `RegisterFrame` snapshots a
+  doubled voice control write?** `libs/analysis`'s `toRegisterRecord` and `TuneScan.recordControls`
+  build the record from that shape, and `feed` (`player/varispeed.ts`) plays it back. A shifted
+  meaning records a stream that hangs or drops notes at the handback, with no compile error. Update
+  both and run `libs/analysis/src/register-record.spec.ts`. Detail:
+  [`libs/analysis/src/register-record.ts`](../analysis/src/register-record.ts).
 
 - **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
   unhandled variant leaves the player's position and the stream out of step without a compile
-  error. Handle it there, then run `player/create-sid-player.spec.ts`.
+  error. Handle it there, then run `player/create-sid-player.spec.ts`. The same branches end a
+  varispeed handback: a variant that moves the stream but does not call `endVarispeed` leaves the
+  player in varispeed with a position the machine has abandoned.
 - **Changed `QueuedNext` or the hand-off order in `advance` (`timeline/active-loop.ts`)?**
   `queueJump` in `player/create-sid-player.ts` builds the `beforeLanding` hook and relies on it
   running ahead of the image restore; moved after it, a voice a landing unmutes stays at 0 until the

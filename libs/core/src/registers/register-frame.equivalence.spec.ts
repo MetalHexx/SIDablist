@@ -21,6 +21,9 @@ import { BUNDLED_TUNES, decodeBundledTune } from '../sid/__fixtures__/index.js';
  * Differential spec: the field-table output stage against a frozen copy of the implementation it
  * replaced. Every call the old stage accepted must still produce the same frames, byte for byte, in
  * the same order, with the same suppressed-write count.
+ *
+ * The rate pitch is new, so the reference has no such call: the reference is driven with each
+ * voice's pitch multiplied by it instead, which is the equivalence the rate pitch promises.
  */
 
 interface Write {
@@ -45,6 +48,8 @@ class Lockstep implements SidWriteSink {
   readonly actual = createRegisterFrame();
   framesCompared = 0;
   private cue: { reference: RegisterValuesSnapshot; actual: RegisterValuesSnapshot } | null = null;
+  private readonly voicePitches = [1, 1, 1];
+  private ratePitch = 1;
 
   onSidWrite(register: number, value: number): void {
     this.reference.onSidWrite(register, value);
@@ -54,6 +59,22 @@ class Lockstep implements SidWriteSink {
   apply(operation: Operation): void {
     operation(this.reference);
     operation(this.actual);
+  }
+
+  /** Sets voice `voice`'s pitch on the actual frame, and its product with the rate pitch on the
+   *  reference. Use with `setRatePitch` below, never mixed with `apply`-ed pitch calls. */
+  setVoicePitch(voice: number, pitch: number): void {
+    this.voicePitches[voice] = pitch;
+    this.reference.setVoicePitch(voice, pitch * this.ratePitch);
+    this.actual.setVoicePitch(voice, pitch);
+  }
+
+  setRatePitch(ratePitch: number): void {
+    this.ratePitch = ratePitch;
+    this.voicePitches.forEach((pitch, voice) =>
+      this.reference.setVoicePitch(voice, pitch * ratePitch),
+    );
+    this.actual.setRatePitch(ratePitch);
   }
 
   saveCue(): void {
@@ -185,6 +206,45 @@ describe.each(BUNDLED_TUNES)(
         }
         lock.apply((frame) => frame.setTargetClock(PAL_PHI2_HZ, PAL_PHI2_HZ));
         play();
+      });
+    }, 20_000);
+
+    it('matches through rate pitch with a clock correction and voice pitch in force', () => {
+      drive((lock, play) => {
+        lock.apply((frame) => frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ));
+        lock.setVoicePitch(0, 2 ** (7 / 12));
+        lock.setVoicePitch(2, 0.5);
+        play();
+        // Powers of two keep the product of the three factors exact in either order of association.
+        for (const ratePitch of [0.5, 2, 4, 0, 1, 0.25, 1]) {
+          lock.setRatePitch(ratePitch);
+          play(20);
+        }
+        lock.setVoicePitch(0, 1);
+        lock.setVoicePitch(2, 1);
+        play(20);
+      });
+    }, 20_000);
+
+    it('matches through any rate pitch with the clocks matched, and across a mute and a cue', () => {
+      drive((lock, play) => {
+        lock.setVoicePitch(1, 1.5);
+        for (const ratePitch of [0, 0.3, 1, 1.5, 3.3, 1000, 1]) {
+          lock.setRatePitch(ratePitch);
+          play(15);
+        }
+
+        lock.setRatePitch(2.7);
+        lock.apply((frame) => frame.setVoiceMuted(2, true));
+        play(20);
+        lock.saveCue();
+        play();
+        lock.setRatePitch(0.6);
+        lock.restoreCue();
+        lock.apply((frame) => frame.setVoiceMuted(2, false));
+        play(20);
+        lock.setRatePitch(1);
+        play(20);
       });
     }, 20_000);
 

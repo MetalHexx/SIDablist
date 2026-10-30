@@ -103,6 +103,58 @@ describe('createAsidSink', () => {
     });
   });
 
+  describe('unscheduled sends on a port that cannot cancel', () => {
+    beforeEach(() => {
+      sink.setScheduleAhead(milliseconds(20));
+    });
+
+    function deliverDueNow(): number {
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now()), false);
+      return port.sent.at(-1)?.timestampMs ?? Number.NaN;
+    }
+
+    it('stamps a delivered-now frame behind the last scheduled send, so the frames the port still holds cannot undo it', () => {
+      const scheduledAtMs = deliverDueNow();
+
+      sink.deliverNow(frame([4], [0x20]));
+
+      expect(port.sent.at(-1)?.timestampMs).toBeGreaterThan(scheduledAtMs);
+    });
+
+    it('keeps a pause gate-off ahead of the stop packet that follows it', () => {
+      deliverDueNow();
+
+      sink.deliverNow(frame([4], [0x20]));
+      sink.end();
+
+      const [gateOff, stop] = port.sent.slice(-2);
+      expect(stop.bytes).toEqual(buildStopPacket());
+      expect(stop.timestampMs).toBeGreaterThan(gateOff.timestampMs ?? Number.POSITIVE_INFINITY);
+    });
+
+    it('still stamps behind committed frames after a reset, which withdraws nothing from such a port', () => {
+      const scheduledAtMs = deliverDueNow();
+
+      sink.reset();
+      sink.deliverNow(frame([4], [0x20]));
+
+      expect(port.sent.at(-1)?.timestampMs).toBeGreaterThan(scheduledAtMs);
+    });
+
+    it('sends at once when nothing it stamped is still ahead', () => {
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now() - 1000), false);
+
+      sink.deliverNow(frame([4], [0x20]));
+      sink.begin({ chipModel: 'mos6581' });
+
+      expect(port.sent.slice(-3).map((sent) => sent.timestampMs)).toEqual([
+        undefined,
+        undefined,
+        undefined,
+      ]);
+    });
+  });
+
   describe('showText', () => {
     it('sends a display-chars packet straight through the port, uncounted by the delivery stats', () => {
       const statsBefore = sink.stats;

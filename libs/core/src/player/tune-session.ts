@@ -171,6 +171,17 @@ export interface TuneSession {
     frameNumber: Frames,
   ): void;
 
+  /**
+   * `restoreState` without the resync: puts the image on the live pair and adopts its frame number
+   * and nothing else. For a caller whose stream already holds the chip state the image describes,
+   * so a resync would only repeat it.
+   */
+  adoptState(
+    machine: MachineSnapshot,
+    registers: RegisterValuesSnapshot,
+    frameNumber: Frames,
+  ): void;
+
   /** Drops whatever jump is in flight, so its result is discarded rather than applied. */
   discardOutstandingJump(): void;
 
@@ -452,10 +463,20 @@ class TuneSessionImpl implements TuneSession {
   ): void {
     if (this._machine === null || this._frame === null) return;
 
+    this.adoptState(machine, registers, frameNumber);
+    this.host.queueResync();
+  }
+
+  adoptState(
+    machine: MachineSnapshot,
+    registers: RegisterValuesSnapshot,
+    frameNumber: Frames,
+  ): void {
+    if (this._machine === null || this._frame === null) return;
+
     this._machine.restore(machine);
     this._frame.restoreValues(registers);
     this._framesRendered = frameNumber;
-    this.host.queueResync();
   }
 
   discardOutstandingJump(): void {

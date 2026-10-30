@@ -20,6 +20,9 @@ let held: HeldScan | null = null;
  * than the emulation it saves. Either way every rung would re-init — invisibly, since a clean re-init
  * produces byte-identical output.
  *
+ * A `keep: false` request is answered and then forgotten, so a one-shot caller does not leave a whole
+ * scan held between loads.
+ *
  * A failure comes back as a `failed` message rather than a throw, which on the main thread would
  * surface as an unlabelled worker error, and discards the held scan: a machine that ran out of cycles
  * must never be deepened.
@@ -37,7 +40,8 @@ export function handleScanRequest(
     scan.advanceTo(request.maxFrames, (frame) => {
       post({ id: request.id, kind: 'progress', frame });
     });
-    held = { session: request.session, subtune: request.subtune, scan };
+    held =
+      request.keep === false ? null : { session: request.session, subtune: request.subtune, scan };
     message = { id: request.id, kind: 'done', output: scan.output() };
   } catch (error) {
     held = null;

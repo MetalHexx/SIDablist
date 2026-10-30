@@ -13,6 +13,9 @@ export interface ScanRequest {
   readonly file: SidFile;
   readonly subtune: number;
   readonly maxFrames: number;
+  /** Whether the scanner keeps the scan for a later request of the same session to deepen. Defaults
+   *  to true; `false` has it dropped once this request is answered, for a one-shot caller. */
+  readonly keep?: boolean;
 }
 
 /** What the worker posts. Progress is a message; the promise never resolves to it. */

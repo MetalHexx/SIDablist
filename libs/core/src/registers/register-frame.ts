@@ -211,6 +211,17 @@ export interface RegisterFrame extends SidWriteSink {
   setVoicePitch(voice: number, coefficient: number): void;
 
   /**
+   * The playback rate's pitch, shared by all three voices: the third factor of every frequency
+   * multiplier, `clockRatio × voicePitch × ratePitch`, so it composes with the other two and
+   * disturbs neither. Exactly 1 is home, and returning to it arms the one restoring write as any
+   * other multiplier does. At 0 every frequency sends 0, which is below hearing; above 1 a
+   * frequency clamps at the register's ceiling.
+   *
+   * Anything that is not a finite number of at least 0 is ignored.
+   */
+  setRatePitch(coefficient: number): void;
+
+  /**
    * Holds `field` at `value` instead of whatever the tune puts there, `amount` of the way (0…1, 1 if
    * omitted): a numeric field sends `amount` of the way from the tune's own value to `value`, rounded
    * once at the field's full width, so it keeps following the tune while held; a switch sends
@@ -398,6 +409,8 @@ class RegisterFrameImpl implements RegisterFrame {
   /** The live, user-driven half of the frequency multiplier — one per voice. Any ganging is the
    *  application's; this accepts three independent values. */
   private readonly voicePitch = new Float64Array(VOICE_COUNT).fill(1);
+  /** The playback rate's pitch, the same for every voice — the third factor of the multiplier. */
+  private ratePitch = 1;
 
   /** Hold state, one slot per `SID_FIELD_TABLE` entry and sized once so a hold never allocates. */
   private readonly held = new Uint8Array(SID_FIELD_TABLE.length);
@@ -459,10 +472,21 @@ class RegisterFrameImpl implements RegisterFrame {
     this.applyFrequencyMultiplier(voice);
   }
 
-  /** A voice's `frequency` entry multiplies by the two halves composed — exactly 1 is home, as it
-   *  is for any other entry. */
+  setRatePitch(coefficient: number): void {
+    if (!Number.isFinite(coefficient) || coefficient < 0 || coefficient === this.ratePitch) return;
+    this.ratePitch = coefficient;
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      this.applyFrequencyMultiplier(voice);
+    }
+  }
+
+  /** A voice's `frequency` entry multiplies by the three factors composed — exactly 1 is home, as
+   *  it is for any other entry. */
   private applyFrequencyMultiplier(voice: number): void {
-    this.setFieldMultiplier(FREQUENCY_ENTRIES[voice], this.clockRatio * this.voicePitch[voice]);
+    this.setFieldMultiplier(
+      FREQUENCY_ENTRIES[voice],
+      this.clockRatio * this.voicePitch[voice] * this.ratePitch,
+    );
   }
 
   private setFieldMultiplier(index: number, multiplier: number): void {

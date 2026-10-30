@@ -55,6 +55,10 @@ export const UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS: Milliseconds = millisecond
  *  extension this sink does not yet speak. */
 const CHIP_INDEX = 0;
 
+/** How far past the previous send an unscheduled one is stamped on a port that cannot cancel, so
+ *  the port's ordering of two near-equal timestamps never decides which of them lands first. */
+const UNSCHEDULED_SEND_SPACING_MS = 1;
+
 /** One packet already handed to the port with a future delivery time — pruned as its delivery time
  *  passes. What a tempo change can still catch: `retime()` cancels the port's queue and re-sends
  *  exactly these, at the new spacing, rather than losing whatever they were carrying. */
@@ -69,6 +73,10 @@ class AsidSinkImpl implements AsidSink {
   private bytesSent = 0;
   private lastCancelLatencyMs = -1;
   private committedHostSends: CommittedHostSend[] = [];
+  /** The latest delivery time handed to the port. Unlike `committedHostSends` it survives `reset()`
+   *  and `end()`: a port that cannot cancel still delivers everything up to here, whatever this
+   *  sink has stopped counting. See `sendUnscheduled`. */
+  private lastStampedAtMs = 0;
 
   constructor(
     private readonly port: MidiOutputPort,
@@ -131,13 +139,17 @@ class AsidSinkImpl implements AsidSink {
     const packet = buildSidDataPacket(frame);
     const scheduledAtMs = milliseconds(dueAtMs + this.effectiveScheduleAheadMs());
     this.port.send(packet, scheduledAtMs);
+    if (scheduledAtMs > this.lastStampedAtMs) {
+      this.lastStampedAtMs = scheduledAtMs;
+    }
     this.recordCommittedHostSend(packet, scheduledAtMs);
     this.packetsSent++;
     this.bytesSent += packet.length;
   }
 
-  /** Packs and sends immediately, with no timestamp, ahead of anything scheduled — the pause
-   *  gate-off's contract, and why this never touches `committedHostSends`. */
+  /** Packs and sends unscheduled — the pause gate-off's contract, and why this never touches
+   *  `committedHostSends`. Ahead of anything scheduled on a port that can cancel; just behind what
+   *  is already committed on one that cannot (`sendUnscheduled`). */
   deliverNow(frame: SidFrame): void {
     this.sendControl(buildSidDataPacket(frame));
   }
@@ -178,6 +190,7 @@ class AsidSinkImpl implements AsidSink {
     for (const { packet } of outstanding) {
       this.port.send(packet, scheduledAtMs);
       this.committedHostSends.push({ packet, scheduledAtMs: milliseconds(scheduledAtMs) });
+      this.lastStampedAtMs = scheduledAtMs;
       this.packetsSent++;
       this.bytesSent += packet.length;
       scheduledAtMs += newIntervalMs;
@@ -241,9 +254,30 @@ class AsidSinkImpl implements AsidSink {
   }
 
   private sendControl(packet: Uint8Array): void {
-    this.port.send(packet);
+    this.sendUnscheduled(packet);
     this.packetsSent++;
     this.bytesSent += packet.length;
+  }
+
+  /**
+   * Sends a packet that has no due time — start, stop, a pause's gate-off — as early as it can
+   * without overtaking a frame the port will still deliver.
+   *
+   * A port that can cancel takes it at once: whatever it still holds is either withdrawn by the
+   * `reset()` core makes first, or meant to land after it. A port that cannot cancel will play every
+   * frame stamped up to `lastStampedAtMs` regardless, so a packet sent ahead of them is undone by
+   * them — a gate-off followed by frames that re-open the gates leaves the voices ringing through
+   * the pause. It is stamped just behind them instead, each such send a step behind the last so two
+   * of them keep their order. The wait is bounded by the schedule-ahead window, which
+   * `UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS` caps for exactly this kind of port.
+   */
+  private sendUnscheduled(packet: Uint8Array): void {
+    if (this.port.supportsCancel || this.lastStampedAtMs <= performance.now()) {
+      this.port.send(packet);
+      return;
+    }
+    this.lastStampedAtMs += UNSCHEDULED_SEND_SPACING_MS;
+    this.port.send(packet, this.lastStampedAtMs);
   }
 
   /** Drops whatever has already reached its scheduled delivery time, so `committedHostSends` never

@@ -17,6 +17,8 @@ import type {
   ScaledRegisterGroup,
   SidFilterMode,
 } from '../registers/register-frame.js';
+import { isUsableRegisterRecord } from '../registers/register-record.js';
+import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import { isUsableHold, isUsableOffset, resolveSidField } from '../registers/sid-fields.js';
 import type { SidField } from '../registers/sid-fields.js';
@@ -28,21 +30,24 @@ import {
   VOICE_COUNT,
 } from '../registers/sid-constants.js';
 import type { ReplayRunner } from '../replay/replay-runner.js';
+import type { ReplayResult } from '../replay/replay-to-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
 import { createActiveLoopTracker } from '../timeline/active-loop.js';
-import type { ActiveLoop, ActiveLoopTracker } from '../timeline/active-loop.js';
+import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
 import { createTrackStructure } from '../timeline/track-structure.js';
 import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-structure.js';
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
 import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
-import type { SidPlayer } from './sid-player.js';
+import type { SidPlayer, VarispeedRateSource } from './sid-player.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
 import { createTuneSession } from './tune-session.js';
 import type { TuneSession } from './tune-session.js';
+import { createVarispeed } from './varispeed.js';
+import type { Varispeed } from './varispeed.js';
 
 /** `emitted`'s default before any tune has loaded a register shadow to read. */
 const EMPTY_REGISTER_BYTES = new Uint8Array(SID_REGISTER_COUNT);
@@ -85,6 +90,15 @@ const LOOP_ENTRY_CACHE_SIZE = 4;
 /** The mutes every prepared build is seeded with. An image taken with a voice muted carries that
  *  voice's control register zeroed, which is wrong for a restore into an unmuted player. */
 const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
+
+/**
+ * How far ahead of the playhead a handback asks for the machine's image, in seconds of music.
+ * Replay time grows with the depth it is asked for, and the record played at rate 1 is the stream
+ * itself, so the lead costs nothing audible — it only decides how long the record keeps playing
+ * before the machine takes over.
+ */
+const HANDBACK_LEAD_SECONDS = 2;
+const HANDBACK_LEAD_MS = milliseconds(HANDBACK_LEAD_SECONDS * 1000);
 
 /** A field hold as the coordinator carries it into every tune loaded after. */
 interface FieldHoldRecord {
@@ -223,6 +237,29 @@ class SidPlayerCoordinator implements SidPlayer {
    *  it. Riding the clock is what gives each of them a frame slot and a due time of its own; sent
    *  between ticks they would share one slot and the release window would collapse. */
   private gateOffOwed = false;
+
+  /** The record-driven half of varispeed: the playhead, the record and the feed. */
+  private readonly varispeed: Varispeed = createVarispeed();
+  /** True from `enterVarispeed` until live playback or the paused landing takes over. The clock's
+   *  ticks go to `varispeedTick` meanwhile, whatever the transport reads. */
+  private varispeedActive = false;
+  /** Asked for the rate once a tick; null outside varispeed and while handing back. */
+  private rateSource: VarispeedRateSource | null = null;
+  /** The host has left varispeed while playing: the record plays at rate 1 until the machine's
+   *  image is reached. */
+  private handingBack = false;
+  /** Bumped by anything that makes an image request describe a handback that is gone or has moved:
+   *  a new request, a seek, a re-entry, any exit. A late answer carrying an old number is dropped. */
+  private handbackGeneration = 0;
+  private handbackLeadFrames = 0;
+  /** The image that arrived ahead of the playhead, adopted when the playhead reaches its frame. */
+  private handbackImage: ReplayResult | null = null;
+  /** Bumped when varispeed is entered and when it ends, so a clock start that resolves late can tell
+   *  it belongs to a run that is gone. */
+  private varispeedRun = 0;
+  /** Counts every `clock.start` this player issues, so a late-resolving start can tell whether a
+   *  later one has since taken the clock over. */
+  private clockStarts = 0;
 
   /** The image the track's own loop re-enters through, captured off-thread. Held here as well as in
    *  the tracker so a performer's loop can take the entry image away and give it back without a
@@ -371,10 +408,13 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /** Rebuilds the machine and register frame for `file` and initialises its start subtune. */
   loadTune(file: SidFile): void {
-    if (this.transport === 'playing' || this.transport === 'paused') {
+    const varispeedOwnedClock = this.varispeedActive && this.transport !== 'playing';
+    this.leaveVarispeedForRebuild();
+    if (!varispeedOwnedClock && (this.transport === 'playing' || this.transport === 'paused')) {
       this.clock.stop();
       this.sink.end();
     }
+    this.varispeed.setRecord(null);
     // Whatever a jump is replaying describes the outgoing tune, not this one. The same goes for the
     // frames declared against it and the images prepared for them: gone before the new file is
     // loaded, so nothing published or scheduled from here on names the old tune's frames.
@@ -424,7 +464,8 @@ class SidPlayerCoordinator implements SidPlayer {
     this.markDirty();
   }
 
-  /** Starts, or resumes, playback. */
+  /** Starts, or resumes, playback. In varispeed it only sets the transport: the clock is already
+   *  running, so nothing is started, initialised or reset. */
   async play(): Promise<void> {
     const file = this.session.file;
     const frame = this.session.frame;
@@ -433,6 +474,11 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
     if (this.transport === 'playing') {
+      return;
+    }
+    if (this.varispeedActive) {
+      this.transport = 'playing';
+      this.markDirty();
       return;
     }
 
@@ -453,6 +499,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.sink.begin({ chipModel: file.model });
 
     const intervalUs = this.effectiveIntervalUs();
+    this.clockStarts++;
     try {
       await this.clock.start(intervalUs, this.onTick);
     } catch (error) {
@@ -471,9 +518,22 @@ class SidPlayerCoordinator implements SidPlayer {
    *
    * The active loop deliberately survives it: a pause is a hold on a passage, not a get-out from it,
    * so `play()` resumes into the same lap. `stop()` is the one that drops it.
+   *
+   * In varispeed the source still drives the clock, so a pause there only sets the transport; the
+   * clock keeps running and no gate-off is sent. During a handback it is the paused landing, since
+   * nothing else will leave varispeed once the host has handed back.
    */
   pause(): void {
     if (this.transport !== 'playing') {
+      return;
+    }
+    if (this.varispeedActive) {
+      if (this.handingBack) {
+        this.landPaused();
+      } else {
+        this.transport = 'paused';
+        this.markDirty();
+      }
       return;
     }
     this.haltPlayback();
@@ -495,6 +555,9 @@ class SidPlayerCoordinator implements SidPlayer {
    * a wrap from the playhead moving backward, read the restart itself as one.
    */
   stop(): void {
+    // No landing: the re-init below puts the machine back at the top. The halt and the sink end
+    // below are what stop a clock varispeed was running.
+    this.endVarispeed();
     this.haltPlayback();
     // Landing a jump still in flight would restart playback at a position nobody asked for, and the
     // re-init below invalidates whatever it was carrying anyway.
@@ -539,9 +602,13 @@ class SidPlayerCoordinator implements SidPlayer {
    * A replay carrying settings is seeded with no voice muted, since a muted seed would leave that
    * voice's control register at 0 in the image and no restore could bring the voice back. A jump
    * that is superseded or discarded never applies them.
+   *
+   * In varispeed it moves the varispeed position to the target, clamped to the record, and resolves
+   * at once with no replay.
    */
   seek(frame: Frames, settings?: JumpSettings): Promise<void> {
     const target = frames(Math.max(0, Math.round(frame)));
+    if (this.varispeedActive) return this.seekVarispeed(target, settings);
     const prepared = settings === undefined ? null : this.prepareSettings(settings);
     const entry = this.activeLoop.entryImage();
     const image =
@@ -571,6 +638,8 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.session.currentSubtune === before) {
       return;
     }
+    this.leaveVarispeedForRebuild();
+    this.varispeed.setRecord(null);
     // Every entry image describes a machine the re-init has just replaced — the track's own and
     // whichever loop is presently active alike — and so does every frame declared against it. The
     // declarations go before the recaptures below, which skip a declared frame.
@@ -701,6 +770,8 @@ class SidPlayerCoordinator implements SidPlayer {
     const machine = this.session.machine;
     const frame = this.session.frame;
     if (machine === null || frame === null) return null;
+    // The live machine is not at the position, so there is nothing true to snapshot.
+    if (this.varispeedActive) return this.session.framesRendered;
 
     const position = this.session.framesRendered;
     const image: HeldImage = {
@@ -748,6 +819,87 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setRepeatTrack(enabled: boolean): void {
     this.track.setRepeatEnabled(enabled);
+    this.markDirty();
+  }
+
+  setRegisterRecord(record: RegisterRecord | null): void {
+    if (this.varispeedActive) {
+      console.warn('SID player: ignoring a register record while in varispeed.');
+      return;
+    }
+    if (record !== null && !isUsableRegisterRecord(record)) {
+      console.warn('SID player: ignoring a register record of an unusable shape.');
+      return;
+    }
+    this.varispeed.setRecord(record);
+    this.markDirty();
+  }
+
+  /**
+   * The record drives the stream from here: nothing of the tune's own code runs until the host
+   * leaves. An outstanding jump and an owed gate-off are dropped, since the record now says what
+   * the chip does.
+   *
+   * With the clock not running (paused, stopped or ended) varispeed starts it, restoring all 25
+   * registers on the first frame — the pause left the chip's gates zeroed. The transport is not
+   * changed. Already in varispeed, only the source is swapped, and a handback in progress is
+   * cancelled.
+   */
+  enterVarispeed(source: VarispeedRateSource): boolean {
+    const file = this.session.file;
+    const frame = this.session.frame;
+    const record = this.varispeed.record;
+    if (file === null || frame === null || record === null || this.transport === 'error') {
+      return false;
+    }
+
+    if (this.varispeedActive) {
+      this.rateSource = source;
+      this.dropHandback();
+      this.markDirty();
+      return true;
+    }
+    if (this.session.framesRendered > record.frames) return false;
+
+    this.session.discardOutstandingJump();
+    this.gateOffOwed = false;
+    this.varispeed.begin(this.session.framesRendered);
+    this.rateSource = source;
+    this.varispeedActive = true;
+    const run = ++this.varispeedRun;
+
+    if (this.transport !== 'playing') {
+      // The pause gated every voice off on the real chip, so the first frame restores it all.
+      frame.markAllDirty();
+      this.sink.begin({ chipModel: file.model });
+      const intervalUs = this.effectiveIntervalUs();
+      this.runningIntervalUs = intervalUs;
+      void this.startVarispeedClock(run, intervalUs);
+    }
+    this.markDirty();
+    return true;
+  }
+
+  /**
+   * Playing: the source is dropped and the record plays on at rate 1 while the machine's image is
+   * replayed ahead of the playhead; when the playhead reaches it the machine takes over from it,
+   * with no gate-off and nothing re-sent. Otherwise: the player lands paused at the position.
+   */
+  leaveVarispeed(): void {
+    if (!this.varispeedActive || this.handingBack) return;
+    if (this.transport !== 'playing') {
+      this.landPaused();
+      return;
+    }
+
+    this.rateSource = null;
+    this.handingBack = true;
+    this.session.frame?.setRatePitch(1);
+    this.handbackLeadFrames = Math.max(
+      1,
+      msToPlayCalls(HANDBACK_LEAD_MS, this.nominalIntervalUs, this.playRate()),
+    );
+    void this.requestHandbackImage();
     this.markDirty();
   }
 
@@ -1051,9 +1203,10 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     this.fieldHolds.clear();
     this.fieldOffsets.clear();
-    if (this.transport === 'playing' || this.transport === 'paused') {
+    if (this.varispeedActive || this.transport === 'playing' || this.transport === 'paused') {
       this.sink.end();
     }
+    this.endVarispeed();
   }
 
   /**
@@ -1068,6 +1221,11 @@ class SidPlayerCoordinator implements SidPlayer {
     const machine = this.session.machine;
     const frame = this.session.frame;
     if (machine === null || frame === null) {
+      return;
+    }
+
+    if (this.varispeedActive) {
+      this.varispeedTick(machine, frame, dueAtMs, catchUpClamped);
       return;
     }
 
@@ -1129,10 +1287,57 @@ class SidPlayerCoordinator implements SidPlayer {
     this.lastDueAtMs = dueAtMs;
   }
 
+  /**
+   * One tick of varispeed: the source names a rate, the playhead moves by it, the record entry
+   * under the playhead is fed through the live frame, and one frame goes out — even when nothing
+   * changed, so the stream and the frame grid stay one-to-one. No machine runs.
+   *
+   * While handing back the rate is 1 and the loop in force is enforced as a live tick enforces it.
+   * Once the playhead reaches the frame of the image the handback is waiting on, the machine takes
+   * over from it.
+   */
+  private varispeedTick(
+    machine: C64Machine,
+    frame: RegisterFrame,
+    dueAtMs: Milliseconds,
+    catchUpClamped: boolean,
+  ): void {
+    const varispeed = this.varispeed;
+    let rate = 1;
+    if (!this.handingBack) {
+      try {
+        rate = this.rateSource === null ? 0 : this.rateSource(varispeed.position, this.tickUs());
+      } catch (error) {
+        this.fail(`the varispeed rate source threw — ${describeError(error)}`);
+        return;
+      }
+      if (!Number.isFinite(rate)) rate = 0;
+    }
+
+    varispeed.moveBy(rate);
+    varispeed.feed(frame);
+    frame.setRatePitch(Math.abs(rate));
+    this.lastCyclesUsed = cycles(0);
+    this.deliver(frame.takeSnapshot(), dueAtMs, catchUpClamped);
+    this.session.framesRendered = frames(Math.floor(varispeed.position));
+
+    if (!this.handingBack) return;
+    if (this.enforceLoop(machine, frame) !== 'none') return;
+    const image = this.handbackImage;
+    if (image !== null && this.session.framesRendered === image.frame) this.adoptHandback(image);
+  }
+
+  /** The interval the running clock paces at — what a varispeed tick is handed as its own. Read
+   *  from the value the clock was last given, since recomputing it builds a rate object. */
+  private tickUs(): number {
+    return this.runningIntervalUs ?? 0;
+  }
+
   /** Runs whatever loop is in force against the frame just rendered: a lap re-enters and owes the
    *  stream a resync, as does a hand-off to a queued jump; a track end with repeat off ends the
-   *  track. */
-  private enforceLoop(machine: C64Machine, frame: RegisterFrame): void {
+   *  track. Each of those ends a handback, so every branch that moves the stream also ends
+   *  varispeed. Reports what it did. */
+  private enforceLoop(machine: C64Machine, frame: RegisterFrame): AdvanceResult['action'] {
     const outcome = this.activeLoop.advance(
       machine,
       frame,
@@ -1141,28 +1346,27 @@ class SidPlayerCoordinator implements SidPlayer {
       this.session.framesRendered,
     );
     if (outcome.action === 'looped') {
+      this.endVarispeed();
       this.session.framesRendered = outcome.frame;
       this.queueResync();
       // The track's own loop may have just armed itself, which is a discrete change to the loop a
       // consumer reads.
       this.markDirty();
-      return;
-    }
-    if (outcome.action === 'handed-off') {
+    } else if (outcome.action === 'handed-off') {
       // Every coordinator and tracker update comes before `markDirty`, whose listeners run
       // synchronously and may call straight back in: they must see a consistent snapshot, and what
       // they do must not be overwritten afterwards.
+      this.endVarispeed();
       this.session.framesRendered = outcome.frame;
       this.queuedJump = null;
       this.handOffs++;
       if (this.activeLoop.get() === null) this.activeLoop.setEntryImage(this.trackLoopEntry);
       this.queueResync();
       this.markDirty();
-      return;
-    }
-    if (outcome.action === 'stopped') {
+    } else if (outcome.action === 'stopped') {
       this.endTrack();
     }
+    return outcome.action;
   }
 
   /**
@@ -1172,6 +1376,7 @@ class SidPlayerCoordinator implements SidPlayer {
    * already falls through its own non-paused branch to restart from the beginning.
    */
   private endTrack(): void {
+    this.endVarispeed();
     this.haltPlayback();
     // A scrub still in flight would otherwise land after this reports `ended`, restore a position
     // and queue a resync that — with the clock stopped — goes out at once, so the player would report
@@ -1188,6 +1393,149 @@ class SidPlayerCoordinator implements SidPlayer {
     this.clock.stop();
     this.gateOffOwed = false;
     this.sink.reset();
+  }
+
+  /** The register record's length as the snapshot publishes it, or null without a record. */
+  private recordedFrames(): Frames | null {
+    const record = this.varispeed.record;
+    return record === null ? null : frames(record.frames);
+  }
+
+  /**
+   * Starts the clock a varispeed entered from a stopped transport runs on, failing the player as
+   * `play()` does when it cannot. A start that resolves after its varispeed has already ended stops
+   * the clock again, unless something else — a later start, or live playback — wants it running.
+   */
+  private async startVarispeedClock(run: number, intervalUs: Microseconds): Promise<void> {
+    const start = ++this.clockStarts;
+    try {
+      await this.clock.start(intervalUs, this.onTick);
+    } catch (error) {
+      if (this.varispeedRun !== run) return;
+      this.sink.end();
+      this.fail(`the frame clock could not start — ${describeError(error)}`);
+      return;
+    }
+    const abandoned = this.varispeedRun !== run && !this.varispeedActive;
+    if (abandoned && this.clockStarts === start && this.transport !== 'playing') {
+      this.clock.stop();
+    }
+  }
+
+  /**
+   * The one routine every exit from varispeed runs: the handback is dropped, the source let go and
+   * the rate pitch returned to home. The rate pitch lives on the `RegisterFrame`, which `stop()` and
+   * a subtune change keep, so one left at 0 would silence the next play.
+   *
+   * It leaves the clock, the sink and the transport to the exit that called it, and does not
+   * notify.
+   */
+  private endVarispeed(): void {
+    if (!this.varispeedActive) return;
+    this.varispeedActive = false;
+    this.varispeedRun++;
+    this.rateSource = null;
+    this.dropHandback();
+    this.session.frame?.setRatePitch(1);
+  }
+
+  /** Abandons the handback, and with it any image request still on its way. */
+  private dropHandback(): void {
+    this.handingBack = false;
+    this.handbackImage = null;
+    this.handbackGeneration++;
+  }
+
+  /**
+   * The exit for a caller about to re-init or rebuild the machine, so no landing is owed. A varispeed
+   * that is not playing owns the running clock and the open sink, and nothing else would stop them.
+   */
+  private leaveVarispeedForRebuild(): void {
+    if (!this.varispeedActive) return;
+    if (this.transport !== 'playing') {
+      this.haltPlayback();
+      this.sink.end();
+    }
+    this.endVarispeed();
+  }
+
+  /**
+   * Leaves varispeed for a player that is not playing, or whose handback is abandoned: silence the
+   * chip, stop the clock, and bring the machine to the position silently through the same paused
+   * landing a seek while paused takes. The transport reads `paused` even from `stopped` or `ended`,
+   * since the position is no longer the top.
+   */
+  private landPaused(): void {
+    this.haltPlayback();
+    // Immediate, as in `pause()`: queued behind frames the sink still holds it would land late.
+    this.sink.deliverNow(this.gateOffFrame());
+    this.sink.end();
+    this.endVarispeed();
+    this.transport = 'paused';
+    void this.session.jumpToFrame(frames(Math.floor(this.varispeed.position)));
+    this.markDirty();
+  }
+
+  private seekVarispeed(target: Frames, settings?: JumpSettings): Promise<void> {
+    if (Number.isNaN(target)) {
+      console.warn(`SID player: ignoring a seek to ${target}.`);
+      return Promise.resolve();
+    }
+    const prepared = settings === undefined ? null : this.prepareSettings(settings);
+    this.varispeed.moveTo(target);
+    this.session.framesRendered = frames(Math.floor(this.varispeed.position));
+    if (prepared !== null) this.applyPreparedSettings(prepared);
+    // The image asked for was ahead of the old position, so the answer would land in the wrong place.
+    if (this.handingBack) void this.requestHandbackImage();
+    if (prepared !== null) this.markDirty();
+    return Promise.resolve();
+  }
+
+  /**
+   * Asks for the machine's image `handbackLeadFrames` ahead of the playhead, under a new generation.
+   * An answer that is still current and not behind the playhead is held until the playhead reaches
+   * it; one behind it asks again with double the lead, since replay time is what outran the record.
+   */
+  private async requestHandbackImage(): Promise<void> {
+    const record = this.varispeed.record;
+    if (record === null) return;
+    const generation = ++this.handbackGeneration;
+    this.handbackImage = null;
+    const target = frames(
+      Math.min(Math.floor(this.varispeed.position) + this.handbackLeadFrames, record.frames),
+    );
+    const start = this.chainStartFor(target);
+    const image = await this.session.replayImage(target, {
+      mutes: NO_VOICES_MUTED,
+      ...(start === null ? {} : { start }),
+    });
+    if (generation !== this.handbackGeneration) return;
+
+    if (image === null) {
+      this.fail('the handback could not rebuild the tune ahead of the playhead');
+      return;
+    }
+    const position = Math.floor(this.varispeed.position);
+    if (image.frame < position) {
+      this.handbackLeadFrames *= 2;
+      void this.requestHandbackImage();
+    } else if (image.frame === position) {
+      // The playhead is already there and its record frame already out: no tick is left to wait for.
+      this.adoptHandback(image);
+    } else {
+      this.handbackImage = image;
+    }
+  }
+
+  /**
+   * Hands the stream to the machine at `image`. The chip state the record has built to this frame
+   * is the state live playback would have built, so nothing is gated off or re-sent: the image goes
+   * onto the live pair and the next tick runs the tune.
+   */
+  private adoptHandback(image: ReplayResult): void {
+    this.session.adoptState(image.machine, image.registers, image.frame);
+    this.endVarispeed();
+    this.markDirty();
   }
 
   /**
@@ -1468,6 +1816,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.clock.stop();
     this.error = reason;
     this.transport = 'error';
+    this.endVarispeed();
     this.markDirty();
     console.error(`SID player: ${reason}`);
   }
@@ -1491,7 +1840,7 @@ class SidPlayerCoordinator implements SidPlayer {
    * the sink still holds at the old spacing.
    */
   private applyIntervalChange(): void {
-    if (this.transport === 'playing') {
+    if (this.transport === 'playing' || this.varispeedActive) {
       const intervalUs = this.effectiveIntervalUs();
       this.clock.setIntervalUs(intervalUs);
       this.runningIntervalUs = intervalUs;
@@ -1512,11 +1861,11 @@ class SidPlayerCoordinator implements SidPlayer {
     );
   }
 
-  /** The interval a consumer reads: what the clock is running while playing, and the rate the next
-   *  `play()` would start at otherwise. */
+  /** The interval a consumer reads: what the clock is running while playing or in varispeed, and
+   *  the rate the next `play()` would start at otherwise. */
   private reportedIntervalUs(): Microseconds {
     if (this.session.file === null) return microseconds(0);
-    return this.transport === 'playing' && this.runningIntervalUs !== null
+    return (this.transport === 'playing' || this.varispeedActive) && this.runningIntervalUs !== null
       ? this.runningIntervalUs
       : this.effectiveIntervalUs();
   }
@@ -1584,6 +1933,7 @@ class SidPlayerCoordinator implements SidPlayer {
                 .map((frame) => frames(frame)),
               queuedJump: this.queuedJump,
               handOffs: this.handOffs,
+              recordedFrames: this.recordedFrames(),
             },
       tempo: {
         multiplier: this.tempoMultiplier,
@@ -1592,6 +1942,7 @@ class SidPlayerCoordinator implements SidPlayer {
         callsPerFrame: rate.roundedCallsPerFrame,
         rate,
         timingMode: this.timingMode,
+        varispeed: this.varispeedActive,
       },
       loop: this.activeLoop.get(),
       voices: this.mutedVoices.map((muted, voice) => ({
