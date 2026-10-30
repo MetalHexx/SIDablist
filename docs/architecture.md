@@ -223,18 +223,25 @@ and Angular wraps it in a signal updated from an effect.
 
 Everything is a plain read. The only distinction is **whether a change notifies you**:
 
-| Read            | Notifies | Carries                                                                                                                                                            |
-| --------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `getSnapshot()` | yes      | Transport state, tune with its ready jump frames, queued jump, hand-off count and record length, tempo and whether varispeed is on, the active loop, voices, error |
-| `getPosition()` | no       | The playhead frame                                                                                                                                                 |
-| `getStats()`    | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                                                                                                |
-| `readRegisters` | no       | Every register, as written and as sent                                                                                                                             |
+| Read                                 | Notifies | Carries                                                                                                                                                            |
+| ------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `getSnapshot()`                      | yes      | Transport state, tune with its ready jump frames, queued jump, hand-off count and record length, tempo and whether varispeed is on, the active loop, voices, error |
+| `getPosition()`                      | no       | The playhead frame                                                                                                                                                 |
+| `getStats()`                         | no       | Drift, jitter, lag, cycle headroom, in-flight depth                                                                                                                |
+| `readRegisters`                      | no       | Every register, as written and as sent                                                                                                                             |
+| `keepDeliveries` / `drainDeliveries` | no       | Every frame delivered since the last drain, up to a bounded history: the chip's 25 registers after each, its time, and the control bytes it received               |
 
 The rule behind the split: **things a person did notify you; things time did, you go and look at.**
 
 `readRegisters(written, sent)` is a pull read like `getPosition()`: it never notifies, and it fills
 two buffers the caller owns instead of returning a fresh object, so a consumer reading it every
 animation frame allocates nothing. With no tune loaded both buffers read zero.
+
+`readRegisters` is the chip at one instant, so a host that samples slower than the engine builds
+frames misses whatever came and went between two reads: a gate open for one frame, a control
+register written twice to retrigger a note. `keepDeliveries` is the same pull with a bounded history
+behind it, opt-in because it costs memory and an append on every frame, which `drainDeliveries`
+moves into buffers the host owns, on the host's own schedule.
 
 Varispeed follows the same rule from the other side. The host's rate is something time moves, so the
 player pulls it through a source it is handed, once a tick, and publishes nothing of it; entering and

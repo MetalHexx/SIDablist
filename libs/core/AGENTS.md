@@ -37,7 +37,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   scrub does not wait behind a batch of them; without it they share the scrub runner. Varispeed
   (`enterVarispeed`/`leaveVarispeed`) plays a `RegisterRecord` at a rate the host names per tick,
   held inside a loop that carries `varispeedStart`; `varispeed.ts` is the record-driven half the
-  coordinator sequences.
+  coordinator sequences. `keepDeliveries`/`drainDeliveries` keep a bounded history of every frame
+  delivered (`delivery-history.ts`, whose `DeliveryBatch` and `createDeliveryBatch` are public and
+  whose `DeliveryHistory` is not), for a host that samples slower than frames are built.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -56,6 +58,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - A chip field an application wants to drive is a row in `registers/sid-fields.ts`, reached through
   `holdField`/`releaseField` and `setFieldOffset`/`clearFieldOffset` — never a new per-field method
   on `RegisterFrame` or `SidPlayer`.
+- A host that needs every delivery between its reads — a one-frame gate, a doubled control write —
+  uses `keepDeliveries`/`drainDeliveries`, never `readRegisters`: that is the chip at one instant,
+  and anything that came and went between two reads is gone from it.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.
@@ -67,6 +72,22 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
   of it in a fresh object or a getter for readability is a real regression, and it is audible, not
   caught by a test.
+- **The delivery history records inside frame delivery.** `DeliveryHistory.record` runs after every
+  `sink.deliver` and `sink.deliverNow` — allocation-free, and after the sink call so the wire is
+  never delayed by the append. A new place that hands a frame to the sink must record it too, through
+  `deliver` or the coordinator's private `deliverNow`; a bare `this.sink.deliverNow(...)` leaves a
+  frame the chip received missing from the history, and nothing fails.
+- **The history is built from the delivered frame, not from `RegisterFrame`.** The shadow keeps the
+  _first_ byte of a doubled voice control write while the chip is given the second, so an entry read
+  from the shadow shows the wrong byte on exactly the retrigger frames. A third write to one control
+  register in a frame folds into the second before delivery, so the chip never receives it and the
+  history never shows it; do not widen the engine to track more. The request lives on the
+  coordinator, not on `TuneSession`: `session.load` builds a new `RegisterFrame`.
+- **A lap is not a discontinuity; a landing is.** The history restarts where the playhead goes
+  somewhere else (load, stop, a fresh play, a subtune change, a restore, a queued-jump hand-off) and
+  nowhere a lap, pause, resume or varispeed entry or exit passes through. Restart in the arrow handed
+  to `createTuneSession` and in `enforceLoop`'s `'handed-off'` branch, before `queueResync()` — never
+  inside `queueResync()` itself, which the `'looped'` branch also calls.
 - **Hardware-precise constants are not typos to fix.** `registers/sid-constants.ts`'s
   `PAL_FRAME_INTERVAL_US` is deliberately `19950`, not the TeensyROM firmware's own `19975` —
   the comment on it exists because that gap looks like a mistake and is not. The φ2 clock rates in
@@ -175,6 +196,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   both and run `libs/analysis/src/register-record.spec.ts`. Detail:
   [`libs/analysis/src/register-record.ts`](../analysis/src/register-record.ts).
 
+- **Added a `sink.deliver*` call, or changed how a `SidFrame` carries voice control writes
+  (`registers/register-frame.ts`'s doubled-write handling)?** `player/delivery-history.ts` records
+  exactly what the sink was handed, so a frame that skips `record` is missing from every host's
+  history, and a shifted meaning of a control write records the wrong byte, with no compile error.
+  Record at the new call and run `player/delivery-history.spec.ts` and the `delivery history` specs
+  in `player/create-sid-player.spec.ts`.
 - **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
   unhandled variant leaves the player's position and the stream out of step without a compile

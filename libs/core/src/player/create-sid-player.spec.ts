@@ -22,6 +22,8 @@ import { FakeSink } from '../testing/fake-sink.js';
 import { frames, microseconds, milliseconds } from '../units.js';
 import type { Microseconds, Milliseconds } from '../units.js';
 import { createSidPlayer } from './create-sid-player.js';
+import { createDeliveryBatch } from './delivery-history.js';
+import type { DeliveryBatch } from './delivery-history.js';
 import type { SidPlayer, VarispeedRateSource } from './sid-player.js';
 import type { JumpSettings, QueuedJump } from './snapshot.js';
 
@@ -1818,6 +1820,444 @@ describe('createSidPlayer', () => {
 
       player.loadTune(silentTune());
       expect(() => player.readRegisters(ok, short)).toThrow(RangeError);
+    });
+  });
+
+  describe('delivery history', () => {
+    /** play writes voice 0's control register twice, `first` then `second`, every call. */
+    function doubledControlTune(first: number, second: number): SidFile {
+      return tune({
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          // LDA #first; STA $D404; LDA #second; STA $D404; RTS
+          {
+            at: 0x1010,
+            bytes: [0xa9, first, 0x8d, 0x04, 0xd4, 0xa9, second, 0x8d, 0x04, 0xd4, RTS],
+          },
+        ],
+      });
+    }
+
+    /** init writes an envelope byte to $D405 and a pulse width high byte to $D403 once; play only
+     *  bumps a counter on $D400, so the envelope never appears in a delivered frame again. */
+    function initOnceTune(): SidFile {
+      return tune({
+        blocks: [
+          { at: 0x1000, bytes: [0xa9, 0xab, 0x8d, 0x05, 0xd4, 0xa9, 0x08, 0x8d, 0x03, 0xd4, RTS] },
+          { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+        ],
+      });
+    }
+
+    function drain(player: SidPlayer, capacity = 64): DeliveryBatch {
+      const batch = createDeliveryBatch(capacity);
+      player.drainDeliveries(batch);
+      return batch;
+    }
+
+    function entryRegisters(batch: DeliveryBatch, entry: number): number[] {
+      return Array.from(
+        batch.registers.slice(entry * SID_REGISTER_COUNT, (entry + 1) * SID_REGISTER_COUNT),
+      );
+    }
+
+    function entryControl(batch: DeliveryBatch, entry: number, voice: number): number[] {
+      const count = batch.controlCounts[entry * 3 + voice];
+      const from = (entry * 3 + voice) * 2;
+      return Array.from(batch.controlBytes.slice(from, from + count));
+    }
+
+    /** The chip after each delivered frame, applying every frame's writes in order. */
+    function chipsAfterEach(delivered: readonly SidFrame[]): number[][] {
+      const chip = new Uint8Array(SID_REGISTER_COUNT);
+      return delivered.map((frame) => {
+        applyFrameToChip(chip, frame);
+        return Array.from(chip);
+      });
+    }
+
+    it('reports nothing, and changes nothing about delivery, until the host asks', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 3);
+      const batch = createDeliveryBatch(4);
+      batch.count = 3;
+      batch.dropped = 2;
+      batch.restarted = true;
+
+      player.drainDeliveries(batch);
+
+      expect([batch.count, batch.dropped, batch.restarted]).toEqual([0, 0, false]);
+      expect(sink.deliveredFrames).toHaveLength(3);
+    });
+
+    it('returns the delivered frames oldest first, each with the chip as the deliveries left it and the due time the clock handed over', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 5);
+
+      const batch = drain(player);
+
+      expect(batch.count).toBe(5);
+      const chips = chipsAfterEach(sink.deliveredFrames.map(({ frame }) => frame));
+      sink.deliveredFrames.forEach(({ dueAtMs }, index) => {
+        expect(entryRegisters(batch, index)).toEqual(chips[index]);
+        expect(batch.timesMs[index]).toBe(dueAtMs);
+      });
+      expect(entryRegisters(batch, 4)[0]).toBe(5);
+    });
+
+    it.each([
+      ['cuts the gate', 0x40],
+      ['changes the waveform', 0x21],
+    ])(
+      'shows both bytes of a doubled control write, and the second in the register, when the second %s',
+      async (_name, second) => {
+        const { player, sink, clock } = harness();
+        player.loadTune(doubledControlTune(0x41, second));
+        player.keepDeliveries(8);
+        await player.play();
+        run(clock, 2);
+
+        const batch = drain(player);
+
+        expect(batch.count).toBe(2);
+        for (let entry = 0; entry < 2; entry++) {
+          expect(entryControl(batch, entry, 0)).toEqual([0x41, second]);
+          expect(entryRegisters(batch, entry)[4]).toBe(second);
+        }
+        // The first frame of a run writes all 25 registers; the next writes only what the tune did.
+        expect(entryControl(batch, 0, 1)).toEqual([0]);
+        expect(entryControl(batch, 1, 1)).toEqual([]);
+        const received: number[] = [];
+        const sent = sink.deliveredFrames[0].frame;
+        for (let index = 0; index < sent.count; index++) {
+          if (sent.registers[index] === 4) received.push(sent.values[index]);
+        }
+        expect(received).toEqual([0x41, second]);
+      },
+    );
+
+    it('seeds a history switched on mid-play with what the tune wrote once, and says the stream starts there', async () => {
+      const { player, clock } = harness();
+      player.loadTune(initOnceTune());
+      await player.play();
+      run(clock, 3);
+
+      player.keepDeliveries(64);
+      run(clock, 2, 3);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(2);
+      for (let entry = 0; entry < 2; entry++) {
+        expect(entryRegisters(batch, entry)[5]).toBe(0xab);
+        expect(entryRegisters(batch, entry)[3]).toBe(0x08);
+      }
+      expect(entryRegisters(batch, 1)[0]).toBe(5);
+      expect(drain(player).restarted).toBe(false);
+    });
+
+    it('seeds again when it is switched off and on', async () => {
+      const { player, clock } = harness();
+      player.loadTune(initOnceTune());
+      await player.play();
+      run(clock, 2);
+      player.keepDeliveries(8);
+      run(clock, 1, 2);
+      drain(player);
+
+      player.keepDeliveries(0);
+      player.keepDeliveries(8);
+      run(clock, 1, 3);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(1);
+      expect(entryRegisters(batch, 0)[5]).toBe(0xab);
+    });
+
+    it("shows a pause's gate-off, and does not restart for it or the resume", async () => {
+      const { player, clock } = harness();
+      player.loadTune(gateTune());
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 2);
+      drain(player);
+      run(clock, 2, 2);
+
+      player.pause();
+      await player.play();
+      run(clock, 2, 4);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(false);
+      expect(batch.count).toBe(2 + 1 + 2);
+      expect(entryControl(batch, 1, 0)).toEqual([0x41]);
+      for (let voice = 0; voice < 3; voice++) {
+        expect(entryControl(batch, 2, voice)).toEqual([0]);
+      }
+      expect(entryRegisters(batch, 2)[4]).toBe(0);
+      expect(entryRegisters(batch, 3)[4]).toBe(0x41);
+    });
+
+    it("shows a landing's owed gate-off and then its resync, as the first entries of a fresh history", async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(gateTune());
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 2);
+
+      await player.seek(frames(10));
+      run(clock, 2, 2);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(2);
+      expect(entryControl(batch, 0, 0)).toEqual([0]);
+      expect(entryRegisters(batch, 0)[4]).toBe(0);
+      const resync = lastDelivered(sink);
+      expect(resync.count).toBe(25);
+      expect(entryRegisters(batch, 1)).toEqual(chipsAfterEach([resync])[0]);
+      expect(entryRegisters(batch, 1)[4]).toBe(0x41);
+    });
+
+    it('shows the immediate resync of a landing while paused, gates forced off', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(gateTune());
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 2);
+      player.pause();
+      drain(player);
+
+      await player.seek(frames(10));
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(1);
+      const resync = lastDeliveredNow(sink);
+      expect(resync.count).toBe(25);
+      expect(entryRegisters(batch, 0)).toEqual(chipsAfterEach([resync])[0]);
+      expect(entryRegisters(batch, 0)[4]).toBe(0);
+    });
+
+    it("records a loop lap's full re-send as an ordinary entry, without a restart", async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: frames(0),
+        loopPeriodFrames: frames(3),
+        endedAtFrame: null,
+      });
+      player.setRepeatTrack(true);
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 3);
+      expect(player.getPosition()).toBe(0);
+      drain(player);
+
+      run(clock, 2, 3);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(false);
+      expect(batch.count).toBe(2);
+      expect(lastDelivered(sink).count).toBe(25);
+      expect(entryRegisters(batch, 1)).toEqual(
+        chipsAfterEach(sink.deliveredFrames.map(({ frame }) => frame)).at(-1),
+      );
+    });
+
+    it('records the record-fed ticks of varispeed', async () => {
+      const { player, sink, clock } = harness();
+      const file = counterTune();
+      player.loadTune(file);
+      player.setRegisterRecord(recordFromTune(file, 1, 20));
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 2);
+      drain(player);
+      expect(player.enterVarispeed(() => 1)).toBe(true);
+
+      run(clock, 3, 2);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(false);
+      expect(batch.count).toBe(3);
+      const chips = chipsAfterEach(sink.deliveredFrames.map(({ frame }) => frame));
+      expect([0, 1, 2].map((entry) => entryRegisters(batch, entry))).toEqual(chips.slice(2));
+    });
+
+    it('returns the newest capacity when more were delivered than it holds, with the rest as dropped', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(4);
+      await player.play();
+      run(clock, 10);
+
+      const batch = drain(player, 4);
+
+      expect(batch.count).toBe(4);
+      expect(batch.dropped).toBe(6);
+      expect([0, 1, 2, 3].map((entry) => entryRegisters(batch, entry)[0])).toEqual([7, 8, 9, 10]);
+
+      run(clock, 3, 10);
+      const next = drain(player, 4);
+      expect([next.count, next.dropped]).toEqual([3, 0]);
+    });
+
+    it('takes the newest entries into a batch smaller than what is pending', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+      run(clock, 6);
+
+      const batch = drain(player, 2);
+
+      expect(batch.count).toBe(2);
+      expect(batch.dropped).toBe(4);
+      expect([0, 1].map((entry) => entryRegisters(batch, entry)[0])).toEqual([5, 6]);
+    });
+
+    it('survives a load, recording the new tune from a fresh history', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+      run(clock, 2);
+
+      player.loadTune(counterTune());
+      const afterLoad = drain(player);
+      await player.play();
+      run(clock, 2);
+      const batch = drain(player);
+
+      expect(afterLoad.restarted).toBe(true);
+      expect(afterLoad.count).toBe(0);
+      expect(batch.count).toBe(2);
+      expect(entryRegisters(batch, 0)[0]).toBe(1);
+    });
+
+    it.each<[string, (player: SidPlayer) => void | Promise<void>]>([
+      ['a load', (player) => player.loadTune(silentTune(2))],
+      ['a stop', (player) => player.stop()],
+      [
+        'a play from stopped',
+        async (player) => {
+          player.stop();
+          drain(player);
+          await player.play();
+        },
+      ],
+      ['a subtune change', (player) => player.selectSubtune(2)],
+      ['a seek landing', (player) => player.seek(frames(10))],
+    ])('restarts on %s, discarding what was kept', async (_name, act) => {
+      const { player, clock } = harness();
+      player.loadTune(silentTune(2));
+      player.keepDeliveries(64);
+      await player.play();
+      run(clock, 2);
+      drain(player);
+      run(clock, 2, 2);
+
+      await act(player);
+      const batch = drain(player);
+
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(0);
+    });
+
+    it('restarts when a queued jump is handed off to, and not for the laps before it', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      player.keepDeliveries(8);
+      const batch = drain(player, 8);
+      const handOffs = (): number | undefined => player.getSnapshot().tune?.handOffs;
+
+      let ticks = 0;
+      while (handOffs() !== 1 && ticks < 400) {
+        run(clock, 1, ticks);
+        player.drainDeliveries(batch);
+        if (handOffs() !== 1) expect(batch.restarted).toBe(false);
+        ticks++;
+      }
+
+      expect(handOffs()).toBe(1);
+      expect(batch.restarted).toBe(true);
+      expect(batch.count).toBe(0);
+    });
+
+    it('ignores a capacity it cannot honour, with a warning, and leaves the history as it was', async () => {
+      vi.mocked(console.warn).mockClear();
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+      run(clock, 2);
+
+      for (const unusable of [Number.NaN, -1, Number.POSITIVE_INFINITY, 5000]) {
+        player.keepDeliveries(unusable);
+      }
+
+      expect(console.warn).toHaveBeenCalledTimes(4);
+      expect(drain(player, 8).count).toBe(2);
+    });
+
+    it('floors a fractional capacity', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(4.9);
+      await player.play();
+      run(clock, 6);
+
+      const batch = drain(player, 8);
+
+      expect([batch.count, batch.dropped]).toEqual([4, 2]);
+    });
+
+    it('keeps what was recorded when the capacity in force is asked for again, and starts afresh for another', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+      run(clock, 2);
+
+      player.keepDeliveries(8);
+      expect(drain(player, 8).count).toBe(2);
+
+      run(clock, 2, 2);
+      player.keepDeliveries(4);
+      const batch = drain(player, 8);
+      expect([batch.count, batch.restarted]).toEqual([0, true]);
+    });
+
+    it('drops what is kept, and stops keeping, when asked for 0 or disposed', async () => {
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+      run(clock, 2);
+
+      player.keepDeliveries(0);
+      const off = createDeliveryBatch(8);
+      off.count = 5;
+      off.restarted = true;
+      player.drainDeliveries(off);
+      expect([off.count, off.restarted]).toEqual([0, false]);
+
+      player.keepDeliveries(8);
+      run(clock, 1, 2);
+      player.dispose();
+      expect(drain(player, 8).count).toBe(0);
     });
   });
 

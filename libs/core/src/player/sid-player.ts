@@ -6,6 +6,7 @@ import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-f
 import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidField } from '../registers/sid-fields.js';
 import type { ActiveLoop } from '../timeline/active-loop.js';
+import type { DeliveryBatch } from './delivery-history.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
 /** Called once a tick while in varispeed, before the tick moves the position. `position` is the
@@ -124,6 +125,17 @@ export interface SidPlayer {
    *  caller-owned buffers (≥ SID_REGISTER_COUNT) with the registers as written and as sent;
    *  zeros when nothing is loaded. Allocates nothing. */
   readRegisters(written: Uint8Array, sent: Uint8Array): void;
+  /** Keeps the last `capacity` deliveries for the host to drain, so a host that samples slower than
+   *  the engine builds frames still sees each one; 0 turns it off and drops what is kept. Carried
+   *  into every tune loaded after, like holds and offsets. A non-finite, negative or over-4096
+   *  capacity is ignored with a warning. A capacity already in force changes nothing; any other
+   *  starts a fresh history, seeded from the registers the live tune last sent when one is loaded.
+   *  Allocates here, once. */
+  keepDeliveries(capacity: number): void;
+  /** Not notified — pulled on the consumer's own schedule. Moves everything delivered since the last
+   *  drain into `into`, oldest first, with `dropped` and `restarted` as `DeliveryBatch` defines
+   *  them. Allocates nothing. With nothing kept, leaves `into.count` 0. */
+  drainDeliveries(into: DeliveryBatch): void;
   /** The φ2 clocks a tune was written for and is playing on. Derived and session-lifetime, not a
    *  performance control — and the application's to supply, since core cannot know the far end. */
   setTargetClock(sourceHz: number, targetHz: number): void;

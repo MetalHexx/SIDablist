@@ -40,6 +40,8 @@ import { createTrackStructure } from '../timeline/track-structure.js';
 import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-structure.js';
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
 import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
+import { DeliveryHistory } from './delivery-history.js';
+import type { DeliveryBatch } from './delivery-history.js';
 import type { SidPlayer, VarispeedRateSource } from './sid-player.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
@@ -99,6 +101,10 @@ const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
  */
 const HANDBACK_LEAD_SECONDS = 2;
 const HANDBACK_LEAD_MS = milliseconds(HANDBACK_LEAD_SECONDS * 1000);
+
+/** The most deliveries the history will keep: about 170 KB at the ceiling, which is the memory a
+ *  host's request is allowed to cost. */
+const MAX_KEPT_DELIVERIES = 4096;
 
 /** A field hold as the coordinator carries it into every tune loaded after. */
 interface FieldHoldRecord {
@@ -232,6 +238,11 @@ class SidPlayerCoordinator implements SidPlayer {
   private clockCorrection: { readonly sourceHz: number; readonly targetHz: number } | null = null;
   private readonly voicePitch = [1, 1, 1];
 
+  /** What the host asked to keep of the deliveries, or null while it has not. Held here rather than
+   *  on the session or the register frame: `session.load` builds a new frame, and the request must
+   *  outlive a load. */
+  private history: DeliveryHistory | null = null;
+
   /** The one step a landed jump still owes the stream: a gate-off frame the next tick releases,
    *  leaving the resync — already armed on the live frame by `markAllDirty` — to ride the tick after
    *  it. Riding the clock is what gives each of them a frame slot and a due time of its own; sent
@@ -336,7 +347,13 @@ class SidPlayerCoordinator implements SidPlayer {
         this.error = null;
       },
       fail: (reason) => this.fail(reason),
-      queueResync: () => this.queueResync(),
+      // A restore (seek, scrub, jump landing) moves the playhead, so the stream is discontinuous
+      // here. Restarting before the resync means a paused landing's immediate frame is recorded into
+      // the fresh history.
+      queueResync: () => {
+        this.history?.restart();
+        this.queueResync();
+      },
       resetAnchors: () => this.ring.reset(),
       recordAnchor: (machine, frame, framesRendered) =>
         this.ring.record(machine, frame, framesRendered),
@@ -424,6 +441,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.queuedJump = null;
     this.activeLoop.queue(null);
     this.session.load(file);
+    this.history?.restart();
 
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
     // and no field held or offset, so every carried setting is re-applied here, before this load can
@@ -491,6 +509,7 @@ class SidPlayerCoordinator implements SidPlayer {
         return;
       }
       this.resetCounters();
+      this.history?.restart();
     }
 
     this.error = null;
@@ -539,7 +558,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.haltPlayback();
     // Immediate rather than scheduled: queued behind frames the sink still holds, the gate-off would
     // land after they had all played and the voices would ring on until then.
-    this.sink.deliverNow(this.gateOffFrame());
+    this.deliverNow(this.gateOffFrame());
     this.sink.end();
     this.transport = 'paused';
     this.markDirty();
@@ -563,6 +582,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // re-init below invalidates whatever it was carrying anyway.
     this.session.discardOutstandingJump();
     this.transport = 'stopped';
+    this.history?.restart();
     // After the transport, so the one snapshot this publishes already reads as stopped rather than
     // announcing a player that is still playing with its loop taken away.
     this.setActiveLoop(null);
@@ -638,6 +658,7 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.session.currentSubtune === before) {
       return;
     }
+    this.history?.restart();
     this.leaveVarispeedForRebuild();
     this.varispeed.setRecord(null);
     // Every entry image describes a machine the re-init has just replaced — the track's own and
@@ -1159,6 +1180,51 @@ class SidPlayerCoordinator implements SidPlayer {
     frame.readRegisters(written, sent);
   }
 
+  /**
+   * Turns the delivery history on at `capacity`, or off at 0, and carries the request into every
+   * tune loaded after. A capacity already in force is left alone, so a host may repeat the call.
+   *
+   * A history built while a tune is loaded is seeded from the registers that tune last sent and
+   * starts with `restarted` raised: the history only learns a register when a delivery writes it,
+   * and a tune writes some of them once, long before the host asked.
+   */
+  keepDeliveries(capacity: number): void {
+    if (!Number.isFinite(capacity) || capacity < 0 || capacity > MAX_KEPT_DELIVERIES) {
+      console.warn(
+        `SID player: ignoring a delivery history of ${capacity} (must be 0…${MAX_KEPT_DELIVERIES}).`,
+      );
+      return;
+    }
+    const kept = Math.floor(capacity);
+    if (kept === 0) {
+      this.history = null;
+      return;
+    }
+    if (this.history?.capacity === kept) return;
+
+    const history = new DeliveryHistory(kept);
+    const frame = this.session.frame;
+    if (frame !== null) {
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      frame.readRegisters(written, sent);
+      history.restart();
+      history.seed(sent);
+    }
+    this.history = history;
+  }
+
+  /** Allocates nothing: `into` is the caller's. */
+  drainDeliveries(into: DeliveryBatch): void {
+    if (this.history === null) {
+      into.count = 0;
+      into.dropped = 0;
+      into.restarted = false;
+      return;
+    }
+    this.history.drain(into);
+  }
+
   /** A hold or release of `filterType`, so the override has no copy of its own to disagree with. */
   setFilterMode(mode: SidFilterMode | null): void {
     if (mode === null) {
@@ -1211,6 +1277,7 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     this.fieldHolds.clear();
     this.fieldOffsets.clear();
+    this.history = null;
     if (this.varispeedActive || this.transport === 'playing' || this.transport === 'paused') {
       this.sink.end();
     }
@@ -1273,6 +1340,8 @@ class SidPlayerCoordinator implements SidPlayer {
   private deliver(frame: SidFrame, dueAtMs: Milliseconds, catchUpClamped: boolean): void {
     const handOffMs = performance.now();
     this.sink.deliver(frame, this.session.framesRendered, dueAtMs, catchUpClamped);
+    // After the sink call, so the append never delays the wire.
+    this.history?.record(frame, dueAtMs);
 
     this.scheduledFrames++;
     const lagMs = handOffMs - dueAtMs;
@@ -1375,6 +1444,9 @@ class SidPlayerCoordinator implements SidPlayer {
       this.queuedJump = null;
       this.handOffs++;
       if (this.activeLoop.get() === null) this.activeLoop.setEntryImage(this.trackLoopEntry);
+      // A hand-off lands the playhead somewhere else; a lap, above, does not, and is recorded like
+      // any frame.
+      this.history?.restart();
       this.queueResync();
       this.markDirty();
     } else if (outcome.action === 'stopped') {
@@ -1482,7 +1554,7 @@ class SidPlayerCoordinator implements SidPlayer {
   private landPaused(): void {
     this.haltPlayback();
     // Immediate, as in `pause()`: queued behind frames the sink still holds it would land late.
-    this.sink.deliverNow(this.gateOffFrame());
+    this.deliverNow(this.gateOffFrame());
     this.sink.end();
     this.endVarispeed();
     this.transport = 'paused';
@@ -1577,7 +1649,14 @@ class SidPlayerCoordinator implements SidPlayer {
     // gate while the consumer still reads `paused`. Only the outgoing frame is forced — the live
     // frame keeps its true values, which `play()`'s paused branch restores.
     const resync = frame.takeSnapshot();
-    this.sink.deliverNow(this.transport === 'paused' ? withVoiceGatesOff(resync) : resync);
+    this.deliverNow(this.transport === 'paused' ? withVoiceGatesOff(resync) : resync);
+  }
+
+  /** Hands one frame to the sink at once and records it, off the frame grid: the time is when it
+   *  went out, not a due time. */
+  private deliverNow(frame: SidFrame): void {
+    this.sink.deliverNow(frame);
+    this.history?.record(frame, performance.now());
   }
 
   /** A frame that gates every voice off — enough to release every note, and nothing else. */
