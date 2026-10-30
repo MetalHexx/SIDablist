@@ -71,7 +71,10 @@ export interface SidSink {
 
   /** Sends one frame immediately — outside the schedule, outside lag measurement, ahead of
    *  anything already queued. This is the gate-off a pause needs: it has no due time, and
-   *  queueing it behind scheduled frames would let the voices ring on until they drained. */
+   *  queueing it behind scheduled frames would let the voices ring on until they drained.
+   *  A sink without `cancellation` cannot put it ahead of a send it has already committed —
+   *  those frames would land after it and re-open the gates — so it lands right behind them,
+   *  and its schedule-ahead window bounds how long the voices ring. */
   deliverNow(frame: SidFrame): void;
 
   /** Re-times or withdraws whatever is still outstanding after a tempo change.
