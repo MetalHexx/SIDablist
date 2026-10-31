@@ -95,6 +95,7 @@ export {
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
 export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
+export { type DeliveryBatch, createDeliveryBatch } from './player/delivery-history.js';
 export {
   type JumpSettings,
   type PlayerSnapshot,
