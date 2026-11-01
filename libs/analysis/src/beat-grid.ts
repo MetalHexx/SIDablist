@@ -85,6 +85,12 @@ const RELATED_MAX_TERM = 6;
  *  nearest the centre of the usual tempo range among them wins. A starting value, to be judged on
  *  real tunes at the bench. */
 const NEAR_BEST_FRACTION = 0.05;
+/** Phases of the winning beat length weighing within this fraction of the heaviest are taken to align
+ *  equally well, and the one holding the strongest accents among them is the grid's phase. That is
+ *  what tells a beat from the off-beat half a beat after it, whose many single-voice steps can
+ *  outweigh the fewer, heavier hits the beat carries. A starting value, to be judged on real tunes
+ *  at the bench. */
+const NEAR_PHASE_FRACTION = 0.1;
 /** Cap on the on-grid share used to price a note start, keeping a perfect grid's price finite. */
 const MAX_ON_GRID_SHARE = 0.99;
 /** Beats at either end of the stream a span may stop short of and still count as holding to that end.
@@ -177,6 +183,36 @@ function areRelated(a: number, b: number): boolean {
 }
 
 /**
+ * Which residue of `frame % beat` the beats fall on, and the weight of note starts it holds.
+ *
+ * A beat's note starts and the off-beat's (half a beat on) often weigh almost the same, and by weight
+ * alone the off-beat can win on many single-voice steps over fewer, heavier hits. So the phases
+ * weighing within `NEAR_PHASE_FRACTION` of the heaviest are taken to align equally well, and the one
+ * whose starts hold the most weight squared, which counts an accent for more, wins among them; the
+ * lowest phase breaks a remaining tie. A phase clearly ahead of the rest is chosen as it stands.
+ */
+function settlePhase(starts: NoteStarts, beat: number): { phase: number; weight: number } {
+  const weights = new Float64Array(beat);
+  const accents = new Float64Array(beat);
+  for (let i = 0; i < starts.frames.length; i++) {
+    const residue = starts.frames[i] % beat;
+    weights[residue] += starts.voices[i];
+    accents[residue] += starts.voices[i] * starts.voices[i];
+  }
+  let heaviest = 0;
+  for (let phase = 0; phase < beat; phase++) {
+    heaviest = Math.max(heaviest, weights[phase]);
+  }
+  const floor = heaviest * (1 - NEAR_PHASE_FRACTION);
+  let chosen = -1;
+  for (let phase = 0; phase < beat; phase++) {
+    if (weights[phase] < floor) continue;
+    if (chosen < 0 || accents[phase] > accents[chosen]) chosen = phase;
+  }
+  return { phase: chosen, weight: weights[chosen] };
+}
+
+/**
  * Finds a tune's beat grid from where its voices start notes.
  *
  * The beat is a whole number of frames (SID tempo is counted in play calls), so what shows a grid is
@@ -224,8 +260,6 @@ export function detectBeatGrid(
   }
 
   const lifts = new Float64Array(maxBeat + 1);
-  const phases = new Int32Array(maxBeat + 1);
-  const bestWeights = new Float64Array(maxBeat + 1);
   const eligible = new Uint8Array(maxBeat + 1);
   const residueWeights = new Float64Array(maxBeat);
 
@@ -235,18 +269,14 @@ export function detectBeatGrid(
       residueWeights[startFrames[i] % beat] += startVoices[i];
     }
     let bestWeight = 0;
-    let bestPhase = 0;
     for (let phase = 0; phase < beat; phase++) {
       if (residueWeights[phase] > bestWeight) {
         bestWeight = residueWeights[phase];
-        bestPhase = phase;
       }
     }
     const expected = totalWeight / beat;
     const deviation = Math.sqrt((totalSquares / beat) * (1 - 1 / beat));
     lifts[beat] = bestWeight / expected;
-    phases[beat] = bestPhase;
-    bestWeights[beat] = bestWeight;
     eligible[beat] =
       lifts[beat] >= MIN_LIFT && (bestWeight - expected) / deviation >= MIN_SIGNIFICANCE ? 1 : 0;
   }
@@ -278,8 +308,8 @@ export function detectBeatGrid(
   const confidence: DetectorConfidence =
     rivalLift === 0 || lifts[winner] / rivalLift >= STRONG_MARGIN ? 'strong' : 'weak';
 
-  const phase = phases[winner];
-  const onGridShare = Math.min(MAX_ON_GRID_SHARE, bestWeights[winner] / totalWeight);
+  const { phase, weight: phaseWeight } = settlePhase(starts, winner);
+  const onGridShare = Math.min(MAX_ON_GRID_SHARE, phaseWeight / totalWeight);
   const hitScore = Math.log(onGridShare * winner);
   const missScore = -Math.log((1 - 1 / winner) / (1 - onGridShare));
 
@@ -350,12 +380,16 @@ function median(sorted: Float64Array): number {
  * Fits an exact grid to approximate beat frames, snapping it onto note starts.
  *
  * The median gap between consecutive approximate frames picks the length, searched across whole
- * lengths within about 10% of it. The first approximate frame is beat one, but length and beat one
- * must land on note starts: the grid is anchored on the earliest approximate frame with a note start
- * within about a quarter beat, then stepped back by whole beats to the first approximate frame
- * (kept ≥ 0). Among the lengths and anchors tried, the grid that puts each approximate frame closest
- * to a grid point carrying a note start wins, with the most note starts under the grid as the
- * tiebreak.
+ * lengths within about 10% of it. The length must land on note starts: the grid is anchored on the
+ * earliest approximate frame with a note start within about a quarter beat. Among the lengths and
+ * anchors tried, the grid that puts each approximate frame closest to a grid point carrying a note
+ * start wins, with the most note starts under the grid as the tiebreak.
+ *
+ * Where the approximate frames fall within a beat says which of its repeated hits the operator
+ * tapped, which is not which hit is the beat: a tune with a note every few frames puts a hit within
+ * a quarter beat of any tap. So the anchor fixes only the length, and the grid's phase is the one
+ * the tune's accents settle on (`settlePhase`), as in `detectBeatGrid`. Beat one is the grid point
+ * nearest the first approximate frame, kept ≥ 0.
  *
  * @param approxBeatFrames approximate frames of beats, ascending (sorted here if not)
  * @param starts the tune's note starts, from `noteStarts`
@@ -427,9 +461,8 @@ export function fitBeatGrid(
   }
   if (best === null) return null;
 
-  const stepsBack = Math.min(
-    Math.max(0, Math.round((best.anchor - first) / best.beatFrames)),
-    Math.floor(best.anchor / best.beatFrames),
-  );
-  return { beatFrames: best.beatFrames, beatOneFrame: best.anchor - stepsBack * best.beatFrames };
+  const { phase } = settlePhase(starts, best.beatFrames);
+  let beatOneFrame = phase + Math.round((first - phase) / best.beatFrames) * best.beatFrames;
+  while (beatOneFrame < 0) beatOneFrame += best.beatFrames;
+  return { beatFrames: best.beatFrames, beatOneFrame };
 }

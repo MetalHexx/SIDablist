@@ -177,6 +177,22 @@ describe('detectBeatGrid', () => {
     expect(detection.grid?.beatOneFrame).toBe(10);
   });
 
+  it('puts beat one on the accented beat rather than an off-beat that weighs as much by count', () => {
+    // 48-frame beats (125 BPM at 100 calls a second): three voices on every other beat and one
+    // between, and two voices on the off-beat 24 frames before each, at the lower phase. By count
+    // the off-beat weighs the same and wins the tie; by accents the beat does.
+    const music: number[][] = [];
+    for (let beat = 0; beat < 200; beat++) {
+      const frame = 29 + beat * 48;
+      music.push([frame - 24, 2], [frame, beat % 2 === 0 ? 3 : 1]);
+    }
+
+    const detection = detectBeatGrid(asNoteStarts(music), 9700, PAL_CALLS_PER_SECOND * 2);
+
+    expect(detection.grid?.beatFrames).toBe(48);
+    expect(detection.grid?.beatOneFrame).toBe(29);
+  });
+
   it('adds a swing of 6 and 5 frames up to a whole 11-frame beat', () => {
     const swung: number[][] = [];
     for (let beat = 0; beat < 400; beat++) {
@@ -370,6 +386,19 @@ describe('fitBeatGrid', () => {
     const grid = fitBeatGrid([0, 24, 48, 72], lateStarts);
 
     expect(grid).toEqual({ beatFrames: 24, beatOneFrame: 22 });
+  });
+
+  it('puts beat one on the accented phase whichever hit within the beat the taps began on', () => {
+    // Taps on a tick 12 frames after the accented beat: a note start sits within a quarter beat of
+    // each of them, so anchoring on the taps alone would put the grid half a beat late.
+    const approx = [0, 1, 2, 3, 4, 5].map((beat) => GRID_OFFSET + 12 + 24 * (beat + 2));
+
+    const grid = fitBeatGrid(approx, starts);
+
+    expect(grid?.beatFrames).toBe(24);
+    // A tap half a beat from the accent is as near the beat before it as the beat after, and either
+    // is beat one of the same grid: it is the phase that matters.
+    expect((grid?.beatOneFrame ?? -1) % 24).toBe(GRID_OFFSET);
   });
 
   it('is null with fewer than two approximate frames', () => {
