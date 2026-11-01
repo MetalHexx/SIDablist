@@ -1,8 +1,8 @@
 import { parseSidFile, SID_REGISTER_COUNT, VOICE_CONTROL_REGISTERS } from '@sidablist/core';
 import type { RegisterRecord } from '@sidablist/core';
-import { ScanFailedError } from './index-tune.js';
 import { nextRequestId, nextSessionId } from './scan-ids.js';
 import type { ScanOutput } from './scan-tune.js';
+import { ScanFailedError } from './scanner.js';
 import type { AnalysisScanner } from './scanner.js';
 
 /**

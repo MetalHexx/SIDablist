@@ -27,6 +27,9 @@ export type ScanMessage =
 /** What `scan()` resolves to — a terminal outcome only. */
 export type ScanResult = Extract<ScanMessage, { kind: 'done' | 'failed' }>;
 
+/** A scan the scanner answered with `failed`. */
+export class ScanFailedError extends Error {}
+
 /** Runs `scanTune` somewhere other than here, so a long scan never sits in front of a scrub. */
 export interface AnalysisScanner {
   scan(request: ScanRequest, onProgress?: (frame: number) => void): Promise<ScanResult>;

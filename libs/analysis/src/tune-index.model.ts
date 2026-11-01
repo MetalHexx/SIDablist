@@ -1,4 +1,5 @@
 import type { TimingMode } from '@sidablist/core';
+import type { DetectedBeatGrid } from './beat-grid.js';
 
 /** Bumped whenever a detector's weights or algorithm changes in a way that would make a previously
  *  stored answer wrong rather than merely stale. A record whose `formatVersion` does not match this
@@ -8,8 +9,10 @@ import type { TimingMode } from '@sidablist/core';
  *  a version-3 record holds was measured against a different byte stream, so reading one back would
  *  quietly hand out loop points for a comparison that no longer happens.
  *
- *  Version 5 rekeyed the record by content hash, so no version-4 record is addressable anyway. */
-export const TUNE_INDEX_FORMAT_VERSION = 5;
+ *  Version 5 rekeyed the record by content hash, so no version-4 record is addressable anyway.
+ *
+ *  Version 6 replaces the pulse fields with the beat grid. */
+export const TUNE_INDEX_FORMAT_VERSION = 6;
 
 export type DetectorConfidence = 'strong' | 'weak' | 'none';
 
@@ -22,7 +25,7 @@ export interface DetectedMoment {
 
 /**
  * The compact, persisted answer for one `(sidHash, subtune)` pair. Every detector field is
- * nullable because "no answer" — no loop, no key, no pulse — is a completed outcome to cache, not a
+ * nullable because "no answer" — no loop, no key, no beat grid — is a completed outcome to cache, not a
  * reason to re-scan the tune on every subsequent launch.
  *
  * Deliberately excludes the raw `ScanOutput`, the `FeatureMatrix`, the novelty curve, the similarity
@@ -57,10 +60,10 @@ export interface TuneIndexRecord {
   readonly keyConfidence: DetectorConfidence;
   readonly scalePitchClasses: readonly number[];
 
-  // pulse — from computePulse() / impliedTempo()
-  readonly dominantIntervalFrames: number | null;
-  readonly pulseConfidence: DetectorConfidence;
-  readonly nativeTempo: number | null; // BPM
+  // beats — from detectBeatGrid(); frames are register-record entry indices, on the same basis as
+  // the loop and moment frames above
+  readonly beatGrid: DetectedBeatGrid | null;
+  readonly beatConfidence: DetectorConfidence;
 
   readonly callsPerFrame: number; // rounded integer — reinterprets stored frames as time later
   /** The un-rounded rate the tune's timer describes, so the Timing toggle can flip between the two
