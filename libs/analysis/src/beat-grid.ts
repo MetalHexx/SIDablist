@@ -227,7 +227,9 @@ function settlePhase(starts: NoteStarts, beat: number): { phase: number; weight:
  * The span is the stretch of the stream where the winner's note starts keep agreeing: the maximum
  * sum of a score that pays for each on-grid start and charges for each off-grid one, so a quiet
  * stretch costs nothing and a tempo change ends the span. A tune that changes tempo gets its main
- * part's grid and that part's span.
+ * part's grid and that part's span. A known limit: two tempos that share a short subdivision (steps
+ * every 6 frames under beats of 24 and of 30, say) put enough of the other part's starts on the
+ * winner's grid to keep paying, so the span can run on across the change.
  *
  * Declines, with confidence `'none'`, when there are too few note starts, when the stream or the
  * span covers fewer than a handful of beats (a sound-effect subtune), or when no candidate aligns
@@ -365,6 +367,13 @@ function lowerBound(frames: Uint32Array, frame: number): number {
   return low;
 }
 
+/** The note starts from `from` to `to`, both inclusive; views onto `starts`, not copies. */
+function startsBetween(starts: NoteStarts, from: number, to: number): NoteStarts {
+  const low = lowerBound(starts.frames, from);
+  const high = lowerBound(starts.frames, to + 1);
+  return { frames: starts.frames.subarray(low, high), voices: starts.voices.subarray(low, high) };
+}
+
 /** Voices that start a note at exactly `frame`, 0 when none does. */
 function voicesAt(starts: NoteStarts, frame: number): number {
   const index = lowerBound(starts.frames, frame);
@@ -388,8 +397,11 @@ function median(sorted: Float64Array): number {
  * Where the approximate frames fall within a beat says which of its repeated hits the operator
  * tapped, which is not which hit is the beat: a tune with a note every few frames puts a hit within
  * a quarter beat of any tap. So the anchor fixes only the length, and the grid's phase is the one
- * the tune's accents settle on (`settlePhase`), as in `detectBeatGrid`. Beat one is the grid point
- * nearest the first approximate frame, kept ≥ 0.
+ * the tune's accents settle on (`settlePhase`), as in `detectBeatGrid`. A tune can shift its phase
+ * part way through, though, and then the phase the whole tune settles on can hold no note start at
+ * all in the stretch that was tapped; only then is the phase settled on that stretch's own note
+ * starts, from half a beat before the first approximate frame to half a beat after the last. Beat
+ * one is the grid point nearest the first approximate frame, kept ≥ 0.
  *
  * @param approxBeatFrames approximate frames of beats, ascending (sorted here if not)
  * @param starts the tune's note starts, from `noteStarts`
@@ -461,7 +473,12 @@ export function fitBeatGrid(
   }
   if (best === null) return null;
 
-  const { phase } = settlePhase(starts, best.beatFrames);
+  const beat = best.beatFrames;
+  let { phase } = settlePhase(starts, beat);
+  const tapped = startsBetween(starts, Math.ceil(first - beat / 2), Math.floor(last + beat / 2));
+  if (tapped.frames.length > 0 && !tapped.frames.some((frame) => frame % beat === phase)) {
+    phase = settlePhase(tapped, beat).phase;
+  }
   let beatOneFrame = phase + Math.round((first - phase) / best.beatFrames) * best.beatFrames;
   while (beatOneFrame < 0) beatOneFrame += best.beatFrames;
   return { beatFrames: best.beatFrames, beatOneFrame };

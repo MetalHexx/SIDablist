@@ -401,6 +401,19 @@ describe('fitBeatGrid', () => {
     expect((grid?.beatOneFrame ?? -1) % 24).toBe(GRID_OFFSET);
   });
 
+  it('settles the phase on the tapped stretch when the whole tune’s phase holds no note there', () => {
+    // 200 hits on phase 0, then 100 shifted half a beat to phase 12: the whole tune settles on 0,
+    // which falls on no note where the taps are.
+    const shifted = asNoteStarts([
+      ...Array.from({ length: 200 }, (_, beat) => [24 * beat, 3]),
+      ...Array.from({ length: 100 }, (_, beat) => [4812 + 24 * beat, 3]),
+    ]);
+
+    const grid = fitBeatGrid([4812, 4836, 4860, 4884, 4908, 4932], shifted);
+
+    expect(grid).toEqual({ beatFrames: 24, beatOneFrame: 4812 });
+  });
+
   it('is null with fewer than two approximate frames', () => {
     expect(fitBeatGrid([], starts)).toBeNull();
     expect(fitBeatGrid([GRID_OFFSET], starts)).toBeNull();
