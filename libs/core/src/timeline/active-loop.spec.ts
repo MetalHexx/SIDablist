@@ -308,6 +308,91 @@ describe('createActiveLoopTracker', () => {
     });
   });
 
+  describe('with a wrap lead', () => {
+    // The player's lead: one frame, the gate-off a re-entry owes, which takes the loop's last slot.
+    beforeEach(() => {
+      tracker = createActiveLoopTracker({ wrapLeadFrames: 1 });
+    });
+
+    it('falls due one frame before the active loop’s end, and not before', () => {
+      tracker.set({ startFrame: frames(75), endFrame: frames(140) });
+      play(138);
+      expect(tracker.advance(machine, registers, ring, track, frames(138))).toEqual({
+        action: 'none',
+      });
+
+      play(1);
+      const result = tracker.advance(machine, registers, ring, track, frames(139));
+
+      expect(result).toEqual({ action: 'looped', frame: 75 });
+      expect(liveState()).toEqual(runUnbrokenTo(frames(75)));
+    });
+
+    it('lands a queued hand-off at the same point', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(100) });
+      tracker.queue({
+        startFrame: frames(60),
+        loop: { startFrame: frames(60), endFrame: frames(90) },
+      });
+      tracker.setQueuedImage({ frame: frames(60), ...runUnbrokenTo(frames(60)) });
+      play(99);
+
+      expect(tracker.advance(machine, registers, ring, track, frames(99))).toEqual({
+        action: 'handed-off',
+        frame: 60,
+      });
+    });
+
+    it('wraps a repeating track one frame early, on its first pass and every lap after', () => {
+      track.setTrackStructure({
+        loopStartFrame: frames(20),
+        loopPeriodFrames: frames(80),
+        endedAtFrame: null,
+      });
+      track.setRepeatEnabled(true);
+      play(98);
+      expect(tracker.advance(machine, registers, ring, track, frames(98)).action).toBe('none');
+
+      play(1);
+      expect(tracker.advance(machine, registers, ring, track, frames(99))).toEqual({
+        action: 'looped',
+        frame: 20,
+      });
+      expect(tracker.get()).toEqual({ startFrame: 20, endFrame: 100 });
+
+      play(79); // from frame 20 up to the frame before the track's end
+      expect(tracker.advance(machine, registers, ring, track, frames(99))).toEqual({
+        action: 'looped',
+        frame: 20,
+      });
+    });
+
+    it('stops a track with repeat off only at its true end, since a stop owes the stream nothing', () => {
+      track.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: frames(50),
+        endedAtFrame: null,
+      });
+      play(49);
+      expect(tracker.advance(machine, registers, ring, track, frames(49)).action).toBe('none');
+
+      play(1);
+      expect(tracker.advance(machine, registers, ring, track, frames(50)).action).toBe('stopped');
+    });
+
+    it('still renders the start frame of a loop too short to give one up', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(11) });
+      play(10);
+      expect(tracker.advance(machine, registers, ring, track, frames(10)).action).toBe('none');
+
+      play(1);
+      expect(tracker.advance(machine, registers, ring, track, frames(11))).toEqual({
+        action: 'looped',
+        frame: 10,
+      });
+    });
+  });
+
   describe('a queued hand-off’s beforeLanding', () => {
     const imageAt = (at: number): PositionAnchor => ({
       frame: frames(at),

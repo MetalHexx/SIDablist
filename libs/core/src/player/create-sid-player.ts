@@ -102,6 +102,15 @@ const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
 const HANDBACK_LEAD_SECONDS = 2;
 const HANDBACK_LEAD_MS = milliseconds(HANDBACK_LEAD_SECONDS * 1000);
 
+/**
+ * The frame slots a re-entry's resync takes before its start frame plays while playing: the one
+ * gate-off frame `gateOffOwed` releases in a tick of its own. The active-loop tracker wraps this
+ * many frames before a loop's end, so the gate-off takes the place of the loop's last frame rather
+ * than being added after it. Without that, every lap ran one tick longer than the loop, and a short
+ * loop drifted behind a long one at the same tempo — by one tick per lap of the short one.
+ */
+const REENTRY_GATE_OFF_FRAMES = 1;
+
 /** The most deliveries the history will keep: about 170 KB at the ceiling, which is the memory a
  *  host's request is allowed to cost. */
 const MAX_KEPT_DELIVERIES = 4096;
@@ -197,7 +206,11 @@ class SidPlayerCoordinator implements SidPlayer {
 
   private readonly ring: AnchorRing = createAnchorRing(() => this.seekReachFrames());
   private readonly track: TrackStructure = createTrackStructure();
-  private readonly activeLoop: ActiveLoopTracker = createActiveLoopTracker();
+  /** Wraps one frame early: the gate-off a re-entry owes (`gateOffOwed`) takes the loop's last
+   *  slot, so a lap takes exactly as many ticks as the loop has frames. */
+  private readonly activeLoop: ActiveLoopTracker = createActiveLoopTracker({
+    wrapLeadFrames: REENTRY_GATE_OFF_FRAMES,
+  });
 
   /** The scratch frame every gate-off is built on. Never the live frame: that one mirrors the
    *  emulated chip and is what a resume restores from. */
