@@ -10,7 +10,7 @@ import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
 import type { SidSink } from '../ports/sink.js';
-import { clockRatio } from '../registers/clock-ratio.js';
+import { clockRatio, NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
 import { FILTER_MODE_BITS, createRegisterFrame } from '../registers/register-frame.js';
 import type {
   RegisterFrame,
@@ -245,10 +245,13 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Keyed like `fieldHolds`; an amount of 0 is never stored. */
   private readonly fieldOffsets = new Map<number, FieldOffsetRecord>();
 
-  /** The clock pair rather than the ratio it derives, because a fresh `RegisterFrame` is handed the
-   *  pair. Null until the application — the only thing that knows what machine is on the far end —
-   *  names one. */
-  private clockCorrection: { readonly sourceHz: number; readonly targetHz: number } | null = null;
+  /** The φ2 of the machine on the far end. Null until the application — the only thing that knows
+   *  what machine that is — names one, and null again once it no longer knows; null plays the tune's
+   *  bytes uncorrected. Held across loads, since the machine does not change with the tune. */
+  private targetClockHz: number | null = null;
+  /** The φ2 the loaded tune was written for, read from its header on every load — never carried from
+   *  the tune before, and never the application's to supply. */
+  private tuneClockHz = PAL_PHI2_HZ;
   private readonly voicePitch = [1, 1, 1];
 
   /** What the host asked to keep of the deliveries, or null while it has not. Held here rather than
@@ -456,6 +459,12 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.load(file);
     this.history?.restart();
 
+    // The header's clock decides both the rate this tune's frames are paced at and the φ2 its
+    // frequencies were written against: NTSC only when it says so, PAL otherwise ('unknown' and
+    // 'any' included). One rule for both, so tempo and pitch never disagree about what it is.
+    const ntsc = file.clock === 'ntsc';
+    this.tuneClockHz = ntsc ? NTSC_PHI2_HZ : PAL_PHI2_HZ;
+
     // A fresh frame starts at full gain, every group at home, every voice at its own clock and pitch
     // and no field held or offset, so every carried setting is re-applied here, before this load can
     // emit a packet at the wrong setting.
@@ -476,9 +485,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // A fresh frame starts fully unmuted, so a held button must not survive into a tune it was never
     // pressed against — `effectiveMutes` would disagree with the chip it just replaced.
     this.heldVoices.fill(false);
-    this.nominalIntervalUs = microseconds(
-      file.clock === 'ntsc' ? NTSC_FRAME_INTERVAL_US : PAL_FRAME_INTERVAL_US,
-    );
+    this.nominalIntervalUs = microseconds(ntsc ? NTSC_FRAME_INTERVAL_US : PAL_FRAME_INTERVAL_US);
     // The outgoing tune's mode was that tune's own; the application re-applies whatever detection
     // found for this one.
     this.timingMode = DEFAULT_TIMING_MODE;
@@ -1248,17 +1255,18 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /**
-   * The pitch correction for a tune written for a machine clocked at `sourceHz` and played on one
-   * clocked at `targetHz`. Only the application knows what is on the far end, so this is the route
-   * by which it tells the register shadow — and it is held, so the next tune loaded inherits it.
+   * The φ2 of the machine on the far end, or null for one nobody knows. Only the application knows
+   * what is there, so this is the route by which it tells the register shadow, and it is held, so
+   * every tune loaded after plays against it. The other half of the ratio is the tune's own, read
+   * from each tune's header as it loads, so one tune's clock never carries into the next.
    */
-  setTargetClock(sourceHz: number, targetHz: number): void {
-    if (clockRatio(sourceHz, targetHz) === null) {
-      console.warn(`SID player: ignoring a clock correction of ${sourceHz} Hz to ${targetHz} Hz.`);
+  setTargetClock(targetHz: number | null): void {
+    if (targetHz !== null && clockRatio(this.tuneClockHz, targetHz) === null) {
+      console.warn(`SID player: ignoring a target clock of ${targetHz} Hz.`);
       return;
     }
-    this.clockCorrection = { sourceHz, targetHz };
-    this.session.frame?.setTargetClock(sourceHz, targetHz);
+    this.targetClockHz = targetHz;
+    this.session.frame?.setTargetClock(this.tuneClockHz, targetHz ?? this.tuneClockHz);
   }
 
   /**
@@ -2006,12 +2014,12 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /** Re-applies the correction and the three pitches to whichever register shadow is current. A
    *  fresh one starts at home, so without this a load would emit its first frames at the source
-   *  machine's pitch. */
+   *  machine's pitch. Runs after `tuneClockHz` is read from the new tune's header. */
   private applyPitch(): void {
     const frame = this.session.frame;
     if (frame === null) return;
-    if (this.clockCorrection !== null) {
-      frame.setTargetClock(this.clockCorrection.sourceHz, this.clockCorrection.targetHz);
+    if (this.targetClockHz !== null) {
+      frame.setTargetClock(this.tuneClockHz, this.targetClockHz);
     }
     for (let voice = 0; voice < VOICE_COUNT; voice++) {
       frame.setVoicePitch(voice, this.voicePitch[voice]);

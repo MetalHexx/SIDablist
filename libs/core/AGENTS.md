@@ -97,6 +97,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   whose lengths are exact multiples drift apart by a tick per lap of the shorter one, audibly
   within a minute of a two-deck mix, and only the `lap timing` specs catch it. A repeat-off stop
   owes nothing and still ends on the track's true last frame.
+- **The application names only the far end's clock; the tune's clock is read from its header.**
+  `setTargetClock(targetHz)` is held across loads, and `loadTune` derives the tune's φ2 by the
+  same `file.clock === 'ntsc'` test that sets its tempo. A source clock taken from the host, or
+  kept from the tune before, plays the next tune of the other standard about two-thirds of a
+  semitone off, and only the `pitch correction` specs in `player/create-sid-player.spec.ts`
+  catch it.
 - **Hardware-precise constants are not typos to fix.** `registers/sid-constants.ts`'s
   `PAL_FRAME_INTERVAL_US` is deliberately `19950`, not the TeensyROM firmware's own `19975` —
   the comment on it exists because that gap looks like a mistake and is not. The φ2 clock rates in

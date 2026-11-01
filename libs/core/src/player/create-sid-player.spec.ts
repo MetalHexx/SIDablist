@@ -279,9 +279,10 @@ function gateTune(): SidFile {
 }
 
 /** play writes voice 0's frequency pair every call, so the bytes the correction rewrites are
- *  readable off the delivered frame. */
-function frequencyTune(low: number, high: number): SidFile {
+ *  readable off the delivered frame. `clock` is the header's, which the correction reads. */
+function frequencyTune(low: number, high: number, clock: SidClock = 'pal'): SidFile {
   return tune({
+    clock,
     blocks: [
       { at: 0x1000, bytes: [RTS] },
       // LDA #low; STA $D400; LDA #high; STA $D401; RTS
@@ -1115,8 +1116,8 @@ describe('createSidPlayer', () => {
   describe('pitch correction', () => {
     it('carries a target clock through to the register shadow', async () => {
       const { player, sink, clock } = harness();
-      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234, a PAL tune
+      player.setTargetClock(NTSC_PHI2_HZ);
 
       await player.play();
       run(clock, 1);
@@ -1126,9 +1127,75 @@ describe('createSidPlayer', () => {
       expect(valueOf(frame, 1)).toBe(0x11);
     });
 
+    it("reads an NTSC tune's clock from its header and raises it on a PAL machine", async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0xe5); // 0x12e5
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it("takes each tune's clock afresh from its header under one held target", async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ);
+
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0xe5);
+
+      // The NTSC tune before it must not carry its clock into a PAL tune on the same machine.
+      player.loadTune(frequencyTune(0x34, 0x12, 'pal'));
+      await player.play();
+      run(clock, 1);
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it('treats a header naming no clock, or either, as PAL, as its tempo does', async () => {
+      for (const header of ['unknown', 'any'] as const) {
+        const { player, sink, clock } = harness();
+        player.setTargetClock(NTSC_PHI2_HZ);
+        player.loadTune(frequencyTune(0x34, 0x12, header));
+
+        await player.play();
+        run(clock, 1);
+
+        const frame = lastDelivered(sink);
+        expect(valueOf(frame, 0)).toBe(0x89);
+        expect(valueOf(frame, 1)).toBe(0x11);
+      }
+    });
+
+    it('hands the bytes back when the target is cleared, and keeps a later load uncorrected', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ);
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x89);
+
+      player.setTargetClock(null);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x34);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x12);
+
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x34);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x12);
+    });
+
     it('survives a tune load, which starts a register shadow at home', async () => {
       const { player, sink, clock } = harness();
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setTargetClock(NTSC_PHI2_HZ);
       player.setVoicePitch(0, 2);
 
       player.loadTune(frequencyTune(0x34, 0x12));
@@ -1143,7 +1210,7 @@ describe('createSidPlayer', () => {
     it('composes a voice pitch with the correction without either disturbing the other', async () => {
       const { player, sink, clock } = harness();
       player.loadTune(frequencyTune(0x34, 0x12));
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setTargetClock(NTSC_PHI2_HZ);
       await player.play();
 
       player.setVoicePitch(0, 2);
@@ -1156,10 +1223,10 @@ describe('createSidPlayer', () => {
       expect(valueOf(lastDelivered(sink), 1)).toBe(0x11);
     });
 
-    it('leaves the tunes own bytes alone with the clocks matched and the pitch at 1', async () => {
+    it("leaves the tune's own bytes alone on a machine at its own clock with the pitch at 1", async () => {
       const { player, sink, clock } = harness();
-      player.loadTune(frequencyTune(0x34, 0x12));
-      player.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      player.setTargetClock(NTSC_PHI2_HZ);
       player.setVoicePitch(0, 1);
 
       await player.play();
@@ -1170,12 +1237,14 @@ describe('createSidPlayer', () => {
       expect(valueOf(frame, 1)).toBe(0x12);
     });
 
-    it('ignores a clock pair it cannot divide and a voice outside the chip', async () => {
+    it('ignores a clock it cannot divide by and a voice outside the chip, keeping what is in force', async () => {
       const { player, sink, clock } = harness();
       player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ);
 
-      player.setTargetClock(0, NTSC_PHI2_HZ);
-      player.setTargetClock(PAL_PHI2_HZ, Number.NaN);
+      player.setTargetClock(0);
+      player.setTargetClock(-PAL_PHI2_HZ);
+      player.setTargetClock(Number.NaN);
       player.setVoicePitch(3, 0.5);
       player.setVoicePitch(0, 0);
 
@@ -1183,8 +1252,8 @@ describe('createSidPlayer', () => {
       run(clock, 1);
 
       const frame = lastDelivered(sink);
-      expect(valueOf(frame, 0)).toBe(0x34);
-      expect(valueOf(frame, 1)).toBe(0x12);
+      expect(valueOf(frame, 0)).toBe(0x89);
+      expect(valueOf(frame, 1)).toBe(0x11);
     });
   });
 
@@ -4123,7 +4192,7 @@ describe('createSidPlayer', () => {
       it('scales frequency by the rate on top of the clock correction and voice pitch, clamped to the register', async () => {
         const h = withRecord(rampTune(), 60);
         await h.player.seek(frames(20));
-        h.player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+        h.player.setTargetClock(NTSC_PHI2_HZ);
         h.player.setVoicePitch(0, 2);
         h.player.enterVarispeed(h.source);
         const ratio = clockRatio(PAL_PHI2_HZ, NTSC_PHI2_HZ) as number;

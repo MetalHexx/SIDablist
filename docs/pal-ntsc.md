@@ -53,9 +53,13 @@ Fn_out = Fn × clockRatio × voicePitch[voice]
 ```
 
 - **`clockRatio`** (`registers/clock-ratio.ts`'s `clockRatio(sourceHz, targetHz)`) is derived from the
-  two φ2 values, constant for the session, and invisible to the performer. It answers "what was this
-  tune written for, and what is it playing on" — a fact about the tune and the target machine, not a
-  performance control.
+  two φ2 values and invisible to the performer. It answers "what was this tune written for, and what
+  is it playing on" — a fact about the tune and the target machine, not a performance control. The
+  two halves have different owners. The target is the application's: only it knows what machine is
+  on the far end, so it names that φ2 through `setTargetClock(targetHz)`, and the player holds it
+  across loads. The source is the tune's: the player reads it from each tune's header as the tune
+  loads, by the same rule its tempo follows (NTSC only when the header says so, PAL otherwise), so
+  one tune's clock never carries into the next.
   Concretely: `clockRatio(sourceHz, targetHz) = sourceHz / targetHz`, so a PAL tune corrected for
   playback on NTSC divides its frequency registers by NTSC's clock rising over PAL's — a downward
   scale — and an NTSC tune corrected for PAL scales up by the same ratio inverted.
@@ -63,8 +67,9 @@ Fn_out = Fn × clockRatio × voicePitch[voice]
   interface gangs the three voices together is an application decision core has no opinion on.
 
 Keeping them apart means moving a pitch control never disturbs the clock correction, and vice versa: a
-`setTargetClock` call re-derives `clockRatio` without touching whatever `voicePitch` a performer has
-already set, and `setVoicePitch` composes with whatever `clockRatio` is already in force. An interface
+`setTargetClock` call or a tune load re-derives `clockRatio` without touching whatever `voicePitch` a
+performer has already set, and `setVoicePitch` composes with whatever `clockRatio` is already in
+force. An interface
 can report how much correction is in effect independently of where a pitch control currently sits.
 
 ## What is scaled, and what is not — and why
