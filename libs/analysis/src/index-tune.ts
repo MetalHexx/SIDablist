@@ -6,6 +6,7 @@ import {
   playCallsPerSecond,
 } from '@sidablist/core';
 import type { PlayRate } from '@sidablist/core';
+import { detectBeatGrid, noteStarts } from './beat-grid.js';
 import { buildFeatureMatrix } from './frame-features.js';
 import {
   computeNovelty,
@@ -14,13 +15,14 @@ import {
   DEFAULT_FEATURE_WEIGHTS,
 } from './novelty.js';
 import { computeStructure } from './structure.js';
-import { computePulse, impliedTempo } from './pulse.js';
 import { detectKey } from './key.js';
 import { segmentNotes } from './notes.js';
 import { detectLoop, IDLE_PERIOD_SECONDS, MIN_TAIL_SECONDS } from './loop-detect.js';
 import type { LoopDetection } from './loop-detect.js';
+import { toRegisterRecord } from './register-record.js';
 import { nextRequestId, nextSessionId } from './scan-ids.js';
 import type { ScanOutput } from './scan-tune.js';
+import { ScanFailedError } from './scanner.js';
 import type { AnalysisScanner, ScanRequest, ScanResult } from './scanner.js';
 import { TUNE_INDEX_FORMAT_VERSION } from './tune-index.model.js';
 import type { TuneIndexRecord } from './tune-index.model.js';
@@ -30,7 +32,7 @@ export interface TuneIndexIdentity {
   readonly subtune: number;
 }
 
-export class ScanFailedError extends Error {}
+export { ScanFailedError };
 
 /** Seconds of music per rung — the depths the measured baseline was produced at. */
 export const SCAN_DEPTH_SECONDS: readonly number[] = [90, 210, 450, 750];
@@ -88,16 +90,11 @@ export async function indexTune(
   const matrix = buildFeatureMatrix(output);
   const novelty = computeNovelty(matrix, DEFAULT_FEATURE_WEIGHTS);
   const structure = computeStructure(matrix, DEFAULT_FEATURE_WEIGHTS);
-  const pulse = computePulse(novelty.candidates, output.exactCallsPerFrame);
   const key = detectKey(segmentNotes(output, file.clock));
   // Duration-facing, unlike the ladder's rung sizing above: the exact rate, not the rounded one — see
   // `C64Machine.exactCallsPerFrame`'s own doc for why rounding here would mis-tempo a multispeed tune.
-  const tempo = impliedTempo(
-    pulse.dominantInterval,
-    nominalIntervalUs,
-    output.exactCallsPerFrame,
-    1,
-  );
+  const callsPerSecond = (1e6 / nominalIntervalUs) * output.exactCallsPerFrame;
+  const beats = detectBeatGrid(noteStarts(toRegisterRecord(output)), output.frames, callsPerSecond);
 
   return {
     sidHash: identity.sidHash,
@@ -120,9 +117,8 @@ export async function indexTune(
     keyConfidence: key.confidence,
     scalePitchClasses: key.scalePitchClasses,
 
-    dominantIntervalFrames: pulse.dominantInterval,
-    pulseConfidence: pulse.confidence,
-    nativeTempo: tempo.native,
+    beatGrid: beats.grid,
+    beatConfidence: beats.confidence,
 
     callsPerFrame: output.callsPerFrame,
     exactCallsPerFrame: output.exactCallsPerFrame,

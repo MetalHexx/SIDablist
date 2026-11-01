@@ -136,9 +136,14 @@ export interface SidPlayer {
    *  drain into `into`, oldest first, with `dropped` and `restarted` as `DeliveryBatch` defines
    *  them. Allocates nothing. With nothing kept, leaves `into.count` 0. */
   drainDeliveries(into: DeliveryBatch): void;
-  /** The φ2 clocks a tune was written for and is playing on. Derived and session-lifetime, not a
-   *  performance control — and the application's to supply, since core cannot know the far end. */
-  setTargetClock(sourceHz: number, targetHz: number): void;
+  /** The φ2 of the machine on the far end, in Hz (`PAL_PHI2_HZ` or `NTSC_PHI2_HZ` for a C64), or
+   *  null for a machine nobody knows, which plays the tune's bytes uncorrected. Held across loads.
+   *  The clock each tune was written for is read from its header as it loads (NTSC only when the
+   *  header says so, PAL otherwise, the same rule its tempo follows), so the far end sounds the pitch
+   *  the tune was written at. Session-lifetime, not a performance control, and the application's to
+   *  supply, since core cannot know the far end. A non-finite or non-positive clock is ignored with
+   *  a warning. */
+  setTargetClock(targetHz: number | null): void;
   /** Live, per voice, user-driven. Composes with the clock ratio and never disturbs it. */
   setVoicePitch(voice: number, coefficient: number): void;
 

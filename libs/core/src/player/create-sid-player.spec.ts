@@ -279,9 +279,10 @@ function gateTune(): SidFile {
 }
 
 /** play writes voice 0's frequency pair every call, so the bytes the correction rewrites are
- *  readable off the delivered frame. */
-function frequencyTune(low: number, high: number): SidFile {
+ *  readable off the delivered frame. `clock` is the header's, which the correction reads. */
+function frequencyTune(low: number, high: number, clock: SidClock = 'pal'): SidFile {
   return tune({
+    clock,
     blocks: [
       { at: 0x1000, bytes: [RTS] },
       // LDA #low; STA $D400; LDA #high; STA $D401; RTS
@@ -529,8 +530,9 @@ describe('createSidPlayer', () => {
   describe("a loop's entry image", () => {
     // A wrap owes the stream a resync (`queueResync`'s `gateOffOwed`), which the tick immediately
     // after a wrap spends delivering a gate-off frame instead of running the play routine — one
-    // tick with no `runFrame` call of its own, on every wrap, fast path or slow. Each case below
-    // ticks past that one first, so the batch it measures is unbroken real ticks throughout.
+    // tick with no `runFrame` call of its own, on every wrap, fast path or slow. The wrap falls due
+    // one frame before the loop's end so that tick takes the loop's last slot: a ten-frame loop
+    // laps in ten ticks, nine of them real and the tenth the gate-off.
 
     afterEach(() => {
       vi.restoreAllMocks();
@@ -546,10 +548,10 @@ describe('createSidPlayer', () => {
       player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
       await flushEntryImageCapture();
 
-      run(clock, 9); // up to, but not touching, the loop's end
+      run(clock, 8); // up to, but not touching, the frame the wrap falls due on
 
       runFrameSpy.mockClear();
-      run(clock, 1); // crosses the loop's end and re-enters its start on this same tick
+      run(clock, 1); // plays the loop's second-to-last frame and re-enters its start on this tick
 
       // One call for the tick's own frame and nothing more — a seek along the anchor path would have
       // cost extra calls proportional to how far back the newest usable anchor sat, and once this
@@ -591,13 +593,12 @@ describe('createSidPlayer', () => {
       player.setActiveLoop({ startFrame: frames(deepStart), endFrame: frames(deepStart + 10) });
       await flushEntryImageCapture();
 
-      run(clock, 10); // first wrap: 500 -> 510 -> back to 500
-      run(clock, 1); // the gate-off tick the first wrap owed the stream
+      run(clock, 10); // first lap: 500 -> 508, back to 500, and the gate-off in 509's slot
 
       runFrameSpy.mockClear();
-      run(clock, 10); // second wrap in full: every one of these ticks is a real one
+      run(clock, 10); // second lap in full: nine real ticks and the gate-off
 
-      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(runFrameSpy).toHaveBeenCalledTimes(9);
       expect(player.getPosition()).toBe(deepStart);
     });
 
@@ -613,7 +614,9 @@ describe('createSidPlayer', () => {
       await player.play();
       await flushEntryImageCapture(); // lets the track's own loop capture its entry image
 
-      run(clock, 550); // plays through the track's own end and wraps back to its start
+      // Plays up to the track's own end, wraps back to its start one frame early, and spends the
+      // 550th tick on the gate-off that wrap owed.
+      run(clock, 550);
       expect(player.getSnapshot().loop).toEqual({ startFrame: 500, endFrame: 550 });
       expect(player.getPosition()).toBe(500);
 
@@ -621,12 +624,11 @@ describe('createSidPlayer', () => {
       // marker loop's own capture has any chance to resolve.
       player.setActiveLoop({ startFrame: frames(10), endFrame: frames(20) });
       player.setActiveLoop(null);
-      run(clock, 1); // the gate-off tick the earlier wrap owed the stream
 
       runFrameSpy.mockClear();
-      run(clock, 50); // back around to the track loop's own end again
+      run(clock, 50); // one lap of the track loop: 49 real ticks and the gate-off
 
-      expect(runFrameSpy).toHaveBeenCalledTimes(50);
+      expect(runFrameSpy).toHaveBeenCalledTimes(49);
       expect(player.getPosition()).toBe(500);
     });
 
@@ -696,6 +698,104 @@ describe('createSidPlayer', () => {
 
       expect(runFrameSpy).toHaveBeenCalled();
       expect(player.getPosition()).toBe(deepStart + 10);
+    });
+  });
+
+  describe('lap timing', () => {
+    // Every re-entry owes the stream a gate-off in a tick of its own. The wrap falls due one frame
+    // before the end so that tick takes the last frame's slot rather than being added after it: a
+    // lap takes exactly as many ticks as the loop has frames, so two loops at one tempo whose
+    // lengths are exact multiples stay locked instead of the shorter one drifting behind.
+
+    /** The byte `counterTune` writes to $D400 on the frame after `frame`. */
+    const counterAfter = (frame: number): number => (frame + 1) & 0xff;
+
+    /** Ticks `count` times, collecting the byte each delivered frame carried for $D400 — null for
+     *  one that carried none, which for `counterTune` is only ever the gate-off. */
+    function counterBytes(sink: RecordingSink, clock: FakeClock, count: number): (number | null)[] {
+      const bytes: (number | null)[] = [];
+      for (let tick = 0; tick < count; tick++) {
+        run(clock, 1);
+        bytes.push(valueOf(lastDelivered(sink), 0) ?? null);
+      }
+      return bytes;
+    }
+
+    it('takes exactly as many ticks per lap as the loop has frames, the gate-off in the last frame’s slot', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 100);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+
+      // Frames 100 to 108, then the gate-off where frame 109 would have played.
+      const lap = [101, 102, 103, 104, 105, 106, 107, 108, 109, null];
+      expect(counterBytes(sink, clock, 10)).toEqual(lap);
+      expect(player.getPosition()).toBe(100);
+      expect(counterBytes(sink, clock, 10)).toEqual(lap);
+      expect(counterBytes(sink, clock, 10)).toEqual(lap);
+      expect(player.getPosition()).toBe(100);
+    });
+
+    it('lands a queued jump on the lap’s own boundary: the gate-off in the last frame’s slot, the target on the tick after', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      await player.play();
+      run(clock, 100);
+      player.setJumpTargets([frames(500)]);
+      player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+
+      expect(counterBytes(sink, clock, 11)).toEqual([
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        null,
+        counterAfter(500),
+      ]);
+      expect(player.getSnapshot().tune?.handOffs).toBe(1);
+      expect(player.getPosition()).toBe(501);
+    });
+
+    it('wraps a repeating track one frame early as well, so every pass takes as many ticks as the track has frames', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: frames(0),
+        loopPeriodFrames: frames(10),
+        endedAtFrame: null,
+      });
+      player.setRepeatTrack(true);
+      await player.play();
+      await flushEntryImageCapture();
+
+      const pass = [1, 2, 3, 4, 5, 6, 7, 8, 9, null];
+      expect(counterBytes(sink, clock, 10)).toEqual(pass);
+      expect(counterBytes(sink, clock, 10)).toEqual(pass);
+      expect(player.getSnapshot().loop).toEqual({ startFrame: 0, endFrame: 10 });
+    });
+
+    it('plays a track with repeat off through its last frame, since a stop owes the stream nothing', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(counterTune());
+      player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(10),
+      });
+      player.setRepeatTrack(false);
+      await player.play();
+
+      expect(counterBytes(sink, clock, 10)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(player.getSnapshot().transport).toBe('ended');
     });
   });
 
@@ -1016,8 +1116,8 @@ describe('createSidPlayer', () => {
   describe('pitch correction', () => {
     it('carries a target clock through to the register shadow', async () => {
       const { player, sink, clock } = harness();
-      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12)); // 0x1234, a PAL tune
+      player.setTargetClock(NTSC_PHI2_HZ);
 
       await player.play();
       run(clock, 1);
@@ -1027,9 +1127,75 @@ describe('createSidPlayer', () => {
       expect(valueOf(frame, 1)).toBe(0x11);
     });
 
+    it("reads an NTSC tune's clock from its header and raises it on a PAL machine", async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+
+      await player.play();
+      run(clock, 1);
+
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0xe5); // 0x12e5
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it("takes each tune's clock afresh from its header under one held target", async () => {
+      const { player, sink, clock } = harness();
+      player.setTargetClock(PAL_PHI2_HZ);
+
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0xe5);
+
+      // The NTSC tune before it must not carry its clock into a PAL tune on the same machine.
+      player.loadTune(frequencyTune(0x34, 0x12, 'pal'));
+      await player.play();
+      run(clock, 1);
+      const frame = lastDelivered(sink);
+      expect(valueOf(frame, 0)).toBe(0x34);
+      expect(valueOf(frame, 1)).toBe(0x12);
+    });
+
+    it('treats a header naming no clock, or either, as PAL, as its tempo does', async () => {
+      for (const header of ['unknown', 'any'] as const) {
+        const { player, sink, clock } = harness();
+        player.setTargetClock(NTSC_PHI2_HZ);
+        player.loadTune(frequencyTune(0x34, 0x12, header));
+
+        await player.play();
+        run(clock, 1);
+
+        const frame = lastDelivered(sink);
+        expect(valueOf(frame, 0)).toBe(0x89);
+        expect(valueOf(frame, 1)).toBe(0x11);
+      }
+    });
+
+    it('hands the bytes back when the target is cleared, and keeps a later load uncorrected', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ);
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x89);
+
+      player.setTargetClock(null);
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x34);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x12);
+
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      await player.play();
+      run(clock, 1);
+      expect(valueOf(lastDelivered(sink), 0)).toBe(0x34);
+      expect(valueOf(lastDelivered(sink), 1)).toBe(0x12);
+    });
+
     it('survives a tune load, which starts a register shadow at home', async () => {
       const { player, sink, clock } = harness();
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setTargetClock(NTSC_PHI2_HZ);
       player.setVoicePitch(0, 2);
 
       player.loadTune(frequencyTune(0x34, 0x12));
@@ -1044,7 +1210,7 @@ describe('createSidPlayer', () => {
     it('composes a voice pitch with the correction without either disturbing the other', async () => {
       const { player, sink, clock } = harness();
       player.loadTune(frequencyTune(0x34, 0x12));
-      player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+      player.setTargetClock(NTSC_PHI2_HZ);
       await player.play();
 
       player.setVoicePitch(0, 2);
@@ -1057,10 +1223,10 @@ describe('createSidPlayer', () => {
       expect(valueOf(lastDelivered(sink), 1)).toBe(0x11);
     });
 
-    it('leaves the tunes own bytes alone with the clocks matched and the pitch at 1', async () => {
+    it("leaves the tune's own bytes alone on a machine at its own clock with the pitch at 1", async () => {
       const { player, sink, clock } = harness();
-      player.loadTune(frequencyTune(0x34, 0x12));
-      player.setTargetClock(NTSC_PHI2_HZ, NTSC_PHI2_HZ);
+      player.loadTune(frequencyTune(0x34, 0x12, 'ntsc'));
+      player.setTargetClock(NTSC_PHI2_HZ);
       player.setVoicePitch(0, 1);
 
       await player.play();
@@ -1071,12 +1237,14 @@ describe('createSidPlayer', () => {
       expect(valueOf(frame, 1)).toBe(0x12);
     });
 
-    it('ignores a clock pair it cannot divide and a voice outside the chip', async () => {
+    it('ignores a clock it cannot divide by and a voice outside the chip, keeping what is in force', async () => {
       const { player, sink, clock } = harness();
       player.loadTune(frequencyTune(0x34, 0x12));
+      player.setTargetClock(NTSC_PHI2_HZ);
 
-      player.setTargetClock(0, NTSC_PHI2_HZ);
-      player.setTargetClock(PAL_PHI2_HZ, Number.NaN);
+      player.setTargetClock(0);
+      player.setTargetClock(-PAL_PHI2_HZ);
+      player.setTargetClock(Number.NaN);
       player.setVoicePitch(3, 0.5);
       player.setVoicePitch(0, 0);
 
@@ -1084,8 +1252,8 @@ describe('createSidPlayer', () => {
       run(clock, 1);
 
       const frame = lastDelivered(sink);
-      expect(valueOf(frame, 0)).toBe(0x34);
-      expect(valueOf(frame, 1)).toBe(0x12);
+      expect(valueOf(frame, 0)).toBe(0x89);
+      expect(valueOf(frame, 1)).toBe(0x11);
     });
   });
 
@@ -2056,11 +2224,11 @@ describe('createSidPlayer', () => {
       player.setRepeatTrack(true);
       player.keepDeliveries(64);
       await player.play();
-      run(clock, 3);
+      run(clock, 2); // frames 0 and 1; the wrap falls due here, leaving frame 2's slot to the gate-off
       expect(player.getPosition()).toBe(0);
       drain(player);
 
-      run(clock, 2, 3);
+      run(clock, 2, 2);
       const batch = drain(player);
 
       expect(batch.restarted).toBe(false);
@@ -2324,8 +2492,8 @@ describe('createSidPlayer', () => {
       run(clock, 1); // the gate-off tick the jump owed the stream
       player.setActiveLoop({ startFrame: frames(500), endFrame: frames(510) });
       runFrameSpy.mockClear();
-      run(clock, 10); // plays the lap through and re-enters its start on the last tick
-      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      run(clock, 10); // plays the lap through: nine real ticks, then the gate-off in the last slot
+      expect(runFrameSpy).toHaveBeenCalledTimes(9);
       expect(player.getPosition()).toBe(500);
 
       await player.seek(frames(100));
@@ -2430,9 +2598,9 @@ describe('createSidPlayer', () => {
 
       player.setJumpTargets([]);
       runFrameSpy.mockClear();
-      run(clock, 10);
+      run(clock, 10); // one lap: nine real ticks and the gate-off
 
-      expect(runFrameSpy).toHaveBeenCalledTimes(10);
+      expect(runFrameSpy).toHaveBeenCalledTimes(9);
       expect(player.getPosition()).toBe(100);
     });
 
@@ -2451,9 +2619,9 @@ describe('createSidPlayer', () => {
 
       prepare.resolveAll();
       await flushEntryImageCapture();
-      run(clock, 9);
+      run(clock, 8);
       runFrameSpy.mockClear();
-      run(clock, 1);
+      run(clock, 1); // the loop's second-to-last frame, on which the wrap falls due
 
       expect(runFrameSpy).toHaveBeenCalledTimes(1);
       expect(player.getPosition()).toBe(500);
@@ -4024,7 +4192,7 @@ describe('createSidPlayer', () => {
       it('scales frequency by the rate on top of the clock correction and voice pitch, clamped to the register', async () => {
         const h = withRecord(rampTune(), 60);
         await h.player.seek(frames(20));
-        h.player.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+        h.player.setTargetClock(NTSC_PHI2_HZ);
         h.player.setVoicePitch(0, 2);
         h.player.enterVarispeed(h.source);
         const ratio = clockRatio(PAL_PHI2_HZ, NTSC_PHI2_HZ) as number;
@@ -4251,7 +4419,8 @@ describe('createSidPlayer', () => {
           varispeedStart: 'wrap',
         });
         await flushEntryImageCapture();
-        await h.player.seek(frames(8));
+        // Two ticks short of where the wrap falls due: one frame before the loop's end, at 9.
+        await h.player.seek(frames(7));
         h.player.enterVarispeed(h.source);
         await h.player.play();
         h.replay.manual = true;
@@ -4540,7 +4709,9 @@ describe('createSidPlayer', () => {
         const h = withRecord(rampTune(), 60);
         h.player.setActiveLoop({ startFrame: frames(5), endFrame: frames(10) });
         await flushEntryImageCapture();
-        await h.player.seek(frames(8));
+        // Two ticks short of where the wrap falls due: one frame before the loop's end, at 9, so the
+        // gate-off the lap owes takes the loop's last slot.
+        await h.player.seek(frames(7));
         h.player.enterVarispeed(h.source);
         await h.player.play();
         h.replay.manual = true;

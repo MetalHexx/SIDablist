@@ -1,7 +1,7 @@
 # analysis
 
 Turns a scanned tune's raw register stream into the persisted `TuneIndexRecord` a host caches: the
-loop, key, structure, novelty and pulse detectors, plus the scan ladder — `indexTune` — that decides
+loop, key, structure, novelty, pulse and beat-grid detectors, plus the scan ladder — `indexTune` — that decides
 how deep to scan and when to stop. Framework-free and worker-portable, so a host can index a tune
 with no Angular, and no browser main thread blocked, in sight.
 
@@ -31,6 +31,14 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 - `frame-features.ts`, `notes.ts`, `key.ts`, `novelty.ts`, `structure.ts`, `pulse.ts`,
   `loop-detect.ts` — the detectors themselves, each pure over a `ScanOutput` or the `FeatureMatrix`
   derived from one.
+- `beat-grid.ts` — `noteStarts` reads where voices start notes off a `RegisterRecord`;
+  `detectBeatGrid` finds the beat length, beat one and the span a whole-frame grid holds over from
+  them (the record's `beatGrid`); `fitBeatGrid` snaps a few approximate beat frames onto an exact
+  grid. Its frames are register-record entry indices, the basis `detectedMoments` and a host's loop
+  markers share. `indexTune` reads the record through `toRegisterRecord`, so a hand-built
+  `ScanOutput` it is given must carry `controlBytes` and `retriggers`. The pulse fields are gone
+  from the record; `computePulse`, `impliedTempo` and `marker-moments.ts` stay exported for hosts
+  that still call them.
 - `tune-index.model.ts` — `TuneIndexRecord` and `TUNE_INDEX_FORMAT_VERSION`, the persisted shape
   and its compatibility gate.
 - `tune-index-readouts.ts`, `tune-length.ts`, `marker-moments.ts`, `format.ts` — display-facing
@@ -70,18 +78,21 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 
 ## When a change here ripples
 
-- **Changed `TuneIndexRecord`'s fields, or bumped `TUNE_INDEX_FORMAT_VERSION`?** `libs/tunes`'s
-  resolver reads a tune's cached scan by comparing this version on every hit, and the consuming
-  application stores the record itself — a bump invalidates every stored scan. Confirm the new
-  shape and version are what the resolver and the application's storage migration actually expect
-  before shipping the bump. Detail: [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
+- **Changed `TuneIndexRecord`'s fields (the beat grid among them), or bumped
+  `TUNE_INDEX_FORMAT_VERSION`?** `libs/tunes`'s resolver reads a tune's cached scan by comparing
+  this version on every hit, and the consuming application stores the record itself — a bump
+  invalidates every stored scan. Confirm the new shape and version are what the resolver and the
+  application's storage migration actually expect before shipping the bump. Detail:
+  [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
 - **Changed `TuneScan.recordControls` (`scan-tune.ts`) or `toRegisterRecord` (`register-record.ts`)?**
   Both build the record from how core's `RegisterFrame` snapshots a doubled voice control write —
   the first write, plus one retrigger entry carrying the last byte — and `libs/core`'s `feed`
   (`player/varispeed.ts`) reads it back by the meaning `RegisterRecord` documents. A shifted
   column, entry index or retrigger order compiles and passes the type-checker while recording a
-  stream that hangs or drops notes at the handback. Keep the three in step and run
-  `register-record.spec.ts` and core's `create-sid-player.spec.ts`. Detail:
+  stream that hangs or drops notes at the handback. `noteStarts` (`beat-grid.ts`) reads the same
+  record by the same meaning, so a shifted column or retrigger order also moves every beat grid.
+  Keep the three in step and run `register-record.spec.ts`, `beat-grid.spec.ts` and core's
+  `create-sid-player.spec.ts`. Detail:
   [`libs/core/AGENTS.md`](../core/AGENTS.md).
 
 ## Commands

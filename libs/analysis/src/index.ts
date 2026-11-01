@@ -1,3 +1,12 @@
+export {
+  noteStarts,
+  detectBeatGrid,
+  fitBeatGrid,
+  type BeatGrid,
+  type DetectedBeatGrid,
+  type NoteStarts,
+  type BeatGridDetection,
+} from './beat-grid.js';
 export { formatCents, formatDuration } from './format.js';
 export {
   readFrameFeatures,

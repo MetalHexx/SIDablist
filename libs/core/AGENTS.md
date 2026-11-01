@@ -88,6 +88,21 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   nowhere a lap, pause, resume or varispeed entry or exit passes through. Restart in the arrow handed
   to `createTuneSession` and in `enforceLoop`'s `'handed-off'` branch, before `queueResync()` — never
   inside `queueResync()` itself, which the `'looped'` branch also calls.
+- **A wrap falls due one frame before the end it wraps at, not at it.** Every re-entry — a lap, a
+  queued hand-off, a repeating track's wrap — owes the stream a gate-off in a tick of its own, and
+  `create-sid-player.ts` hands the tracker that lead (`REENTRY_GATE_OFF_FRAMES`, the tracker's
+  `wrapLeadFrames`) so the gate-off takes the loop's last slot and a lap is exactly
+  `endFrame - startFrame` ticks. Wrapping at the end again, or adding a step a re-entry owes
+  without raising the lead, makes every lap a tick longer than its loop: two loops at one tempo
+  whose lengths are exact multiples drift apart by a tick per lap of the shorter one, audibly
+  within a minute of a two-deck mix, and only the `lap timing` specs catch it. A repeat-off stop
+  owes nothing and still ends on the track's true last frame.
+- **The application names only the far end's clock; the tune's clock is read from its header.**
+  `setTargetClock(targetHz)` is held across loads, and `loadTune` derives the tune's φ2 by the
+  same `file.clock === 'ntsc'` test that sets its tempo. A source clock taken from the host, or
+  kept from the tune before, plays the next tune of the other standard about two-thirds of a
+  semitone off, and only the `pitch correction` specs in `player/create-sid-player.spec.ts`
+  catch it.
 - **Hardware-precise constants are not typos to fix.** `registers/sid-constants.ts`'s
   `PAL_FRAME_INTERVAL_US` is deliberately `19950`, not the TeensyROM firmware's own `19975` —
   the comment on it exists because that gap looks like a mistake and is not. The φ2 clock rates in

@@ -82,18 +82,25 @@ export interface ActiveLoopTracker {
    * Enforces whatever is running against `framesRendered`: the active loop if one is set, else the
    * track's own end.
    *
-   * Reaching the active loop's end re-enters its start — through the entry image if one is held,
-   * else by seeking along the anchor path — and reports the frame landed on. With a jump queued and
-   * its image held, it calls the queued jump's `beforeLanding`, restores that image instead, makes
-   * the queued loop (or none, for a cue) the active one, empties the queue and reports `handed-off`
-   * at the frame landed on.
+   * A wrap falls due `wrapLeadFrames` (see `ActiveLoopTrackerOptions`) before the end it wraps at,
+   * so the frames the re-entry owes the stream take the lap's last slots instead of being added
+   * after them — but never before the start frame itself has been rendered, so a loop too short to
+   * give up a frame still plays one.
    *
-   * Reaching the track's end with no active loop set decides between replaying and stopping per
-   * `track.repeatEnabled()`: off stops, leaving the pair exactly where it stands — what stopping
-   * means for playback is the caller's call, not core's. On arms the track's own loop as the active
-   * loop — its start defaulting to 0, whether because the track repeats from the top or because it
-   * only ever ended and repeating it means replaying the whole thing — and enters it immediately, so
-   * every later lap over the same track is the ordinary case above.
+   * A wrap of the active loop re-enters its start — through the entry image if one is held, else by
+   * seeking along the anchor path — and reports the frame landed on. With a jump queued and its
+   * image held, it calls the queued jump's `beforeLanding`, restores that image instead, makes the
+   * queued loop (or none, for a cue) the active one, empties the queue and reports `handed-off` at
+   * the frame landed on.
+   *
+   * With no active loop set, the track's end decides between replaying and stopping per
+   * `track.repeatEnabled()`: off stops on reaching the true end, with no lead, since a stop owes the
+   * stream nothing — leaving the pair exactly where it stands, because what stopping means for
+   * playback is the caller's call, not core's. On wraps like any loop, lead included: it arms the
+   * track's own loop as the active loop — its start defaulting to 0, whether because the track
+   * repeats from the top or because it only ever ended and repeating it means replaying the whole
+   * thing — and enters it immediately, so every later lap over the same track is the ordinary case
+   * above.
    *
    * A seek that comes back with nothing to seek from (the ring holds no usable anchor) leaves the
    * pair and the active loop untouched and reports `none` rather than claim a lap that did not
@@ -108,7 +115,24 @@ export interface ActiveLoopTracker {
   ): AdvanceResult;
 }
 
-export function createActiveLoopTracker(): ActiveLoopTracker {
+/** How a tracker times its wraps. */
+export interface ActiveLoopTrackerOptions {
+  /**
+   * How many frames before the end a wrap falls due: the frame slots a re-entry's resync takes
+   * before its start frame plays. Default 0, for a host that sends nothing between a loop's last
+   * frame and its start.
+   *
+   * The player passes 1: every re-entry owes the stream a gate-off frame in a tick of its own, and
+   * without a lead that tick is added after the loop's last frame, so a lap takes one tick more than
+   * the loop has frames. A short loop pays that more often than a long one, so two loops at the same
+   * tempo whose lengths are exact multiples drift apart. With the lead the gate-off takes the place
+   * of the loop's last frame instead, and a lap takes exactly `endFrame - startFrame` ticks.
+   */
+  readonly wrapLeadFrames?: number;
+}
+
+export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}): ActiveLoopTracker {
+  const lead = options.wrapLeadFrames ?? 0;
   let loop: ActiveLoop = null;
   let entryImage: PositionAnchor | null = null;
   let queued: QueuedNext | null = null;
@@ -128,6 +152,12 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
       return entryImage.frame;
     }
     return seekToFrame(machine, frame, ring, startFrame) === null ? null : startFrame;
+  }
+
+  /** The frame count at which a wrap of `startFrame`..`endFrame` falls due: `lead` frames before the
+   *  end, but no earlier than one frame past the start, so the start frame is always rendered. */
+  function wrapDueAt(startFrame: Frames, endFrame: Frames): number {
+    return Math.max(startFrame + 1, endFrame - lead);
   }
 
   return {
@@ -156,7 +186,7 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
 
     advance(machine, frame, ring, track, framesRendered): AdvanceResult {
       if (loop !== null) {
-        if (framesRendered < loop.endFrame) return { action: 'none' };
+        if (framesRendered < wrapDueAt(loop.startFrame, loop.endFrame)) return { action: 'none' };
         if (queued !== null && queuedImage !== null) {
           const image = queuedImage;
           queued.beforeLanding?.();
@@ -173,10 +203,13 @@ export function createActiveLoopTracker(): ActiveLoopTracker {
       }
 
       const trackEnd = track.trackEndFrame();
-      if (trackEnd === null || framesRendered < trackEnd) return { action: 'none' };
-      if (!track.repeatEnabled()) return { action: 'stopped' };
+      if (trackEnd === null) return { action: 'none' };
+      if (!track.repeatEnabled()) {
+        return framesRendered < trackEnd ? { action: 'none' } : { action: 'stopped' };
+      }
 
       const start = track.loopStartFrame() ?? frames(0);
+      if (framesRendered < wrapDueAt(start, trackEnd)) return { action: 'none' };
       const landed = enter(machine, frame, ring, start);
       if (landed === null) return { action: 'none' };
       loop = { startFrame: start, endFrame: trackEnd };

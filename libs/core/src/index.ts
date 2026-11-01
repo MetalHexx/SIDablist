@@ -89,6 +89,7 @@ export {
 export {
   type ActiveLoop,
   type ActiveLoopTracker,
+  type ActiveLoopTrackerOptions,
   type AdvanceResult,
   type QueuedNext,
   type VarispeedLoopStart,

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { SID_REGISTER_COUNT } from '@sidablist/core';
+import {
+  NTSC_FRAME_INTERVAL_US,
+  PAL_FRAME_INTERVAL_US,
+  parseSidFile,
+  SID_REGISTER_COUNT,
+  VOICE_CONTROL_REGISTERS,
+} from '@sidablist/core';
 import { indexTune, ScanFailedError } from './index-tune.js';
 import type { TuneIndexIdentity } from './index-tune.js';
 import { TuneScan } from './scan-tune.js';
@@ -42,6 +48,20 @@ class ScriptedScanner implements AnalysisScanner {
   }
 }
 
+const VOICES = VOICE_CONTROL_REGISTERS.length;
+
+const NO_RETRIGGERS = {
+  entries: new Uint32Array(0),
+  registers: new Uint8Array(0),
+  values: new Uint8Array(0),
+};
+
+/** The scan's control columns for a stream where no voice ever sounds, which `toRegisterRecord`
+ *  needs of any output it is handed. */
+function silentControls(frames: number): Pick<ScanOutput, 'controlBytes' | 'retriggers'> {
+  return { controlBytes: new Uint8Array(frames * VOICES), retriggers: NO_RETRIGGERS };
+}
+
 /** A zero-frame probe answer at a given play rate. */
 function probeOutput(callsPerFrame = 1, exactCallsPerFrame = callsPerFrame): ScanOutput {
   return {
@@ -50,6 +70,7 @@ function probeOutput(callsPerFrame = 1, exactCallsPerFrame = callsPerFrame): Sca
     frames: 0,
     callsPerFrame,
     exactCallsPerFrame,
+    ...silentControls(0),
   };
 }
 
@@ -66,6 +87,7 @@ function noLoopOutput(
     frames,
     callsPerFrame,
     exactCallsPerFrame,
+    ...silentControls(frames),
   };
 }
 
@@ -86,30 +108,34 @@ function loopingOutput(frames: number, period: number): ScanOutput {
     frames,
     callsPerFrame: 1,
     exactCallsPerFrame: 1,
+    ...silentControls(frames),
   };
 }
 
-/** Voice 0's gate toggling every 120 frames at a multispeed rate (`callsPerFrame: 2`,
- *  `exactCallsPerFrame: 2.4`) — the reviewer's own example: a 2.4-calls/frame tune with a 60 BPM
- *  pulse. Frequency stays 0 throughout, so `segmentNotes` never opens a note and key detection stays
- *  out of this fixture's way; `frames` is short enough that `detectLoop` never verifies it (its tail
- *  always undershoots `minTailFrames`, computed off the rounded rate), so the ladder runs to
- *  exhaustion and `pulse`/`nativeTempo` are computed from this same data every rung. */
-function multispeedPulseOutput(): ScanOutput {
-  const halfPeriodFrames = 120;
-  const frames = halfPeriodFrames * 6;
-  const registerValues = new Uint8Array(frames * SID_REGISTER_COUNT);
-  for (let f = 0; f < frames; f++) {
-    const gateOn = Math.floor(f / halfPeriodFrames) % 2 === 0;
-    // Voice 0's control register: triangle waveform, gate bit toggling.
-    registerValues[f * SID_REGISTER_COUNT + 4] = gateOn ? 0x11 : 0x10;
+/** A multispeed stream (`callsPerFrame: 2`, `exactCallsPerFrame: 2.4`) with a beat every 60 frames: all
+ *  three voices start a note on each beat, and one voice on each of the three steps between. Frequency
+ *  stays 0 throughout, so `segmentNotes` never opens a note and key detection stays out of this
+ *  fixture's way; `frames` is short enough that `detectLoop` never verifies it (its tail always
+ *  undershoots `minTailFrames`, computed off the rounded rate), so the ladder runs to exhaustion. */
+function multispeedBeatOutput(): ScanOutput {
+  const beatFrames = 60;
+  const stepFrames = 15;
+  const frames = beatFrames * 20;
+  const controlBytes = new Uint8Array(frames * VOICES);
+  for (let f = 0; f < frames; f += stepFrames) {
+    const voicesStarting = f % beatFrames === 0 ? VOICES : 1;
+    for (let voice = 0; voice < voicesStarting; voice++) {
+      controlBytes[f * VOICES + voice] = 0x41; // pulse waveform, gate set for this one call
+    }
   }
   return {
-    registerValues,
+    registerValues: new Uint8Array(frames * SID_REGISTER_COUNT),
     writeCounts: new Uint8Array(frames),
     frames,
     callsPerFrame: 2,
     exactCallsPerFrame: 2.4,
+    controlBytes,
+    retriggers: NO_RETRIGGERS,
   };
 }
 
@@ -222,31 +248,50 @@ describe('indexTune — the ladder', () => {
 
     expect(record.sidHash).toBe('my-hash');
     expect(record.subtune).toBe(3);
-    expect(record.formatVersion).toBe(5);
+    expect(record.formatVersion).toBe(6);
     expect(record.callsPerFrame).toBe(1);
     expect(record.exactCallsPerFrame).toBe(1.03);
   });
 
-  it('finds a multispeed pulse the nominal 1× histogram cap would discard, and computes nativeTempo off the exact rate', async () => {
-    const pulseOutput = multispeedPulseOutput();
+  it('records no beat grid, and none of the old pulse fields, when no voice ever starts a note', async () => {
     const scanner = new ScriptedScanner([
-      { kind: 'done', output: probeOutput(2, 2.4) },
-      { kind: 'done', output: pulseOutput },
-      { kind: 'done', output: pulseOutput },
-      { kind: 'done', output: pulseOutput },
-      { kind: 'done', output: pulseOutput },
+      { kind: 'done', output: probeOutput() },
+      { kind: 'done', output: noLoopOutput() },
+      { kind: 'done', output: noLoopOutput() },
+      { kind: 'done', output: noLoopOutput() },
+      { kind: 'done', output: noLoopOutput() },
     ]);
 
     const record = await indexTune(scanner, BUNDLED_BYTES, IDENTITY);
 
-    // A 120-frame interval is past the ~101-frame cap a nominal-PAL-1× histogram would use — it only
-    // survives because the ladder now sizes that cap off `exactCallsPerFrame` (2.4), not 1.
-    expect(record.dominantIntervalFrames).toBe(120);
-    expect(record.pulseConfidence).toBe('strong');
-    // 120 frames at 19,950 µs / 2.4 calls-per-frame is ~0.9975s of music, ~60.15 BPM. Computed off the
-    // rounded rate (2) instead, the same interval reads about 20% slower.
-    expect(record.nativeTempo).not.toBeNull();
-    expect(record.nativeTempo ?? 0).toBeCloseTo(60.15, 1);
+    expect(record.beatGrid).toBeNull();
+    expect(record.beatConfidence).toBe('none');
+    expect(record).not.toHaveProperty('dominantIntervalFrames');
+    expect(record).not.toHaveProperty('pulseConfidence');
+    expect(record).not.toHaveProperty('nativeTempo');
+  });
+
+  it("detects a multispeed stream's beat grid in frames, searching off the exact play rate", async () => {
+    const beatOutput = multispeedBeatOutput();
+    const scanner = new ScriptedScanner([
+      { kind: 'done', output: probeOutput(2, 2.4) },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+    ]);
+
+    const record = await indexTune(scanner, BUNDLED_BYTES, IDENTITY);
+
+    // 60 frames at 19,950 µs / 2.4 calls-per-frame is ~0.4988 s of music, ~120 BPM. Read as a
+    // single-speed stream, the same note starts would give a 30-frame beat instead.
+    expect(record.beatGrid).toEqual({
+      beatFrames: 60,
+      beatOneFrame: 0,
+      startFrame: 0,
+      endFrame: null,
+    });
+    expect(record.beatConfidence).not.toBe('none');
   });
 });
 
@@ -291,5 +336,27 @@ describe('indexTune — end to end', () => {
       expect(record.endedAtFrame).toBeNull();
     },
     SCAN_TIMEOUT_MS,
+  );
+
+  it(
+    'gives a real tune the same beat grid on every index, at a tempo in the usual range',
+    async () => {
+      const first = await indexTune(new TuneScanScanner(), BUNDLED_BYTES, IDENTITY);
+      const second = await indexTune(new TuneScanScanner(), BUNDLED_BYTES, IDENTITY);
+
+      expect(first.beatGrid).not.toBeNull();
+      expect(second.beatGrid).toEqual(first.beatGrid);
+      expect(second.beatConfidence).toBe(first.beatConfidence);
+
+      const nominalIntervalUs =
+        parseSidFile(BUNDLED_BYTES).clock === 'ntsc'
+          ? NTSC_FRAME_INTERVAL_US
+          : PAL_FRAME_INTERVAL_US;
+      const callsPerSecond = (1e6 / nominalIntervalUs) * first.exactCallsPerFrame;
+      const bpm = (60 * callsPerSecond) / (first.beatGrid?.beatFrames ?? Infinity);
+      expect(bpm).toBeGreaterThanOrEqual(80);
+      expect(bpm).toBeLessThanOrEqual(170);
+    },
+    2 * SCAN_TIMEOUT_MS,
   );
 });
