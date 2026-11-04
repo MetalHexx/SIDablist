@@ -55,6 +55,9 @@ export interface PlayerSnapshot {
     readonly preparedFrames: readonly Frames[];
     /** The jump queued for the end of the running loop's lap, or null. */
     readonly queuedJump: QueuedJump | null;
+    /** The change of loop named for the lap that ends at `atFrame`, or null. The running loop's
+     *  `endFrame` already reads `atFrame` while it is pending; `loop` takes over at that wrap. */
+    readonly loopChange: { readonly atFrame: Frames; readonly loop: ActiveLoop } | null;
     /** How many queued jumps the engine has handed off to since this tune and subtune loaded. It
      *  increments once per hand-off and never on a cancel, a replace or a clear, so a host can tell
      *  a landing from a dropped queue. */

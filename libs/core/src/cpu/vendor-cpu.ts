@@ -87,12 +87,16 @@ class VendorCpu implements Cpu6502 {
   }
 
   getState(): CpuState {
-    const record = this.cpu as unknown as Record<string, unknown>;
     const state: Record<string, unknown> = {};
-    for (const key of CPU_STATE_KEYS) {
-      state[key] = record[key];
-    }
+    this.copyStateInto(state);
     return state;
+  }
+
+  copyStateInto(target: Record<string, unknown>): void {
+    const record = this.cpu as unknown as Record<string, unknown>;
+    for (const key of CPU_STATE_KEYS) {
+      target[key] = record[key];
+    }
   }
 
   setState(state: CpuState): void {
@@ -101,6 +105,16 @@ class VendorCpu implements Cpu6502 {
       record[key] = state[key];
     }
   }
+}
+
+/** A record carrying every `CPU_STATE_KEYS` field, for `copyStateInto` to fill in place. Allocated
+ *  with all its keys so the copy itself only assigns. */
+export function createCpuStateRecord(): Record<string, unknown> {
+  const state: Record<string, unknown> = {};
+  for (const key of CPU_STATE_KEYS) {
+    state[key] = 0;
+  }
+  return state;
 }
 
 /** Builds a `Cpu6502` over the vendored `mos6502` core, wired to `bus` for every read and write. */

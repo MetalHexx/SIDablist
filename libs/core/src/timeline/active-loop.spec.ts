@@ -393,6 +393,137 @@ describe('createActiveLoopTracker', () => {
     });
   });
 
+  describe('a change of loop named for a lap', () => {
+    // With the player's lead, as the lap it changes is timed exactly like any other.
+    beforeEach(() => {
+      tracker = createActiveLoopTracker({ wrapLeadFrames: 1 });
+    });
+
+    const next = { startFrame: frames(60), endFrame: frames(90) };
+    const imageAt = (at: number): PositionAnchor => ({
+      frame: frames(at),
+      ...runUnbrokenTo(frames(at)),
+    });
+
+    it('is refused when no loop is running', () => {
+      expect(tracker.changeAt(frames(100), next, imageAt(60))).toBe(false);
+      expect(tracker.pendingChange()).toBeNull();
+      expect(tracker.get()).toBeNull();
+    });
+
+    it('ends the running loop at the named frame at once, leaving its entry image and queue alone', () => {
+      const entry = imageAt(10);
+      tracker.set({ startFrame: frames(10), endFrame: frames(200), varispeedStart: 'stop' });
+      tracker.setEntryImage(entry);
+      tracker.queue({ startFrame: frames(80), loop: null });
+
+      expect(tracker.changeAt(frames(100), next, imageAt(60))).toBe(true);
+
+      expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 100, varispeedStart: 'stop' });
+      expect(tracker.pendingChange()).toEqual({ atFrame: 100, loop: next });
+      expect(tracker.entryImage()).toBe(entry);
+    });
+
+    it('wraps one frame before the named frame into the new loop’s start, as a lap', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.changeAt(frames(100), next, imageAt(60));
+      play(98);
+      expect(tracker.advance(machine, registers, ring, track, frames(98))).toEqual({
+        action: 'none',
+      });
+
+      play(1);
+      const result = tracker.advance(machine, registers, ring, track, frames(99));
+
+      expect(result).toEqual({ action: 'looped', frame: 60 });
+      expect(liveState()).toEqual(runUnbrokenTo(frames(60)));
+      expect(tracker.get()).toEqual(next);
+      expect(tracker.pendingChange()).toBeNull();
+      expect(tracker.entryImage()?.frame).toBe(60);
+    });
+
+    it('laps the new loop through the image it took over with', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.changeAt(frames(100), next, imageAt(60));
+      play(99);
+      tracker.advance(machine, registers, ring, track, frames(99));
+      play(29); // 60 up to the frame before the new loop's end, one lead short of it
+
+      const result = tracker.advance(machine, registers, ring, track, frames(89));
+
+      expect(result).toEqual({ action: 'looped', frame: 60 });
+      expect(liveState()).toEqual(runUnbrokenTo(frames(60)));
+    });
+
+    it('lands on the next advance when it is named at or behind the wrap point', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      play(150);
+
+      tracker.changeAt(frames(100), next, imageAt(60));
+
+      expect(tracker.advance(machine, registers, ring, track, frames(150))).toEqual({
+        action: 'looped',
+        frame: 60,
+      });
+    });
+
+    it('is replaced by a change named later, which the lap then follows', () => {
+      const later = { startFrame: frames(30), endFrame: frames(50) };
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.changeAt(frames(100), next, imageAt(60));
+      tracker.changeAt(frames(120), later, imageAt(30));
+      play(99);
+      expect(tracker.advance(machine, registers, ring, track, frames(99)).action).toBe('none');
+
+      play(20);
+      const result = tracker.advance(machine, registers, ring, track, frames(119));
+
+      expect(result).toEqual({ action: 'looped', frame: 30 });
+      expect(tracker.get()).toEqual(later);
+    });
+
+    it('gives way to a queued jump, which lands in its place and drops it', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.queue({
+        startFrame: frames(80),
+        loop: { startFrame: frames(80), endFrame: frames(95) },
+      });
+      tracker.setQueuedImage(imageAt(80));
+      tracker.changeAt(frames(100), next, imageAt(60));
+      play(99);
+
+      const result = tracker.advance(machine, registers, ring, track, frames(99));
+
+      expect(result).toEqual({ action: 'handed-off', frame: 80 });
+      expect(tracker.get()).toEqual({ startFrame: 80, endFrame: 95 });
+      expect(tracker.pendingChange()).toBeNull();
+    });
+
+    it('is dropped by set', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.changeAt(frames(100), next, imageAt(60));
+
+      tracker.set({ startFrame: frames(10), endFrame: frames(150) });
+
+      expect(tracker.pendingChange()).toBeNull();
+      play(120);
+      expect(tracker.advance(machine, registers, ring, track, frames(120)).action).toBe('none');
+    });
+
+    it('is cancelled by giving the loop back the end it had before the first change', () => {
+      tracker.set({ startFrame: frames(10), endFrame: frames(200) });
+      tracker.changeAt(frames(100), next, imageAt(60));
+      tracker.changeAt(frames(120), next, imageAt(60));
+
+      tracker.cancelChange();
+
+      expect(tracker.pendingChange()).toBeNull();
+      expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 200 });
+      tracker.cancelChange();
+      expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 200 });
+    });
+  });
+
   describe('a queued hand-off’s beforeLanding', () => {
     const imageAt = (at: number): PositionAnchor => ({
       frame: frames(at),

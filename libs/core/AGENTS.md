@@ -27,6 +27,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
   operations core owns. An `ActiveLoop` may carry `varispeedStart`, which varispeed alone reads.
+  `ActiveLoopTracker.changeAt` names a change of loop for the lap that ends at a frame.
+  `crossing-captures.ts` is the bounded pool of images saved as the playhead crosses declared lines
+  (`CrossingLines`) and the arithmetic that says when to save one.
 - `player/` — `createSidPlayer`, the composition root wiring the above into `SidPlayer`, plus
   `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
   surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
@@ -40,6 +43,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   coordinator sequences. `keepDeliveries`/`drainDeliveries` keep a bounded history of every frame
   delivered (`delivery-history.ts`, whose `DeliveryBatch` and `createDeliveryBatch` are public and
   whose `DeliveryHistory` is not), for a host that samples slower than frames are built.
+  `setCrossingCaptures` declares lines the live machine is saved at as the playhead crosses them,
+  and `holdsImageAt` says whether an entry image exists for a frame (prepared, cached or saved at a
+  crossing); a loop set at such a frame re-enters from the saved image with no replay.
+  `changeLoopAt` changes a running loop's bounds from the lap that ends on a named frame, published
+  as `tune.loopChange`.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -126,6 +134,38 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   voice's control register is zeroed in an image taken muted. Only an image built by an unmuted
   replay may start a chained build — a live `capturePosition()` never does, and a capture taken
   after a mute and unmute can carry a stale control register until the tune next writes it.
+- **Crossing images are live captures and never chain.** A frame saved at a crossing is a copy of the
+  live machine, so it never enters `prepared` and never starts a chained build. A voice muted at the
+  crossing has its control register zeroed in the image — `RegisterFrame` zeroes it when the voice is
+  muted and discards the tune's later writes, so it holds no value of the tune's own to save instead
+  — and a loop re-entered from that image has the voice silent after it is unmuted until the tune
+  writes the register again.
+- **The crossing pool is allocated off the tick.** `setCrossingCaptures` allocates every buffer
+  (about 64 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
+  `C64Machine.snapshotInto`, the CPU's `copyStateInto` and `RegisterFrame.snapshotValuesInto`. A
+  capture that builds an object, a `snapshot()` or an iterator on the tick is the regression, and no
+  test catches it. A new declaration holds memory for as long as it stays declared.
+- **At most one copy a tick.** A frame on several sets of lines is copied once and held by each; a
+  loop's start is saved straight into the loop-entry buffer, and the lines skip that frame.
+- **A running loop's image lives in the loop-entry buffer, never in a slot that is still recycling.**
+  `setActiveLoop` and `changeLoopAt` copy a crossing slot's image into the one preallocated buffer
+  before handing it to the tracker, because the next crossings recycle the slot. A running loop grown
+  or shrunk finds its start in the buffer and uses it as it is; copying the buffer onto itself, or
+  handing the tracker a slot, makes a lap re-enter from whatever the slot holds by then. The lookup is
+  one order everywhere (`imageAt`): the buffer, the prepared images, the four-entry cache, then the
+  slots.
+- **A loop set ahead of the playhead in live play is armed by the tick that reaches its start, not by
+  a replay.** Nothing is requested for it; a jump that puts the playhead on or past the start without
+  crossing it leaves the loop with no entry image, and its first wrap falls back to the main-thread
+  seek. At or behind the playhead, in varispeed and in a handback, `setActiveLoop` still requests the
+  replay. A change named by `changeLoopAt` skips this arming, since its image may be the buffer.
+- **`holdsImageAt` reads wider than `queueJump` and `setJumpTargets` do.** A queued jump holds its
+  image by reference until it lands, and a crossing slot is recycled, so those two look only in the
+  prepared images and the cache; a frame held only at a crossing still costs a replay there.
+- **A pending loop change has already moved the running loop's end.** `changeLoopAt` sets the end to
+  the named frame at once and holds the new bounds in the tracker, which `set` clears and a subtune
+  change cancels; the wrap there is a lap (`looped`), with no history restart. Setting the end through
+  `ActiveLoopTracker.set` would drop the queued jump and the entry image with it.
 - **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
   long as it stays declared. The four-image cache for undeclared captures does not bound them; the
   host's declaration does.
@@ -198,10 +238,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   field name inside the vendored `mos6502` core)?** `vendor-cpu.ts`'s `CPU_STATE_KEYS`/
   `assertCpuStateKeys` is the only thing standing between a renamed field and a cue that restores
   incomplete CPU state silently, since `MachineSnapshot.cpu` is an opaque `CpuState` record. Keep
-  the key list in sync and run `cpu/vendor-cpu.spec.ts`. Detail:
+  the key list in sync and run `cpu/vendor-cpu.spec.ts`; `copyStateInto`, which the crossing captures
+  copy through, reads the same list. Detail:
   [`cpu/vendor-cpu.ts`](./src/cpu/vendor-cpu.ts).
 - **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`)
-  or `RegisterFrame`'s snapshot API?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
+  or `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
   shifted meaning is a wrong index record, not a compile error. Run analysis's
   `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 - **Changed `RegisterRecord` (`registers/register-record.ts`), or how `RegisterFrame` snapshots a
@@ -217,6 +258,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   history, and a shifted meaning of a control write records the wrong byte, with no compile error.
   Record at the new call and run `player/delivery-history.spec.ts` and the `delivery history` specs
   in `player/create-sid-player.spec.ts`.
+- **Changed how a crossing line rounds (`isOnLine` in `timeline/crossing-captures.ts`)?**
+  `libs/analysis`'s `gridLine` names the frames a host declares lines at by the same
+  `Math.round(origin + k × period)`; a line off by one saves an image no loop can start from, with no
+  error. Change both and run `timeline/crossing-captures.spec.ts`, the `crossing captures` specs in
+  `player/create-sid-player.spec.ts` and analysis's `grid-lines.spec.ts`. Detail:
+  [`libs/analysis/src/grid-lines.ts`](../analysis/src/grid-lines.ts).
 - **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
   unhandled variant leaves the player's position and the stream out of step without a compile

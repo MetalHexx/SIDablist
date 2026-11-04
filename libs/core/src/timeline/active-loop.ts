@@ -42,15 +42,37 @@ export interface QueuedNext {
   readonly beforeLanding?: () => void;
 }
 
+/** A running loop's replacement, named for the wrap that ends the lap ending at `atFrame`. */
+export interface LoopChange {
+  readonly atFrame: Frames;
+  readonly loop: Exclude<ActiveLoop, null>;
+}
+
 /** Holds the loop presently running and enforces it, frame by frame, against the track it plays
  *  over. */
 export interface ActiveLoopTracker {
   /** The loop presently enforced, or null. */
   get(): ActiveLoop;
-  /** Replaces the loop presently enforced. Leaves the entry image untouched — set or clear it
-   *  separately through `setEntryImage`, since the two do not always change together (arming the
-   *  track's own loop inside `advance` keeps whatever image is already held for it). */
+  /** Replaces the loop presently enforced, dropping a queued jump and a change named. Leaves the
+   *  entry image untouched — set or clear it separately through `setEntryImage`, since the two do
+   *  not always change together (arming the track's own loop inside `advance` keeps whatever image
+   *  is already held for it). */
   set(loop: ActiveLoop): void;
+  /**
+   * Makes the running loop end at `atFrame` and run `loop` from the wrap that ends there: that
+   * wrap re-enters through `image` — the image of `loop`'s start frame — instead of the running
+   * loop's own start, reports `looped` like any lap, and makes `loop` the active one. Replaces a
+   * change already named. Leaves the entry image and a queued jump alone, which `set` would clear:
+   * a queued jump that lands at that wrap lands in the change's place and drops it.
+   *
+   * A change named at or behind the wrap point lands on the next `advance`. Returns false, changing
+   * nothing, when no loop is running.
+   */
+  changeAt(atFrame: Frames, loop: Exclude<ActiveLoop, null>, image: PositionAnchor): boolean;
+  /** The change named and not yet landed, or null. */
+  pendingChange(): LoopChange | null;
+  /** Drops the change named, if any, and gives the running loop back the end it had before. */
+  cancelChange(): void;
   /**
    * The image a lap re-enters through in place of a replay along the anchor path — a snapshot
    * taken exactly at the presently active loop's start frame, whichever loop that is: the track's
@@ -91,7 +113,9 @@ export interface ActiveLoopTracker {
    * seeking along the anchor path — and reports the frame landed on. With a jump queued and its
    * image held, it calls the queued jump's `beforeLanding`, restores that image instead, makes the
    * queued loop (or none, for a cue) the active one, empties the queue and reports `handed-off` at
-   * the frame landed on.
+   * the frame landed on. With no jump landing and a change named by `changeAt`, the wrap restores
+   * the change's image instead, makes its loop the active one and reports `looped` at the frame
+   * landed on.
    *
    * With no active loop set, the track's end decides between replaying and stopping per
    * `track.repeatEnabled()`: off stops on reaching the true end, with no lead, since a stop owes the
@@ -137,6 +161,10 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
   let entryImage: PositionAnchor | null = null;
   let queued: QueuedNext | null = null;
   let queuedImage: PositionAnchor | null = null;
+  let change: LoopChange | null = null;
+  let changeImage: PositionAnchor | null = null;
+  /** The running loop as it stood before the first change was named. */
+  let unchanged: ActiveLoop = null;
 
   /** Re-enters `startFrame`, preferring the held entry image over a seek. Returns the frame landed
    *  on, or null when neither is possible and the pair was left untouched. */
@@ -167,6 +195,26 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
       loop = next;
       queued = null;
       queuedImage = null;
+      change = null;
+      changeImage = null;
+    },
+
+    changeAt(atFrame, next, image): boolean {
+      if (loop === null) return false;
+      if (change === null) unchanged = loop;
+      loop = { ...loop, endFrame: atFrame };
+      change = { atFrame, loop: next };
+      changeImage = image;
+      return true;
+    },
+
+    pendingChange: (): LoopChange | null => change,
+
+    cancelChange(): void {
+      if (change === null) return;
+      loop = unchanged;
+      change = null;
+      changeImage = null;
     },
 
     setEntryImage(entry: PositionAnchor | null): void {
@@ -196,7 +244,19 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
           if (queued.loop !== null) entryImage = image;
           queued = null;
           queuedImage = null;
+          change = null;
+          changeImage = null;
           return { action: 'handed-off', frame: image.frame };
+        }
+        if (change !== null && changeImage !== null) {
+          const image = changeImage;
+          machine.restore(image.machine);
+          frame.restoreValues(image.registers);
+          loop = change.loop;
+          entryImage = image;
+          change = null;
+          changeImage = null;
+          return { action: 'looped', frame: image.frame };
         }
         const landed = enter(machine, frame, ring, loop.startFrame);
         return landed === null ? { action: 'none' } : { action: 'looped', frame: landed };

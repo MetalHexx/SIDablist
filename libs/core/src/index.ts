@@ -91,10 +91,12 @@ export {
   type ActiveLoopTracker,
   type ActiveLoopTrackerOptions,
   type AdvanceResult,
+  type LoopChange,
   type QueuedNext,
   type VarispeedLoopStart,
   createActiveLoopTracker,
 } from './timeline/active-loop.js';
+export { type CrossingLines } from './timeline/crossing-captures.js';
 export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
 export { type DeliveryBatch, createDeliveryBatch } from './player/delivery-history.js';
 export {

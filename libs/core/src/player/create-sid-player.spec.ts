@@ -17,6 +17,7 @@ import {
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import { replayToFrame } from '../replay/replay-to-frame.js';
 import type { SidClock, SidFile, SidModel } from '../sid/sid-file.model.js';
+import type { CrossingLines } from '../timeline/crossing-captures.js';
 import { FakeClock } from '../testing/fake-clock.js';
 import { FakeSink } from '../testing/fake-sink.js';
 import { frames, microseconds, milliseconds } from '../units.js';
@@ -33,7 +34,11 @@ import type { JumpSettings, QueuedJump } from './snapshot.js';
  * `C64Machine.prototype` spying gave before the class became a factory-built, unexported internal.
  * Reset with `runFrameSpy.mockClear()` at the point a test wants to start counting from.
  */
-const { runFrameSpy } = vi.hoisted(() => ({ runFrameSpy: vi.fn() }));
+const { runFrameSpy, snapshotIntoSpy, seekToFrameSpy } = vi.hoisted(() => ({
+  runFrameSpy: vi.fn(),
+  snapshotIntoSpy: vi.fn(),
+  seekToFrameSpy: vi.fn(),
+}));
 
 vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../cpu/c64-machine.js')>();
@@ -51,9 +56,28 @@ vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
               return target.runFrame();
             };
           }
+          if (prop === 'snapshotInto') {
+            return (image: Parameters<typeof target.snapshotInto>[0]) => {
+              snapshotIntoSpy();
+              target.snapshotInto(image);
+            };
+          }
           return Reflect.get(target, prop, target);
         },
       });
+    },
+  };
+});
+
+/** Counts the seeks a loop re-entry falls back to when it holds no image — the main-thread replay
+ *  along the anchor path. */
+vi.mock('../timeline/seek.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../timeline/seek.js')>();
+  return {
+    ...actual,
+    seekToFrame: (...args: Parameters<typeof actual.seekToFrame>) => {
+      seekToFrameSpy();
+      return actual.seekToFrame(...args);
     },
   };
 });
@@ -408,6 +432,27 @@ function valueOf(frame: SidFrame, register: number): number | undefined {
     if (frame.registers[index] === register) return frame.values[index];
   }
   return undefined;
+}
+
+/** `from` to `to`, both included. */
+function range(from: number, to: number): number[] {
+  return Array.from({ length: to - from + 1 }, (_, index) => from + index);
+}
+
+/** What `counterTune` writes for the counts `from` to `to`: its counter is one byte wide. */
+function counts(from: number, to: number): number[] {
+  return range(from, to).map((count) => count & 0xff);
+}
+
+/** Ticks `count` times, collecting the byte each delivered frame carried for $D400 — null for one
+ *  that carried none, which for `counterTune` is only ever the gate-off. */
+function bytesOver(h: Harness, count: number): (number | null)[] {
+  const bytes: (number | null)[] = [];
+  for (let tick = 0; tick < count; tick++) {
+    run(h.clock, 1);
+    bytes.push(valueOf(lastDelivered(h.sink), 0) ?? null);
+  }
+  return bytes;
 }
 
 describe('createSidPlayer', () => {
@@ -1275,6 +1320,7 @@ describe('createSidPlayer', () => {
         lengthFrames: null,
         preparedFrames: [],
         queuedJump: null,
+        loopChange: null,
         handOffs: 0,
         recordedFrames: null,
       });
@@ -3618,6 +3664,9 @@ describe('createSidPlayer', () => {
         'applies the settings of a seek to %s before the next frame is delivered',
         async (_, target) => {
           const h = await looping(settingsTune());
+          // The loop starts ahead of the playhead, so the tick that reaches 100 is what saves its
+          // entry image rather than a replay.
+          run(h.clock, 100);
           const requests = h.replay.requests.length;
           const delivered = h.sink.deliveredFrames.length;
 
@@ -5014,6 +5063,453 @@ describe('createSidPlayer', () => {
         expect(varispeedOn(player)).toBe(false);
         expect(sink.calls.slice(1)).toEqual(['begin', 'end']);
       });
+    });
+  });
+
+  describe('crossing captures', () => {
+    /** A counter tune playing with `lines` declared, before the first tick. */
+    async function playing(lines: readonly CrossingLines[]): Promise<Harness> {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setCrossingCaptures(lines);
+      await h.player.play();
+      return h;
+    }
+
+    const held = (player: SidPlayer, at: readonly number[]): boolean[] =>
+      at.map((frame) => player.holdsImageAt(frames(frame)));
+
+    beforeEach(() => {
+      snapshotIntoSpy.mockClear();
+      seekToFrameSpy.mockClear();
+      vi.mocked(console.warn).mockClear();
+    });
+
+    it('holds the most recent crossings of the declared lines and lets the oldest go', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+
+      run(clock, 35);
+      expect(held(player, [0, 5, 10, 20, 30])).toEqual([false, false, true, true, true]);
+
+      run(clock, 10);
+      expect(held(player, [10, 20, 30, 40])).toEqual([false, true, true, true]);
+    });
+
+    it('crosses a fractional period at the frames its lines round to', async () => {
+      const { player, clock } = await playing([{ originFrame: 3, periodFrames: 12.5, keep: 8 }]);
+
+      run(clock, 60);
+
+      // 3, 15.5, 28, 40.5 and 53, each rounded half up.
+      expect(held(player, [3, 15, 16, 28, 40, 41, 53])).toEqual([
+        true,
+        false,
+        true,
+        true,
+        false,
+        true,
+        true,
+      ]);
+    });
+
+    it('copies the machine once for a frame that lies on several sets of lines', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 10, keep: 3 },
+        { originFrame: 0, periodFrames: 20, keep: 3 },
+        { originFrame: 0, periodFrames: 5, keep: 4 },
+      ]);
+
+      run(clock, 20);
+
+      // Frames 5, 10, 15 and 20 are crossed; 10 lies on two sets and 20 on all three.
+      expect(snapshotIntoSpy).toHaveBeenCalledTimes(4);
+      expect(held(player, [5, 10, 15, 20])).toEqual([true, true, true, true]);
+    });
+
+    it('keeps each set’s own most recent crossings, a shared frame staying while any set holds it', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 10, keep: 2 },
+        { originFrame: 0, periodFrames: 20, keep: 2 },
+      ]);
+
+      run(clock, 45);
+
+      // Tens keep 30 and 40; twenties keep 20 and 40. 10 fell out of both.
+      expect(held(player, [10, 20, 30, 40])).toEqual([false, true, true, true]);
+    });
+
+    it('keeps the images already saved on lines that are declared again', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 35);
+
+      player.setCrossingCaptures([{ originFrame: 0, periodFrames: 20, keep: 2 }]);
+
+      expect(held(player, [10, 20, 30])).toEqual([false, true, false]);
+      run(clock, 10);
+      expect(held(player, [20, 40])).toEqual([true, true]);
+    });
+
+    it('frees every image when the lines are withdrawn', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 35);
+
+      player.setCrossingCaptures([]);
+      run(clock, 20);
+
+      expect(held(player, [10, 20, 30, 40, 50])).toEqual([false, false, false, false, false]);
+    });
+
+    it('ignores lines that cannot be crossed, with a warning', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 0.5, keep: 2 },
+        { originFrame: Number.NaN, periodFrames: 10, keep: 2 },
+        { originFrame: 0, periodFrames: 10, keep: 0 },
+      ]);
+
+      run(clock, 25);
+
+      expect(held(player, [10, 20])).toEqual([false, false]);
+      expect(console.warn).toHaveBeenCalledTimes(3);
+    });
+
+    it('drops the images on a stop, a load and a subtune change, and keeps the lines', async () => {
+      const twoSongs = tune({
+        songs: 2,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+        ],
+      });
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 25);
+      expect(held(player, [10, 20])).toEqual([true, true]);
+
+      player.stop();
+      expect(held(player, [10, 20])).toEqual([false, false]);
+      await player.play();
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+
+      player.loadTune(twoSongs);
+      expect(held(player, [10])).toEqual([false]);
+      await player.play();
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+
+      player.selectSubtune(2);
+      expect(held(player, [10])).toEqual([false]);
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+    });
+
+    it('saves nothing in varispeed', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setRegisterRecord(recordFromTune(counterTune(), 1, 200));
+      h.player.setCrossingCaptures([{ originFrame: 0, periodFrames: 10, keep: 4 }]);
+      await h.player.play();
+      run(h.clock, 5);
+
+      h.player.enterVarispeed(() => 1);
+      run(h.clock, 30);
+
+      expect(h.player.getPosition()).toBeGreaterThan(30);
+      expect(held(h.player, [10, 20, 30])).toEqual([false, false, false]);
+      expect(snapshotIntoSpy).not.toHaveBeenCalled();
+    });
+
+    it('re-enters a loop set at a crossed line from the image saved there, for a first lap exactly the loop’s length', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 10, keep: 4 }]);
+      run(h.clock, 35);
+      const requests = h.replay.requests.length;
+      snapshotIntoSpy.mockClear();
+
+      h.player.setActiveLoop({ startFrame: frames(30), endFrame: frames(40) });
+      await flushEntryImageCapture();
+
+      // Frames 35 to 38, then the wrap, its gate-off, and two whole laps of ten ticks each.
+      const lap = [null, ...range(31, 39)];
+      expect(bytesOver(h, 24)).toEqual([...range(36, 39), ...lap, ...lap]);
+      expect(h.player.getPosition()).toBe(30);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+      // Inside the loop no declared line is reached again: the wrap restores its start, and the
+      // gate-off tick runs no machine.
+      expect(snapshotIntoSpy).not.toHaveBeenCalled();
+    });
+
+    it('lets a loop set a frame ahead of the playhead lap from the image saved as the playhead crossed its start', async () => {
+      const h = await playing([]);
+      run(h.clock, 49);
+      const requests = h.replay.requests.length;
+
+      h.player.setActiveLoop({ startFrame: frames(50), endFrame: frames(60) });
+      await flushEntryImageCapture();
+
+      expect(h.replay.requests).toHaveLength(requests);
+      // Frame 49 crosses the start; frames 50 to 58 follow, then the wrap and a lap from the image.
+      expect(bytesOver(h, 30)).toEqual([
+        ...range(50, 59),
+        null,
+        ...range(51, 59),
+        null,
+        ...range(51, 59),
+      ]);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+      expect(h.replay.requests).toHaveLength(requests);
+    });
+
+    it('still asks for a replay when no tick will cross the loop’s start', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setRegisterRecord(recordFromTune(counterTune(), 1, 200));
+      const asked = async (startFrame: number): Promise<number> => {
+        const before = h.replay.requests.length;
+        h.player.setActiveLoop({
+          startFrame: frames(startFrame),
+          endFrame: frames(startFrame + 10),
+        });
+        await flushEntryImageCapture();
+        return h.replay.requests.length - before;
+      };
+
+      expect(await asked(50)).toBe(1); // not playing
+      h.player.setActiveLoop(null);
+      await h.player.play();
+      run(h.clock, 60);
+      expect(await asked(20)).toBe(1); // behind the playhead
+      expect(await asked(60)).toBe(1); // at the playhead
+      expect(await asked(90)).toBe(0); // ahead of it, in live play
+
+      h.player.enterVarispeed(() => 1);
+      expect(await asked(150)).toBe(1); // varispeed saves nothing at a crossing
+    });
+
+    it('keeps a running loop’s image through the recycling of the slots it was found in', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 5, keep: 2 }]);
+      run(h.clock, 31);
+      expect(held(h.player, [25, 30])).toEqual([true, true]);
+      const requests = h.replay.requests.length;
+
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(45) });
+
+      // The crossings at 35 and 40 recycle both slots long before the loop first wraps.
+      const lap = [null, ...range(26, 44)];
+      expect(bytesOver(h, 13 + 20 + 20)).toEqual([...range(32, 44), ...lap, ...lap]);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps a running loop’s start across a re-declare of the lines, and finds it again for a shorter loop', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 5, keep: 2 }]);
+      run(h.clock, 31);
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(45) });
+      run(h.clock, 20); // into the second lap, at frame 31
+      const requests = h.replay.requests.length;
+
+      h.player.setCrossingCaptures([]);
+      expect(held(h.player, [25, 35, 40])).toEqual([true, false, false]);
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(35) });
+      await flushEntryImageCapture();
+
+      expect(h.replay.requests).toHaveLength(requests);
+      const lap = [null, ...range(26, 34)];
+      expect(bytesOver(h, 3 + 10 + 10)).toEqual([...range(32, 34), ...lap, ...lap]);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('changing the loop on a named frame', () => {
+    const snapshotOf = (player: SidPlayer): ReturnType<SidPlayer['getSnapshot']> =>
+      player.getSnapshot();
+    const loopChange = (player: SidPlayer): unknown => snapshotOf(player).tune?.loopChange;
+
+    function runUntil(clock: FakeClock, done: () => boolean, limit = 400): void {
+      for (let tick = 0; tick < limit && !done(); tick++) run(clock, 1);
+      expect(done()).toBe(true);
+    }
+
+    /** A counter tune at frame 100, inside the ten-frame loop that starts there. */
+    async function loopingAt100(): Promise<Harness> {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      run(h.clock, 100);
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      return h;
+    }
+
+    beforeEach(() => {
+      seekToFrameSpy.mockClear();
+    });
+
+    it('refuses, changing nothing, when no loop is running', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      const before = h.player.getSnapshot();
+
+      const accepted = h.player.changeLoopAt(frames(110), {
+        startFrame: frames(100),
+        endFrame: frames(120),
+      });
+
+      expect(accepted).toBe(false);
+      expect(h.player.getSnapshot()).toBe(before);
+    });
+
+    it('refuses, changing nothing, when no image is held for the new loop’s start', async () => {
+      const h = await loopingAt100();
+      const before = h.player.getSnapshot();
+
+      const accepted = h.player.changeLoopAt(frames(106), {
+        startFrame: frames(300),
+        endFrame: frames(310),
+      });
+
+      expect(accepted).toBe(false);
+      expect(h.player.getSnapshot()).toBe(before);
+    });
+
+    it('ends the lap on the named frame as a lap ending there would, then runs the new bounds', async () => {
+      const h = await loopingAt100();
+      const requests = h.replay.requests.length;
+      const next = { startFrame: frames(100), endFrame: frames(116) };
+
+      expect(h.player.changeLoopAt(frames(106), next)).toBe(true);
+
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 106 });
+      expect(loopChange(h.player)).toEqual({ atFrame: 106, loop: next });
+
+      // Frames 100 to 104 and the gate-off in 105's slot: six ticks, as a loop ending at 106 laps.
+      expect(bytesOver(h, 6)).toEqual([...range(101, 105), null]);
+      expect(snapshotOf(h.player).loop).toEqual(next);
+      expect(loopChange(h.player)).toBeNull();
+      // Then the new length: fifteen frames and the gate-off, sixteen ticks.
+      expect(bytesOver(h, 32)).toEqual([...range(101, 115), null, ...range(101, 115), null]);
+      expect(h.player.getPosition()).toBe(100);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('replaces a change already named', async () => {
+      const h = await loopingAt100();
+      const second = { startFrame: frames(100), endFrame: frames(104) };
+
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+      h.player.changeLoopAt(frames(108), second);
+
+      expect(loopChange(h.player)).toEqual({ atFrame: 108, loop: second });
+      expect(bytesOver(h, 8 + 4 + 4)).toEqual([
+        ...range(101, 107),
+        null,
+        ...range(101, 103),
+        null,
+        ...range(101, 103),
+        null,
+      ]);
+    });
+
+    it('is dropped by setActiveLoop, which sets its own loop', async () => {
+      const h = await loopingAt100();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(120) });
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 120 });
+      run(h.clock, 12);
+      expect(h.player.getPosition()).toBe(112);
+    });
+
+    it('is dropped by a stop', async () => {
+      const h = await loopingAt100();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.stop();
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toBeNull();
+    });
+
+    it('keeps a queued jump, which lands at the wrap in the change’s place and drops it', async () => {
+      const h = await loopingAt100();
+      h.player.setJumpTargets([frames(500)]);
+      await flushEntryImageCapture();
+      h.player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      const queued = snapshotOf(h.player).tune?.queuedJump;
+
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      expect(snapshotOf(h.player).tune?.queuedJump).toEqual(queued);
+      runUntil(h.clock, () => snapshotOf(h.player).tune?.handOffs === 1);
+      expect(h.player.getPosition()).toBe(500);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 500, endFrame: 520 });
+      expect(loopChange(h.player)).toBeNull();
+      expect(bytesOver(h, 2)).toEqual([null, ...counts(501, 501)]);
+    });
+
+    it('re-enters the new loop’s own start when it is another frame', async () => {
+      const h = await loopingAt100();
+      h.player.setJumpTargets([frames(500)]);
+      await flushEntryImageCapture();
+
+      expect(
+        h.player.changeLoopAt(frames(106), { startFrame: frames(500), endFrame: frames(508) }),
+      ).toBe(true);
+
+      expect(bytesOver(h, 6 + 16)).toEqual([
+        ...range(101, 105),
+        null,
+        ...counts(501, 507),
+        null,
+        ...counts(501, 507),
+        null,
+      ]);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 500, endFrame: 508 });
+    });
+
+    it('re-enters from an image saved at a crossing, landing a change named behind the playhead on the next tick', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setCrossingCaptures([{ originFrame: 0, periodFrames: 10, keep: 6 }]);
+      await h.player.play();
+      run(h.clock, 55);
+      h.player.setActiveLoop({ startFrame: frames(40), endFrame: frames(56) });
+      const requests = h.replay.requests.length;
+
+      expect(
+        h.player.changeLoopAt(frames(50), { startFrame: frames(20), endFrame: frames(30) }),
+      ).toBe(true);
+
+      expect(bytesOver(h, 1 + 1 + 9)).toEqual([56, null, ...range(21, 29)]);
+      expect(h.player.getPosition()).toBe(20);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 20, endFrame: 30 });
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('is cancelled by a subtune change, which gives the loop its end back', async () => {
+      const twoSongs = tune({
+        songs: 2,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+        ],
+      });
+      const h = harness();
+      h.player.loadTune(twoSongs);
+      await h.player.play();
+      run(h.clock, 100);
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.selectSubtune(2);
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 110 });
     });
   });
 });

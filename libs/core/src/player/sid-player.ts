@@ -6,6 +6,7 @@ import type { ScaledRegisterGroup, SidFilterMode } from '../registers/register-f
 import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidField } from '../registers/sid-fields.js';
 import type { ActiveLoop } from '../timeline/active-loop.js';
+import type { CrossingLines } from '../timeline/crossing-captures.js';
 import type { DeliveryBatch } from './delivery-history.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
@@ -57,6 +58,21 @@ export interface SidPlayer {
   /** Replaces the running loop; null clears it. A loop carrying `varispeedStart` also holds
    *  varispeed inside it — see `ActiveLoop`. */
   setActiveLoop(loop: ActiveLoop): void;
+  /** From the lap that ends at `frame`, run `loop` instead: the running loop wraps at `frame` as it
+   *  would at an end there (the wrap lead applies), re-entering `loop`'s start, and `loop` runs from
+   *  then on. Replaces any change already named; `setActiveLoop` and a stop drop it. A queued jump is
+   *  kept, unlike with `setActiveLoop`: it lands at that wrap in the change's place and drops the
+   *  change. Returns false, changing nothing, when no loop is running or no image is held for
+   *  `loop`'s start. Published as `getSnapshot().tune.loopChange` while pending. */
+  changeLoopAt(frame: Frames, loop: Exclude<ActiveLoop, null>): boolean;
+  /** Replaces the set of lines saved at. [] withdraws them all and frees the crossing slots' images.
+   *  It never touches the loop-entry buffer, so a running loop's start survives a re-declare.
+   *  Allocates the image buffers here, never on a tick. A stop, a `loadTune` and a subtune change
+   *  drop the images held, and the lines stay declared. */
+  setCrossingCaptures(lines: readonly CrossingLines[]): void;
+  /** True when the player holds an entry image for `frame`: prepared, cached, or saved at a
+   *  crossing. Not notified — pulled on the consumer's own schedule. */
+  holdsImageAt(frame: Frames): boolean;
   /**
    * Declares the frames the host wants to jump to instantly — loop starts and cue points alike —
    * replacing the previous set; an empty list withdraws all. Each declared frame gets its own

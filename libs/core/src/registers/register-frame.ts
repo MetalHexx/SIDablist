@@ -334,6 +334,12 @@ export interface RegisterFrame extends SidWriteSink {
   snapshotValues(): RegisterValuesSnapshot;
 
   /**
+   * `snapshotValues` into a snapshot the caller already holds, allocating nothing — for a capture
+   * made on the frame path.
+   */
+  snapshotValuesInto(target: RegisterValuesSnapshot): void;
+
+  /**
    * Replaces the accumulated register values wholesale and drops any half-built frame.
    *
    * Mute is not part of the snapshot: whichever voices are muted *now* stay muted, so returning to a
@@ -725,6 +731,10 @@ class RegisterFrameImpl implements RegisterFrame {
 
   snapshotValues(): RegisterValuesSnapshot {
     return { values: this.values.slice() };
+  }
+
+  snapshotValuesInto(target: RegisterValuesSnapshot): void {
+    target.values.set(this.values);
   }
 
   restoreValues(snapshot: RegisterValuesSnapshot): void {

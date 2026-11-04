@@ -1,6 +1,6 @@
 import type { SidFile } from '../sid/sid-file.model.js';
 import { cycles, type Cycles } from '../units.js';
-import { createVendorCpu } from './vendor-cpu.js';
+import { createCpuStateRecord, createVendorCpu } from './vendor-cpu.js';
 import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 import {
   CIA1_INTERRUPT_CONTROL,
@@ -92,6 +92,55 @@ export interface MachineSnapshot {
 }
 
 /**
+ * A `MachineSnapshot` the holder may refill in place — what `snapshotInto` writes, and what a pool
+ * of images allocates once. Structurally a `MachineSnapshot`, so it restores like any other.
+ */
+export interface WritableMachineSnapshot {
+  readonly memory: Uint8Array;
+  readonly cpu: Record<string, unknown>;
+  trampoline: number;
+  idleAddress: number;
+  playAddress: number;
+  timerALatch: number | null;
+  cyclesThisCall: number;
+  reachedIdle: boolean;
+  expectingOpcodeFetch: boolean;
+  illegalOpcodes: number;
+}
+
+/** An image holding nothing yet, for `snapshotInto` or `copyMachineImage` to fill. Allocates the
+ *  64 KB address space, so call it off the frame path and keep what it returns. */
+export function createMachineImage(): WritableMachineSnapshot {
+  return {
+    memory: new Uint8Array(MEMORY_SIZE),
+    cpu: createCpuStateRecord(),
+    trampoline: 0,
+    idleAddress: 0,
+    playAddress: 0,
+    timerALatch: null,
+    cyclesThisCall: 0,
+    reachedIdle: false,
+    expectingOpcodeFetch: false,
+    illegalOpcodes: 0,
+  };
+}
+
+/** Copies `source` over `target` field by field. Not for the frame path: the CPU record is copied
+ *  by enumeration. */
+export function copyMachineImage(source: MachineSnapshot, target: WritableMachineSnapshot): void {
+  target.memory.set(source.memory);
+  Object.assign(target.cpu, source.cpu);
+  target.trampoline = source.trampoline;
+  target.idleAddress = source.idleAddress;
+  target.playAddress = source.playAddress;
+  target.timerALatch = source.timerALatch;
+  target.cyclesThisCall = source.cyclesThisCall;
+  target.reachedIdle = source.reachedIdle;
+  target.expectingOpcodeFetch = source.expectingOpcodeFetch;
+  target.illegalOpcodes = source.illegalOpcodes;
+}
+
+/**
  * A 64 KB address space with just enough faked C64 hardware — CIA timers, a moving raster counter
  * and ROM vector stubs — for a tune's `init` and `play` routines to run to completion. Every write
  * the tune makes to the SID's address range is handed to the sink.
@@ -144,6 +193,13 @@ export interface C64Machine {
    * main-thread stall that a replay of the same distance costs.
    */
   snapshot(): MachineSnapshot;
+
+  /**
+   * `snapshot` written over an image the caller already holds — memory copied with `set`, the rest
+   * assigned — so a capture on the frame path allocates nothing. `target` must come from
+   * `createMachineImage` (or be a `snapshot()` result), which gives its CPU record every key.
+   */
+  snapshotInto(target: WritableMachineSnapshot): void;
 
   /**
    * Puts the machine back exactly where `snapshot` was taken.
@@ -230,6 +286,19 @@ class C64MachineImpl implements C64Machine {
       expectingOpcodeFetch: this.expectingOpcodeFetch,
       illegalOpcodes: this.illegalOpcodes,
     };
+  }
+
+  snapshotInto(target: WritableMachineSnapshot): void {
+    target.memory.set(this.memory);
+    this.cpu.copyStateInto(target.cpu);
+    target.trampoline = this.trampoline;
+    target.idleAddress = this.idleAddress;
+    target.playAddress = this.playAddress;
+    target.timerALatch = this.timerALatch;
+    target.cyclesThisCall = this.cyclesThisCall;
+    target.reachedIdle = this.reachedIdle;
+    target.expectingOpcodeFetch = this.expectingOpcodeFetch;
+    target.illegalOpcodes = this.illegalOpcodes;
   }
 
   restore(snapshot: MachineSnapshot): void {

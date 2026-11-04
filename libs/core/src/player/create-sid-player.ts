@@ -36,6 +36,16 @@ import { createActiveLoopTracker } from '../timeline/active-loop.js';
 import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
+import {
+  copyImageBuffer,
+  createCrossingCaptures,
+  createImageBuffer,
+} from '../timeline/crossing-captures.js';
+import type {
+  CrossingCaptures,
+  CrossingLines,
+  ImageBuffer,
+} from '../timeline/crossing-captures.js';
 import { createTrackStructure } from '../timeline/track-structure.js';
 import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-structure.js';
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
@@ -297,6 +307,19 @@ class SidPlayerCoordinator implements SidPlayer {
    *  a loop being armed, or a jump landing on one's own start, is served from instead of a replay.
    *  Emptied wholesale by anything that replaces the machine the images describe. */
   private readonly loopEntries = new Map<number, HeldImage>();
+
+  /** The images saved from the live machine as the playhead crosses the lines the host declared
+   *  (`setCrossingCaptures`). A slot is recycled by later crossings, which is why a running loop
+   *  re-enters from `loopEntry` and never from one. */
+  private readonly crossing: CrossingCaptures = createCrossingCaptures();
+
+  /** The one image a running loop re-enters from when it did not come from a replay — copied out of
+   *  a crossing slot as the loop is set, or saved straight from the machine as the playhead reaches
+   *  the loop's start. Allocated once; the tracker holds this very object as the loop's entry image,
+   *  so a lap restores from it however many crossings have recycled the slots since. */
+  private readonly loopEntry: ImageBuffer = createImageBuffer();
+  /** Whether `loopEntry` holds an image of the machine now loaded. */
+  private loopEntryFilled = false;
 
   /** The frames the host asked to be able to jump to instantly, normalised the way `seek` is. */
   private readonly declared = new Set<number>();
@@ -606,6 +629,9 @@ class SidPlayerCoordinator implements SidPlayer {
     // After the transport, so the one snapshot this publishes already reads as stopped rather than
     // announcing a player that is still playing with its loop taken away.
     this.setActiveLoop(null);
+    // Not `dropEntryImages`: that would drop the prepared images and build every declared frame
+    // again on each Stop. Only what was saved from the live machine goes; the lines stay declared.
+    this.dropLiveImages();
     if (this.session.file !== null) {
       this.sink.end();
       this.session.initSubtune(this.session.currentSubtune);
@@ -688,6 +714,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.declared.clear();
     this.queuedJump = null;
     this.activeLoop.queue(null);
+    this.activeLoop.cancelChange();
     this.handOffs = 0;
     this.markDirty();
     void this.captureTrackLoopEntry();
@@ -715,15 +742,63 @@ class SidPlayerCoordinator implements SidPlayer {
     // than replaying — and so does its first wrap. Only a loop this machine has never held an image
     // for pays the one-time off-thread capture `captureTrackLoopEntry` already pays for the track's
     // own loop. A start the host declared is not captured here at all: the build scheduler owns
-    // that frame and hands the image to the loop when it lands.
+    // that frame and hands the image to the loop when it lands. Nor is one still ahead of the
+    // playhead in live play: the tick that reaches it saves the machine as the loop's entry image.
     const cached = this.entryImageFor(loop);
     this.activeLoop.setEntryImage(cached);
-    if (loop !== null && cached === null) {
+    if (loop !== null && cached === null && !this.crossingArms(loop)) {
       // Not awaited: nothing on this path needs the image, and a lap cannot reach this loop's own
       // end for a whole pass yet.
       void this.captureActiveLoopEntry(loop);
     }
     this.markDirty();
+  }
+
+  changeLoopAt(frame: Frames, loop: Exclude<ActiveLoop, null>): boolean {
+    if (
+      !Number.isFinite(frame) ||
+      !Number.isFinite(loop.startFrame) ||
+      !(loop.endFrame > loop.startFrame)
+    ) {
+      console.warn(
+        `SID player: ignoring a loop change at ${frame} to ${loop.startFrame}-${loop.endFrame}.`,
+      );
+      return false;
+    }
+    if (this.activeLoop.get() === null) return false;
+    const image = this.entryImageFor(loop);
+    if (image === null) return false;
+    this.activeLoop.changeAt(frame, loop, image);
+    this.markDirty();
+    return true;
+  }
+
+  setCrossingCaptures(lines: readonly CrossingLines[]): void {
+    const usable: CrossingLines[] = [];
+    for (const line of lines) {
+      if (
+        !Number.isFinite(line.originFrame) ||
+        !Number.isFinite(line.periodFrames) ||
+        line.periodFrames < 1 ||
+        !Number.isFinite(line.keep) ||
+        line.keep < 1
+      ) {
+        console.warn(
+          `SID player: ignoring crossing lines from ${line.originFrame} every ${line.periodFrames} keeping ${line.keep}.`,
+        );
+        continue;
+      }
+      usable.push({
+        originFrame: line.originFrame,
+        periodFrames: line.periodFrames,
+        keep: Math.floor(line.keep),
+      });
+    }
+    this.crossing.declare(usable);
+  }
+
+  holdsImageAt(frame: Frames): boolean {
+    return this.imageAt(frame) !== null;
   }
 
   queueJump(target: (QueuedJump & { readonly settings?: JumpSettings }) | null): void {
@@ -1352,9 +1427,52 @@ class SidPlayerCoordinator implements SidPlayer {
 
     this.deliver(frame.takeSnapshot(), dueAtMs, catchUpClamped);
     this.session.framesRendered = frames(this.session.framesRendered + 1);
+    this.captureAtCrossing(machine, frame, this.session.framesRendered);
     this.ring.maybeRecord(machine, frame, this.session.framesRendered);
     this.enforceLoop(machine, frame);
   };
+
+  /**
+   * Saves the live machine when the playhead has just reached a frame something wants kept: the
+   * active loop's own start while the loop has no entry image, else a frame on a declared line.
+   * Never more than one copy a tick, and nothing but a few comparisons when there is no hit —
+   * nothing is allocated and no host code runs.
+   *
+   * The loop's start is saved straight into `loopEntry` and the declared lines skip that frame, so a
+   * loop set a frame ahead of the playhead laps from the image saved as it crossed its start. Not
+   * while a change is pending: its image may be `loopEntry`, and the running loop never re-enters
+   * its own start again.
+   *
+   * Reached only on a tick that ran the machine, so neither varispeed nor a gate-off tick saves.
+   */
+  private captureAtCrossing(machine: C64Machine, frame: RegisterFrame, position: Frames): void {
+    const loop = this.activeLoop.get();
+    if (
+      loop !== null &&
+      loop.startFrame === position &&
+      this.activeLoop.entryImage() === null &&
+      this.activeLoop.pendingChange() === null
+    ) {
+      this.saveLive(this.loopEntry, machine, frame, position);
+      this.loopEntryFilled = true;
+      this.activeLoop.setEntryImage(this.loopEntry);
+      return;
+    }
+    const slot = this.crossing.take(position);
+    if (slot !== null) this.saveLive(slot, machine, frame, position);
+  }
+
+  /** Copies the live pair into `target` in place, allocating nothing. */
+  private saveLive(
+    target: ImageBuffer,
+    machine: C64Machine,
+    frame: RegisterFrame,
+    position: Frames,
+  ): void {
+    machine.snapshotInto(target.machine);
+    frame.snapshotValuesInto(target.registers);
+    target.frame = position;
+  }
 
   /** Hands one frame to the sink and measures the hand-off. The reading is taken before the call so
    *  it measures core's own lag against the frame grid, not the sink's work. */
@@ -1772,6 +1890,8 @@ class SidPlayerCoordinator implements SidPlayer {
 
     this.rememberEntryImage(result);
     if (this.activeLoop.get()?.startFrame !== loop.startFrame) return;
+    // The playhead may have crossed the start while this was in flight and armed the loop itself.
+    if (this.activeLoop.entryImage()?.frame === loop.startFrame) return;
     this.activeLoop.setEntryImage(result.anchor);
   }
 
@@ -1799,13 +1919,40 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.queuedJump === record) this.activeLoop.setQueuedImage(result.anchor);
   }
 
-  /** Whichever image already stands at `loop`'s own start frame — prepared first, then the cache —
-   *  or the track's own loop's entry when nothing is looping. What `setActiveLoop` arms a loop with
-   *  in place of a fresh capture. */
+  /** Whichever image already stands at `loop`'s own start frame, from the lookup `imageAt` makes, or
+   *  the track's own loop's entry when nothing is looping. What `setActiveLoop` and `changeLoopAt`
+   *  arm a loop with in place of a fresh capture.
+   *
+   *  An image found in a crossing slot is copied into `loopEntry` and that is returned: a later
+   *  crossing recycles the slot, and a running loop must keep the image it re-enters from. One
+   *  already in `loopEntry` — a running loop grown or shrunk keeps its start — is used as it is. */
   private entryImageFor(loop: ActiveLoop): PositionAnchor | null {
     if (loop === null) return this.trackLoopEntry;
-    const held = this.prepared.get(loop.startFrame) ?? this.loopEntries.get(loop.startFrame);
-    return held?.anchor ?? null;
+    const image = this.imageAt(loop.startFrame);
+    const slot = this.crossing.imageAt(loop.startFrame);
+    if (image === null || slot === null || image !== slot) return image;
+    copyImageBuffer(slot, this.loopEntry);
+    this.loopEntryFilled = true;
+    return this.loopEntry;
+  }
+
+  /** The one lookup for an image held at `frame`: the loop-entry buffer, the prepared images, the
+   *  cache, then the crossing slots. */
+  private imageAt(frame: number): PositionAnchor | null {
+    if (this.loopEntryFilled && this.loopEntry.frame === frame) return this.loopEntry;
+    const held = this.prepared.get(frame) ?? this.loopEntries.get(frame);
+    return held?.anchor ?? this.crossing.imageAt(frame);
+  }
+
+  /** Whether the tick that reaches `loop`'s start will save its entry image: live play with the
+   *  start still ahead of the playhead. Varispeed and a handback save nothing at a crossing, and a
+   *  start at or behind the playhead is not crossed again. */
+  private crossingArms(loop: Exclude<ActiveLoop, null>): boolean {
+    return (
+      this.transport === 'playing' &&
+      !this.varispeedActive &&
+      loop.startFrame > this.session.framesRendered
+    );
   }
 
   /** Files `entry` under the frame it was taken at, evicting the oldest once the cache is full.
@@ -1834,7 +1981,15 @@ class SidPlayerCoordinator implements SidPlayer {
     this.capturesInFlight.clear();
     this.activeLoop.setEntryImage(null);
     this.activeLoop.setQueuedImage(null);
+    this.dropLiveImages();
     this.dropPreparedImages();
+  }
+
+  /** Lets go of the images saved from the live machine: the crossing slots and `loopEntry`. The
+   *  declared lines stay, so the next crossings fill the slots again. */
+  private dropLiveImages(): void {
+    this.crossing.clearImages();
+    this.loopEntryFilled = false;
   }
 
   /** Drops every prepared image and the builds still owed, and strands the one in flight: its answer
@@ -2046,6 +2201,7 @@ class SidPlayerCoordinator implements SidPlayer {
                 .sort((a, b) => a - b)
                 .map((frame) => frames(frame)),
               queuedJump: this.queuedJump,
+              loopChange: this.activeLoop.pendingChange(),
               handOffs: this.handOffs,
               recordedFrames: this.recordedFrames(),
             },

@@ -2,7 +2,8 @@
 
 Turns a scanned tune's raw register stream into the persisted `TuneIndexRecord` a host caches: the
 loop, key, structure, novelty, pulse and beat-grid detectors, plus the scan ladder — `indexTune` — that decides
-how deep to scan and when to stop. Framework-free and worker-portable, so a host can index a tune
+how deep to scan and when to stop. Also the frame arithmetic over a beat grid that places a loop on it.
+Framework-free and worker-portable, so a host can index a tune
 with no Angular, and no browser main thread blocked, in sight.
 
 ## How it works
@@ -39,6 +40,12 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   `ScanOutput` it is given must carry `controlBytes` and `retriggers`. The pulse fields are gone
   from the record; `computePulse`, `impliedTempo` and `marker-moments.ts` stay exported for hosts
   that still call them.
+- `grid-lines.ts` — the arithmetic over a `BeatGrid`, in frames and with no notion of what a person
+  wants: `lengthLadder` (the lengths a loop can take at a beat length), `gridLine` (line `index` of
+  lines `periodFrames` apart), `loopStartAtOrBefore` (where a loop of a length starts at or behind a
+  frame), `shrinkLanding` (where a shrink takes effect) and `foldIntoLoop` (a frame folded into a
+  loop by whole laps). Every line is `Math.round`ed to a whole frame, so a host's grid with float
+  noise in `beatFrames` still lands on frames.
 - `tune-index.model.ts` — `TuneIndexRecord` and `TUNE_INDEX_FORMAT_VERSION`, the persisted shape
   and its compatibility gate.
 - `tune-index-readouts.ts`, `tune-length.ts`, `marker-moments.ts`, `format.ts` — display-facing
@@ -93,6 +100,14 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   record by the same meaning, so a shifted column or retrigger order also moves every beat grid.
   Keep the three in step and run `register-record.spec.ts`, `beat-grid.spec.ts` and core's
   `create-sid-player.spec.ts`. Detail:
+  [`libs/core/AGENTS.md`](../core/AGENTS.md).
+
+- **Changed how `gridLine` rounds (`grid-lines.ts`)?** `libs/core`'s crossing lines
+  (`timeline/crossing-captures.ts`, `CrossingLines`) test `Math.round(originFrame + k × periodFrames)`
+  by the same convention: the player saves the machine at the frames this module names. A line one
+  frame off on either side saves an image a loop can then never start from, with no error. Change
+  both and run this module's `grid-lines.spec.ts` and core's `crossing-captures.spec.ts` and the
+  `crossing captures` specs in `player/create-sid-player.spec.ts`. Detail:
   [`libs/core/AGENTS.md`](../core/AGENTS.md).
 
 ## Commands
