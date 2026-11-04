@@ -57,15 +57,25 @@ export interface SidPlayer {
   /** Selects the previous subtune, clamped to the tune's range. A no-op at the first subtune. */
   previousSubtune(): void;
   /** Replaces the running loop; null clears it. A loop carrying `varispeedStart` also holds
-   *  varispeed inside it — see `ActiveLoop`. */
+   *  varispeed inside it — see `ActiveLoop`. A length that is not a whole number of frames laps in
+   *  alternating whole-frame lengths from lap 0 at its `lapPhase`; setting the loop already running
+   *  again, with the same start, end and lap phase, keeps the lap in progress. Ignored, with a
+   *  warning, for such a length under `MIN_FRACTIONAL_LOOP_FRAMES` or a lap phase that is not a
+   *  finite number. */
   setActiveLoop(loop: ActiveLoop): void;
   /** From the lap that ends at `frame`, run `loop` instead: the running loop wraps at `frame` as it
    *  would at an end there (the wrap lead applies), re-entering `loop`'s start, and `loop` runs from
-   *  then on. Replaces any change already named; `setActiveLoop` and a stop drop it. A queued jump is
-   *  kept, unlike with `setActiveLoop`: it lands at that wrap in the change's place and drops the
-   *  change. Returns false, changing nothing, when no loop is running or no image is held for
-   *  `loop`'s start. Published as `getSnapshot().tune.loopChange` while pending. */
+   *  then on, from lap 0 at its `lapPhase`. Replaces any change already named; `setActiveLoop` and a
+   *  stop drop it. A queued jump is kept, unlike with `setActiveLoop`: it lands at that wrap in the
+   *  change's place and drops the change. A running loop whose length is not whole and a `frame`
+   *  past the end of its lap in progress change at that lap's end instead. Returns false, changing
+   *  nothing, when no loop is running, no image is held for `loop`'s start, or `loop` is one
+   *  `setActiveLoop` would ignore. Published as `getSnapshot().tune.loopChange` while pending. */
   changeLoopAt(frame: Frames, loop: Exclude<ActiveLoop, null>): boolean;
+  /** The reduced phase of the running loop's lap in progress — which of a loop's alternating lap
+   *  lengths it is in (see `ActiveLoop`) — or null with no loop running. Pulled, never notified: it
+   *  moves every lap. */
+  getLapPhase(): number | null;
   /** Replaces the set of lines saved at. [] withdraws them all and frees the crossing slots' images.
    *  It never touches the loop-entry buffer, so a running loop's start survives a re-declare.
    *  Allocates the image buffers here, never on a tick. A stop, a `loadTune` and a subtune change
@@ -87,7 +97,12 @@ export interface SidPlayer {
    *  until then laps continue — and is dropped by `setActiveLoop`, `stop`, `loadTune` and a subtune
    *  change. Ignored, with a warning, when no loop is running: jump now with `setActiveLoop` and
    *  `seek` instead. `target.settings`, when given, are applied as the jump lands, never before,
-   *  and are dropped with the queue. */
+   *  and are dropped with the queue. The start is rounded as a seek's is; the end is not. A queued
+   *  loop whose length is not whole laps on from the running loop's clock (lap 0 starts at the
+   *  phase the outgoing lap ended on, so hand-offs never add up drift); landing in place of a
+   *  change `changeLoopAt` named, it starts at that change's `lapPhase`; handed off from the
+   *  track's own loop, it starts at `target.lapPhase`. Ignored, with a warning, for a loop
+   *  `setActiveLoop` would ignore. */
   queueJump(target: (QueuedJump & { readonly settings?: JumpSettings }) | null): void;
   /**
    * Snapshots the live position into the entry-image cache, a memory copy with no replay, and
@@ -116,29 +131,36 @@ export interface SidPlayer {
   /** Lands the playhead on `at`: the voices released and struck again, as a jump lands, playing from the
    *  register record while the machine is rebuilt ahead, then handing back to the machine. A bare frame
    *  (`getPosition()`'s unit) lands with no gate-off pending; a `ShadowCount` lands with its phase
-   *  (`held`). Works from live play and from inside varispeed (it drops any rate source). `settings` are
-   *  applied at the landing. Returns false, changing nothing, when no record is held, the frame lies past
-   *  it, or the transport is not playing. Notifies. */
+   *  (`held`), and with its `lapPhase`, when it carries one, as the running loop's lap in progress — the
+   *  loop running at the landing: a loop set after it starts from its own lap phase. Works from live play
+   *  and from inside varispeed (it drops any rate source). `settings` are applied at the landing. Returns
+   *  false, changing nothing, when no record is held, the frame lies past it, the transport is not
+   *  playing, or the frame or lap phase is not a finite number. Notifies. */
   land(at: Frames | ShadowCount, settings?: JumpSettings): boolean;
 
   // The shadow position
   /** Starts (or re-bases) the shadow: a count that advances one frame per tick while the transport is
    *  playing and is unmoved by jumps, loops, landings and varispeed. It laps `loop` when one is given,
-   *  otherwise wraps where the track wraps. It counts from `from`, or from the player's own position and
-   *  phase when `from` is omitted. False with no tune. Notifies. */
+   *  otherwise wraps where the track wraps; a loop whose length is not whole is lapped in alternating
+   *  lengths, as the player laps it. It counts from `from` — in the lap `from.lapPhase` names, else the
+   *  loop's lap 0 — or from the player's own position and phase when `from` is omitted, in the lap the
+   *  player is in when `loop` has the running loop's start and end. False with no tune, and, with a
+   *  warning, for a frame or lap phase that is not a number or a loop `setActiveLoop` would ignore.
+   *  Notifies. */
   startShadow(loop: ActiveLoop, from?: ShadowCount): boolean;
   /** Stops the shadow. A load, a subtune change and a stop stop it too. Notifies. */
   stopShadow(): void;
   /** The frame the shadow counts now, or null when it is stopped. For painting: a pulled read that never
    *  notifies. */
   getShadowPosition(): Frames | null;
-  /** The shadow's exact count, frame and phase, or null when it is stopped. For re-basing and
-   *  `countAfter`. */
+  /** The shadow's exact count, frame and phase — and the lap's `lapPhase` on a loop whose length is
+   *  not whole — or null when it is stopped. For re-basing and `countAfter`. */
   getShadowCount(): ShadowCount | null;
   /** Ticks counted since the shadow last started or re-based, or null when it is stopped. */
   getShadowTicks(): number | null;
   /** Lands the playhead on the shadow's count, frame and phase, as `land` does. When the live player
-   *  already reads that count and phase, it sends nothing, applies no `settings` and returns true. False,
+   *  already reads that count and phase, it sends nothing, applies no `settings` and returns true — and
+   *  still takes the count's `lapPhase` as the running loop's lap in progress, when it carries one. False,
    *  changing nothing, where `land` would be, or with the shadow stopped. The shadow keeps running: the
    *  host stops it. */
   landOnShadow(settings?: JumpSettings): boolean;

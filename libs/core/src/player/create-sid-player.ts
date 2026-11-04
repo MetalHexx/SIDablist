@@ -32,7 +32,11 @@ import {
 import type { ReplayRunner } from '../replay/replay-runner.js';
 import type { ReplayResult } from '../replay/replay-to-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
-import { REENTRY_GATE_OFF_FRAMES, createActiveLoopTracker } from '../timeline/active-loop.js';
+import {
+  REENTRY_GATE_OFF_FRAMES,
+  createActiveLoopTracker,
+  isUsableLoopLength,
+} from '../timeline/active-loop.js';
 import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
@@ -118,6 +122,19 @@ const HANDBACK_LEAD_MS = milliseconds(HANDBACK_LEAD_SECONDS * 1000);
 /** The most deliveries the history will keep: about 170 KB at the ceiling, which is the memory a
  *  host's request is allowed to cost. */
 const MAX_KEPT_DELIVERIES = 4096;
+
+/** Whether a loop's bounds and lap phase can run: a length that is not a whole number of frames is
+ *  at least `MIN_FRACTIONAL_LOOP_FRAMES`, and a lap phase given is a finite number. */
+function isRunnableLoop(
+  startFrame: number,
+  endFrame: number,
+  lapPhase: number | undefined,
+): boolean {
+  return (
+    isUsableLoopLength(startFrame, endFrame) &&
+    (lapPhase === undefined || Number.isFinite(lapPhase))
+  );
+}
 
 /** A field hold as the coordinator carries it into every tune loaded after. */
 interface FieldHoldRecord {
@@ -741,6 +758,12 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   setActiveLoop(loop: ActiveLoop): void {
+    if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
+      console.warn(
+        `SID player: ignoring a loop of ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
+      );
+      return;
+    }
     this.queuedJump = null;
     this.activeLoop.set(loop);
     // A loop already captured for this machine is armed with its image straight away, so the seek a
@@ -764,7 +787,8 @@ class SidPlayerCoordinator implements SidPlayer {
     if (
       !Number.isFinite(frame) ||
       !Number.isFinite(loop.startFrame) ||
-      !(loop.endFrame > loop.startFrame)
+      !(loop.endFrame > loop.startFrame) ||
+      !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)
     ) {
       console.warn(
         `SID player: ignoring a loop change at ${frame} to ${loop.startFrame}-${loop.endFrame}.`,
@@ -819,10 +843,16 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
     const startFrame = frames(Math.max(0, Math.round(target.startFrame)));
-    const endFrame = target.endFrame === null ? null : frames(Math.round(target.endFrame));
-    if (endFrame !== null && !(endFrame > startFrame)) {
+    // The end is not rounded: a length that is not a whole number of frames laps in alternating
+    // whole-frame lengths once it lands.
+    const endFrame = target.endFrame;
+    const lapPhase = endFrame === null ? undefined : target.lapPhase;
+    if (
+      endFrame !== null &&
+      (!(endFrame > startFrame) || !isRunnableLoop(startFrame, endFrame, lapPhase))
+    ) {
       console.warn(
-        `SID player: ignoring a queued jump to ${startFrame} ending at ${target.endFrame}.`,
+        `SID player: ignoring a queued jump to ${startFrame} ending at ${target.endFrame} at lap phase ${lapPhase}.`,
       );
       return;
     }
@@ -839,6 +869,7 @@ class SidPlayerCoordinator implements SidPlayer {
       startFrame,
       endFrame,
       ...(varispeedStart === undefined ? {} : { varispeedStart }),
+      ...(lapPhase === undefined ? {} : { lapPhase }),
     };
     this.queuedJump = record;
     this.activeLoop.queue({
@@ -846,7 +877,12 @@ class SidPlayerCoordinator implements SidPlayer {
       loop:
         endFrame === null
           ? null
-          : { startFrame, endFrame, ...(varispeedStart === undefined ? {} : { varispeedStart }) },
+          : {
+              startFrame,
+              endFrame,
+              ...(varispeedStart === undefined ? {} : { varispeedStart }),
+              ...(lapPhase === undefined ? {} : { lapPhase }),
+            },
       ...(prepared === null ? {} : { beforeLanding: () => this.applyPreparedSettings(prepared) }),
     });
     this.armQueuedImage(record);
@@ -1039,6 +1075,7 @@ class SidPlayerCoordinator implements SidPlayer {
   land(at: Frames | ShadowCount, settings?: JumpSettings): boolean {
     const target = typeof at === 'number' ? at : at.frame;
     const held = typeof at === 'number' ? false : at.held;
+    const lapPhase = typeof at === 'number' ? undefined : at.lapPhase;
     const record = this.varispeed.record;
     if (
       this.session.file === null ||
@@ -1048,8 +1085,8 @@ class SidPlayerCoordinator implements SidPlayer {
     ) {
       return false;
     }
-    if (!Number.isFinite(target)) {
-      console.warn(`SID player: ignoring a landing on ${target}.`);
+    if (!Number.isFinite(target) || (lapPhase !== undefined && !Number.isFinite(lapPhase))) {
+      console.warn(`SID player: ignoring a landing on ${target} at lap phase ${lapPhase}.`);
       return false;
     }
     const landing = frames(Math.max(0, Math.round(target)));
@@ -1061,6 +1098,9 @@ class SidPlayerCoordinator implements SidPlayer {
     // Before the resync, like every restart: the landing is where the stream goes somewhere else.
     this.history?.restart();
     this.putRecordAt(landing, held);
+    // The lap the count is in, not the one the playhead left: a loop of alternating lap lengths
+    // then ends this lap where the count's own would.
+    if (lapPhase !== undefined) this.activeLoop.setLapPhase(lapPhase);
     this.beginHandback();
     this.markDirty();
     return true;
@@ -1096,27 +1136,42 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /**
    * Starts the shadow, or re-bases it. With no `from` it counts from the player's own position and
-   * phase: a pending gate-off that will leave the position where it is makes the count held.
+   * phase: a pending gate-off that will leave the position where it is makes the count held, and a
+   * `loop` with the running loop's start and end is counted in the lap the player is in.
    */
   startShadow(loop: ActiveLoop, from?: ShadowCount): boolean {
     if (this.session.file === null) return false;
+    const lapPhase =
+      from === undefined ? (this.activeLoop.lapPhaseOf(loop) ?? undefined) : from.lapPhase;
     const origin = from ?? {
       frame: this.session.framesRendered,
       held: this.gateOffOwed && !this.gateOffAdvances,
     };
     if (
       !Number.isFinite(origin.frame) ||
+      (lapPhase !== undefined && !Number.isFinite(lapPhase)) ||
       (loop !== null && (!Number.isFinite(loop.startFrame) || !Number.isFinite(loop.endFrame)))
     ) {
       console.warn('SID player: ignoring a shadow started on a frame that is not a number.');
       return false;
     }
+    if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
+      console.warn(
+        `SID player: ignoring a shadow lapping ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
+      );
+      return false;
+    }
     this.shadow.start(loop, {
       frame: frames(Math.max(0, Math.round(origin.frame))),
       held: origin.held,
+      ...(lapPhase === undefined ? {} : { lapPhase }),
     });
     this.markDirty();
     return true;
+  }
+
+  getLapPhase(): number | null {
+    return this.activeLoop.lapPhase();
   }
 
   stopShadow(): void {
@@ -1148,7 +1203,11 @@ class SidPlayerCoordinator implements SidPlayer {
       !this.varispeedActive &&
       this.session.framesRendered === count.frame &&
       this.gateOffOwed === count.held;
-    if (there) return true;
+    if (there) {
+      // Nothing to send, but the lap may still be another one of a loop of alternating lengths.
+      if (count.lapPhase !== undefined) this.activeLoop.setLapPhase(count.lapPhase);
+      return true;
+    }
     return this.land(count, settings);
   }
 

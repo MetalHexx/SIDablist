@@ -260,6 +260,25 @@ describe('changeRowMemory', () => {
     expect(changeRowMemory(r, 2, { markers: [] })).toBe(r);
   });
 
+  it('keeps a boundary that is not a whole frame as it was given, and tells two such apart', () => {
+    // An eighth of a 28-frame beat: a loop of 3.5 frames, whose laps alternate 4 and 3.
+    const eighth: LoopMarker = {
+      ...marker('m'),
+      start: { frame: 102, offsetFrames: 0 },
+      end: { frame: 105.5, offsetFrames: -1 },
+    };
+    const r = changeRowMemory(row('a', 'h1'), 1, { markers: [eighth] });
+
+    expect(subtuneMemoryOf(r, 1)?.markers[0].end).toEqual({ frame: 105.5, offsetFrames: -1 });
+    expect(tuneMemoryOf(r, T1).subtunes[0].markers[0]).toEqual(eighth);
+    expect(changeRowMemory(r, 1, { markers: [eighth] })).toBe(r);
+    const sixteenth = { ...eighth, end: { frame: 103.75, offsetFrames: -1 } };
+    expect(changeRowMemory(r, 1, { markers: [sixteenth] }).subtunes[0].markers[0].end).toEqual({
+      frame: 103.75,
+      offsetFrames: -1,
+    });
+  });
+
   it('copies what it is given, and the source row stays as it was', () => {
     const source = row('a', 'h1');
     const given = marker('m', { gains: [1] });

@@ -161,6 +161,7 @@ describe('countAfter', () => {
     ['a loop', loop(10, 17)],
     ['a loop too short to give up a frame', loop(10, 11)],
     ['a two-frame loop', loop(10, 12)],
+    ['a whole loop carrying a lap phase', { ...loop(10, 17), lapPhase: 0.5 }],
   ])('equals stepping the shadow tick by tick over %s, from any place', (_, lap) => {
     const starts: ShadowCount[] = [];
     for (let frame = 0; frame <= 20; frame++) {
@@ -177,3 +178,106 @@ describe('countAfter', () => {
     }
   });
 });
+
+describe('a loop whose length is not a whole number of frames', () => {
+  const fractional = (start: number, length: number, lapPhase?: number) => ({
+    ...loop(start, start + length),
+    ...(lapPhase === undefined ? {} : { lapPhase }),
+  });
+
+  /** The ticks each lap of the shadow takes, from a lap's start, held. */
+  function lapTicks(shadow: ShadowPosition, laps: number): number[] {
+    const track = createTrackStructure();
+    const taken: number[] = [];
+    let ticks = 0;
+    while (taken.length < laps) {
+      shadow.tick(track);
+      ticks++;
+      if (shadow.count()?.held === true) {
+        taken.push(ticks);
+        ticks = 0;
+      }
+    }
+    return taken;
+  }
+
+  it('laps the shadow in alternating lengths, as the player laps the loop', () => {
+    const atZero = new ShadowPosition();
+    atZero.start(fractional(10, 3.5), at(10, true));
+    expect(lapTicks(atZero, 6)).toEqual([4, 3, 4, 3, 4, 3]);
+
+    const atHalf = new ShadowPosition();
+    atHalf.start(fractional(10, 3.5, 0.5), at(10, true));
+    expect(lapTicks(atHalf, 4)).toEqual([3, 4, 3, 4]);
+  });
+
+  it('counts from the lap the count names over the loop’s own phase, and says which lap it is in', () => {
+    const shadow = new ShadowPosition();
+    shadow.start(fractional(10, 3.5), { ...at(10, true), lapPhase: 0.5 });
+
+    expect(shadow.count()).toEqual({ frame: 10, held: true, lapPhase: 0.5 });
+    expect(lapTicks(shadow, 2)).toEqual([3, 4]);
+    expect(shadow.count()).toEqual({ frame: 10, held: true, lapPhase: 0.5 });
+    shadow.tick(createTrackStructure());
+    expect(shadow.count()).toEqual({ frame: 10, held: false, lapPhase: 0.5 });
+  });
+
+  it('reports no lap phase on a whole loop or with none', () => {
+    const shadow = new ShadowPosition();
+    shadow.start({ ...loop(10, 14), lapPhase: 0.5 }, { ...at(10), lapPhase: 0.5 });
+    expect(shadow.count()).toEqual({ frame: 10, held: false });
+    expect(countAfter({ ...at(10), lapPhase: 0.5 }, 3, loop(10, 14))).toEqual(at(10, true));
+    expect(countAfter({ ...at(10), lapPhase: 0.5 }, 3, null)).toEqual(at(13));
+  });
+
+  it.each([
+    [2.5, [0, 0.5]],
+    [2.75, [0, 0.25, 0.5, 0.75]],
+    [3.5, [0, 0.5, 31.5]],
+    [3.125, [0, 0.125, 0.5, 0.875]],
+    [6.25, [0, 0.75]],
+    [1.5, [0, 0.5]],
+  ])(
+    'countAfter equals stepping the shadow tick by tick over %s frames, from any place and phase',
+    (length, phases) => {
+      for (const phase of phases) {
+        const lap = fractional(10, length, phase);
+        const starts: ShadowCount[] = [];
+        for (let frame = 0; frame <= 20; frame++) {
+          starts.push(at(frame), at(frame, true));
+          // A count handed in with its own lap's phase, which wins over the loop's.
+          starts.push({ ...at(frame), lapPhase: lapPhaseAfterOne(phase, length) });
+        }
+        for (const from of starts) {
+          const shadow = new ShadowPosition();
+          shadow.start(lap, from);
+          const track = createTrackStructure();
+          for (let ticks = 0; ticks <= 300; ticks++) {
+            expect(countAfter(from, ticks, lap)).toEqual(shadow.count());
+            shadow.tick(track);
+          }
+        }
+      }
+    },
+  );
+
+  it('countAfter is the stepped count however many laps the ticks span', () => {
+    const lap = fractional(10, 3.125, 0.375);
+    const shadow = new ShadowPosition();
+    const from = at(12);
+    shadow.start(lap, from);
+    const track = createTrackStructure();
+    for (let ticks = 1; ticks <= 100_000; ticks++) {
+      shadow.tick(track);
+      if (ticks % 9973 === 0 || ticks === 100_000) {
+        expect(countAfter(from, ticks, lap)).toEqual(shadow.count());
+      }
+    }
+  });
+});
+
+/** The reduced phase a lap on from `phase`. */
+function lapPhaseAfterOne(phase: number, length: number): number {
+  const next = phase + length;
+  return next - Math.floor(next);
+}

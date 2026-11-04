@@ -94,9 +94,16 @@ export {
   type LoopChange,
   type QueuedNext,
   type VarispeedLoopStart,
+  MIN_FRACTIONAL_LOOP_FRAMES,
   createActiveLoopTracker,
+  isUsableLoopLength,
+  lapLength,
+  lapPhaseAfter,
+  lapSpan,
+  lapsWithin,
+  reduceLapPhase,
 } from './timeline/active-loop.js';
-export { type ShadowCount, countAfter } from './timeline/shadow-position.js';
+export { type CountedLoop, type ShadowCount, countAfter } from './timeline/shadow-position.js';
 export { type CrossingLines } from './timeline/crossing-captures.js';
 export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
 export { type DeliveryBatch, createDeliveryBatch } from './player/delivery-history.js';

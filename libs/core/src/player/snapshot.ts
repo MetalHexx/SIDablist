@@ -13,6 +13,11 @@ export interface QueuedJump {
   /** How varispeed holds the queued loop once it is running — see `ActiveLoop`. Means something
    *  only when `endFrame` is set. */
   readonly varispeedStart?: VarispeedLoopStart;
+  /** The queued loop's lap phase — see `ActiveLoop`. Reported as handed in; a landing from a
+   *  running loop laps on from that loop's clock instead (see `SidPlayer.queueJump`), and this
+   *  phase is used only for a hand-off from the track's own loop. Means something only when
+   *  `endFrame` is set and the length is not whole. */
+  readonly lapPhase?: number;
 }
 
 /** Output-stage settings a jump applies as it lands, in the engine's own terms. It applies
