@@ -100,14 +100,26 @@ describe('createActiveLoopTracker', () => {
     expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 140 });
   });
 
-  it('re-enters the active loop at the exact start frame through the anchor ring', () => {
+  it('reports the start as due, the pair untouched, when entering it would replay frames', () => {
     tracker.set({ startFrame: frames(75), endFrame: frames(140) });
+    play(140);
+    const before = liveState();
+
+    const result = tracker.advance(machine, registers, ring, track, frames(140));
+
+    expect(result).toEqual({ action: 'due-unheld', frame: 75 });
+    expect(liveState()).toEqual(before);
+    expect(tracker.get()).toEqual({ startFrame: 75, endFrame: 140 });
+  });
+
+  it('re-enters through the anchor ring when the anchor already sits at the start', () => {
+    tracker.set({ startFrame: frames(0), endFrame: frames(140) });
     play(140);
 
     const result = tracker.advance(machine, registers, ring, track, frames(140));
 
-    expect(result).toEqual({ action: 'looped', frame: 75 });
-    expect(liveState()).toEqual(runUnbrokenTo(frames(75)));
+    expect(result).toEqual({ action: 'looped', frame: 0 });
+    expect(liveState()).toEqual(runUnbrokenTo(frames(0)));
   });
 
   it('prefers the held entry image over the anchor ring for re-entry', () => {
@@ -163,7 +175,7 @@ describe('createActiveLoopTracker', () => {
     expect(tracker.get()).toBeNull();
   });
 
-  it("arms and enters the track's own loop when it ends and repeat is on", () => {
+  it("arms the track's own loop when it ends and repeat is on, reporting its start as due", () => {
     track.setTrackStructure({
       loopStartFrame: frames(20),
       loopPeriodFrames: frames(80),
@@ -171,12 +183,31 @@ describe('createActiveLoopTracker', () => {
     });
     track.setRepeatEnabled(true);
     play(100); // trackEndFrame is 20 + 80
+    const before = liveState();
+
+    const result = tracker.advance(machine, registers, ring, track, frames(100));
+
+    expect(result).toEqual({ action: 'due-unheld', frame: 20 });
+    expect(tracker.get()).toEqual({ startFrame: 20, endFrame: 100 });
+    expect(liveState()).toEqual(before);
+  });
+
+  it("enters the track's own loop through its entry image once one is held", () => {
+    const stateAtTwenty = runUnbrokenTo(frames(20));
+    tracker.setEntryImage({ frame: frames(20), ...stateAtTwenty });
+    track.setTrackStructure({
+      loopStartFrame: frames(20),
+      loopPeriodFrames: frames(80),
+      endedAtFrame: null,
+    });
+    track.setRepeatEnabled(true);
+    play(100);
 
     const result = tracker.advance(machine, registers, ring, track, frames(100));
 
     expect(result).toEqual({ action: 'looped', frame: 20 });
     expect(tracker.get()).toEqual({ startFrame: 20, endFrame: 100 });
-    expect(liveState()).toEqual(runUnbrokenTo(frames(20)));
+    expect(liveState()).toEqual(stateAtTwenty);
   });
 
   it('replays from the top when a repeated track only ever ended, with no loop of its own', () => {
@@ -205,11 +236,9 @@ describe('createActiveLoopTracker', () => {
     play(100);
     tracker.advance(machine, registers, ring, track, frames(100));
 
-    play(80); // from frame 20 back up to frame 100
     const result = tracker.advance(machine, registers, ring, track, frames(100));
 
-    expect(result).toEqual({ action: 'looped', frame: 20 });
-    expect(liveState()).toEqual(runUnbrokenTo(frames(20)));
+    expect(result).toEqual({ action: 'due-unheld', frame: 20 });
   });
 
   describe('a queued hand-off', () => {
@@ -275,7 +304,7 @@ describe('createActiveLoopTracker', () => {
 
       const result = tracker.advance(machine, registers, ring, track, frames(100));
 
-      expect(result).toEqual({ action: 'looped', frame: 10 });
+      expect(result).toEqual({ action: 'due-unheld', frame: 10 });
       expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 100 });
 
       play(90);
@@ -292,19 +321,25 @@ describe('createActiveLoopTracker', () => {
       tracker.setQueuedImage(imageAt(60));
       tracker.set({ startFrame: frames(10), endFrame: frames(100) });
       play(100);
-      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe(
+        'due-unheld',
+      );
 
       tracker.queue({ startFrame: frames(60), loop: null });
       tracker.setQueuedImage(imageAt(60));
       tracker.queue(null);
       play(90);
-      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe(
+        'due-unheld',
+      );
 
       tracker.queue({ startFrame: frames(70), loop: null });
       tracker.setQueuedImage(imageAt(60));
       tracker.queue({ startFrame: frames(80), loop: null });
       play(90);
-      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe(
+        'due-unheld',
+      );
     });
   });
 
@@ -324,8 +359,7 @@ describe('createActiveLoopTracker', () => {
       play(1);
       const result = tracker.advance(machine, registers, ring, track, frames(139));
 
-      expect(result).toEqual({ action: 'looped', frame: 75 });
-      expect(liveState()).toEqual(runUnbrokenTo(frames(75)));
+      expect(result).toEqual({ action: 'due-unheld', frame: 75 });
     });
 
     it('lands a queued hand-off at the same point', () => {
@@ -355,14 +389,13 @@ describe('createActiveLoopTracker', () => {
 
       play(1);
       expect(tracker.advance(machine, registers, ring, track, frames(99))).toEqual({
-        action: 'looped',
+        action: 'due-unheld',
         frame: 20,
       });
       expect(tracker.get()).toEqual({ startFrame: 20, endFrame: 100 });
 
-      play(79); // from frame 20 up to the frame before the track's end
       expect(tracker.advance(machine, registers, ring, track, frames(99))).toEqual({
-        action: 'looped',
+        action: 'due-unheld',
         frame: 20,
       });
     });
@@ -387,7 +420,7 @@ describe('createActiveLoopTracker', () => {
 
       play(1);
       expect(tracker.advance(machine, registers, ring, track, frames(11))).toEqual({
-        action: 'looped',
+        action: 'due-unheld',
         frame: 10,
       });
     });
@@ -565,7 +598,9 @@ describe('createActiveLoopTracker', () => {
       tracker.queue({ startFrame: frames(60), loop: null, beforeLanding });
       play(100);
 
-      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe('looped');
+      expect(tracker.advance(machine, registers, ring, track, frames(100)).action).toBe(
+        'due-unheld',
+      );
       expect(beforeLanding).not.toHaveBeenCalled();
 
       play(90);

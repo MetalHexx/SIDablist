@@ -7,6 +7,7 @@ import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidField } from '../registers/sid-fields.js';
 import type { ActiveLoop } from '../timeline/active-loop.js';
 import type { CrossingLines } from '../timeline/crossing-captures.js';
+import type { ShadowCount } from '../timeline/shadow-position.js';
 import type { DeliveryBatch } from './delivery-history.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 
@@ -112,6 +113,35 @@ export interface SidPlayer {
   /** Leaves varispeed. Playing: hands back to live playback with no seam. Otherwise: the player is
    *  left paused at the position. A no-op outside varispeed. Notifies. */
   leaveVarispeed(): void;
+  /** Lands the playhead on `at`: the voices released and struck again, as a jump lands, playing from the
+   *  register record while the machine is rebuilt ahead, then handing back to the machine. A bare frame
+   *  (`getPosition()`'s unit) lands with no gate-off pending; a `ShadowCount` lands with its phase
+   *  (`held`). Works from live play and from inside varispeed (it drops any rate source). `settings` are
+   *  applied at the landing. Returns false, changing nothing, when no record is held, the frame lies past
+   *  it, or the transport is not playing. Notifies. */
+  land(at: Frames | ShadowCount, settings?: JumpSettings): boolean;
+
+  // The shadow position
+  /** Starts (or re-bases) the shadow: a count that advances one frame per tick while the transport is
+   *  playing and is unmoved by jumps, loops, landings and varispeed. It laps `loop` when one is given,
+   *  otherwise wraps where the track wraps. It counts from `from`, or from the player's own position and
+   *  phase when `from` is omitted. False with no tune. Notifies. */
+  startShadow(loop: ActiveLoop, from?: ShadowCount): boolean;
+  /** Stops the shadow. A load, a subtune change and a stop stop it too. Notifies. */
+  stopShadow(): void;
+  /** The frame the shadow counts now, or null when it is stopped. For painting: a pulled read that never
+   *  notifies. */
+  getShadowPosition(): Frames | null;
+  /** The shadow's exact count, frame and phase, or null when it is stopped. For re-basing and
+   *  `countAfter`. */
+  getShadowCount(): ShadowCount | null;
+  /** Ticks counted since the shadow last started or re-based, or null when it is stopped. */
+  getShadowTicks(): number | null;
+  /** Lands the playhead on the shadow's count, frame and phase, as `land` does. When the live player
+   *  already reads that count and phase, it sends nothing, applies no `settings` and returns true. False,
+   *  changing nothing, where `land` would be, or with the shadow stopped. The shadow keeps running: the
+   *  host stops it. */
+  landOnShadow(settings?: JumpSettings): boolean;
 
   // Rate
   setTempo(multiplier: number): void;

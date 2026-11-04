@@ -32,7 +32,7 @@ import {
 import type { ReplayRunner } from '../replay/replay-runner.js';
 import type { ReplayResult } from '../replay/replay-to-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
-import { createActiveLoopTracker } from '../timeline/active-loop.js';
+import { REENTRY_GATE_OFF_FRAMES, createActiveLoopTracker } from '../timeline/active-loop.js';
 import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
@@ -46,6 +46,9 @@ import type {
   CrossingLines,
   ImageBuffer,
 } from '../timeline/crossing-captures.js';
+import { seekToFrame } from '../timeline/seek.js';
+import { ShadowPosition } from '../timeline/shadow-position.js';
+import type { ShadowCount } from '../timeline/shadow-position.js';
 import { createTrackStructure } from '../timeline/track-structure.js';
 import type { DetectedLoopFrames, TrackStructure } from '../timeline/track-structure.js';
 import { cycles, frames, microseconds, milliseconds } from '../units.js';
@@ -111,15 +114,6 @@ const NO_VOICES_MUTED: readonly boolean[] = [false, false, false];
  */
 const HANDBACK_LEAD_SECONDS = 2;
 const HANDBACK_LEAD_MS = milliseconds(HANDBACK_LEAD_SECONDS * 1000);
-
-/**
- * The frame slots a re-entry's resync takes before its start frame plays while playing: the one
- * gate-off frame `gateOffOwed` releases in a tick of its own. The active-loop tracker wraps this
- * many frames before a loop's end, so the gate-off takes the place of the loop's last frame rather
- * than being added after it. Without that, every lap ran one tick longer than the loop, and a short
- * loop drifted behind a long one at the same tempo — by one tick per lap of the short one.
- */
-const REENTRY_GATE_OFF_FRAMES = 1;
 
 /** The most deliveries the history will keep: about 170 KB at the ceiling, which is the memory a
  *  host's request is allowed to cost. */
@@ -274,6 +268,15 @@ class SidPlayerCoordinator implements SidPlayer {
    *  it. Riding the clock is what gives each of them a frame slot and a due time of its own; sent
    *  between ticks they would share one slot and the release window would collapse. */
   private gateOffOwed = false;
+  /** The gate-off a landing on a bare frame owes takes the tick an undisturbed player would have
+   *  played the next frame on, so that tick moves the position and the record on by one without
+   *  sounding. Every other gate-off (a lap, a landing on a held count) leaves them where they are,
+   *  as a live one does. Cleared with the handback it belongs to. */
+  private gateOffAdvances = false;
+
+  /** The second, counted position: moves one tick at a time while playing, whatever the playhead
+   *  does. */
+  private readonly shadow = new ShadowPosition();
 
   /** The record-driven half of varispeed: the playhead, the record and the feed. */
   private readonly varispeed: Varispeed = createVarispeed();
@@ -466,6 +469,7 @@ class SidPlayerCoordinator implements SidPlayer {
   loadTune(file: SidFile): void {
     const varispeedOwnedClock = this.varispeedActive && this.transport !== 'playing';
     this.leaveVarispeedForRebuild();
+    this.shadow.stop();
     if (!varispeedOwnedClock && (this.transport === 'playing' || this.transport === 'paused')) {
       this.clock.stop();
       this.sink.end();
@@ -621,6 +625,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // below are what stop a clock varispeed was running.
     this.endVarispeed();
     this.haltPlayback();
+    this.shadow.stop();
     // Landing a jump still in flight would restart playback at a position nobody asked for, and the
     // re-init below invalidates whatever it was carrying anyway.
     this.session.discardOutstandingJump();
@@ -706,6 +711,7 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     this.history?.restart();
     this.leaveVarispeedForRebuild();
+    this.shadow.stop();
     this.varispeed.setRecord(null);
     // Every entry image describes a machine the re-init has just replaced — the track's own and
     // whichever loop is presently active alike — and so does every frame declared against it. The
@@ -1016,6 +1022,68 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
 
+    this.beginHandback();
+    this.markDirty();
+  }
+
+  /**
+   * Lands the playhead on `at`. The record plays from there while the machine's image is replayed
+   * ahead, and the machine takes over when the playhead reaches it, as when the host leaves varispeed.
+   * Unlike that handback this is a jump: the history restarts and a resync is owed, the gate-off
+   * leading a full re-emit.
+   *
+   * A bare frame lands with no gate-off pending, so the gate-off tick takes the slot of the tick an
+   * undisturbed player at that frame would play next and moves the position on by one. A held count
+   * lands as it stands: its gate-off tick leaves the position where it is.
+   */
+  land(at: Frames | ShadowCount, settings?: JumpSettings): boolean {
+    const target = typeof at === 'number' ? at : at.frame;
+    const held = typeof at === 'number' ? false : at.held;
+    const record = this.varispeed.record;
+    if (
+      this.session.file === null ||
+      this.session.frame === null ||
+      record === null ||
+      this.transport !== 'playing'
+    ) {
+      return false;
+    }
+    if (!Number.isFinite(target)) {
+      console.warn(`SID player: ignoring a landing on ${target}.`);
+      return false;
+    }
+    const landing = frames(Math.max(0, Math.round(target)));
+    if (landing > record.frames) return false;
+
+    const prepared = settings === undefined ? null : this.prepareSettings(settings);
+    this.dropHandback();
+    if (prepared !== null) this.applyPreparedSettings(prepared);
+    // Before the resync, like every restart: the landing is where the stream goes somewhere else.
+    this.history?.restart();
+    this.putRecordAt(landing, held);
+    this.beginHandback();
+    this.markDirty();
+    return true;
+  }
+
+  /** The record takes the stream at `position` with the machine left behind: any jump still in
+   *  flight is dropped, the varispeed playhead is placed (the next feed writes the whole entry), and
+   *  a resync is owed. `held` says whether the gate-off leaves the position where it is. */
+  private putRecordAt(position: Frames, held: boolean): void {
+    this.session.discardOutstandingJump();
+    if (!this.varispeedActive) {
+      this.varispeedActive = true;
+      this.varispeedRun++;
+    }
+    this.varispeed.begin(position);
+    this.session.framesRendered = frames(Math.floor(this.varispeed.position));
+    this.gateOffAdvances = !held;
+    this.queueResync();
+  }
+
+  /** Drops the rate source and hands the stream back to the machine: the record plays at rate 1
+   *  while an image is replayed `HANDBACK_LEAD_SECONDS` ahead of the playhead. */
+  private beginHandback(): void {
     this.rateSource = null;
     this.handingBack = true;
     this.session.frame?.setRatePitch(1);
@@ -1024,7 +1092,64 @@ class SidPlayerCoordinator implements SidPlayer {
       msToPlayCalls(HANDBACK_LEAD_MS, this.nominalIntervalUs, this.playRate()),
     );
     void this.requestHandbackImage();
+  }
+
+  /**
+   * Starts the shadow, or re-bases it. With no `from` it counts from the player's own position and
+   * phase: a pending gate-off that will leave the position where it is makes the count held.
+   */
+  startShadow(loop: ActiveLoop, from?: ShadowCount): boolean {
+    if (this.session.file === null) return false;
+    const origin = from ?? {
+      frame: this.session.framesRendered,
+      held: this.gateOffOwed && !this.gateOffAdvances,
+    };
+    if (
+      !Number.isFinite(origin.frame) ||
+      (loop !== null && (!Number.isFinite(loop.startFrame) || !Number.isFinite(loop.endFrame)))
+    ) {
+      console.warn('SID player: ignoring a shadow started on a frame that is not a number.');
+      return false;
+    }
+    this.shadow.start(loop, {
+      frame: frames(Math.max(0, Math.round(origin.frame))),
+      held: origin.held,
+    });
     this.markDirty();
+    return true;
+  }
+
+  stopShadow(): void {
+    if (!this.shadow.isRunning()) return;
+    this.shadow.stop();
+    this.markDirty();
+  }
+
+  getShadowPosition(): Frames | null {
+    return this.shadow.position();
+  }
+
+  getShadowCount(): ShadowCount | null {
+    return this.shadow.count();
+  }
+
+  getShadowTicks(): number | null {
+    return this.shadow.tickCount();
+  }
+
+  landOnShadow(settings?: JumpSettings): boolean {
+    const count = this.shadow.count();
+    if (count === null) return false;
+    const record = this.varispeed.record;
+    if (record === null || count.frame > record.frames || this.transport !== 'playing') {
+      return false;
+    }
+    const there =
+      !this.varispeedActive &&
+      this.session.framesRendered === count.frame &&
+      this.gateOffOwed === count.held;
+    if (there) return true;
+    return this.land(count, settings);
   }
 
   /** A divisor on the clock and nothing else, which is what makes a tempo change nearly free. The
@@ -1395,6 +1520,11 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
 
+    // Counted before anything else this tick does, so a listener a tick wakes reads the shadow and
+    // the position of the same tick. A paused player's shadow stands still, even while a non-playing
+    // varispeed runs the clock.
+    if (this.transport === 'playing') this.shadow.tick(this.track);
+
     if (this.varispeedActive) {
       this.varispeedTick(machine, frame, dueAtMs, catchUpClamped);
       return;
@@ -1516,6 +1646,10 @@ class SidPlayerCoordinator implements SidPlayer {
    * While handing back the rate is 1 and the loop in force is enforced as a live tick enforces it.
    * Once the playhead reaches the frame of the image the handback is waiting on, the machine takes
    * over from it.
+   *
+   * A pending gate-off (a landing's, or a lap on the record's) takes the tick's slot: the record is
+   * not fed and the gate-off goes out. A landing on a bare frame moves the position and the record
+   * on by one meanwhile; every other leaves them where they are, as a live gate-off tick does.
    */
   private varispeedTick(
     machine: C64Machine,
@@ -1524,23 +1658,32 @@ class SidPlayerCoordinator implements SidPlayer {
     catchUpClamped: boolean,
   ): void {
     const varispeed = this.varispeed;
-    let rate = 1;
-    if (!this.handingBack) {
-      try {
-        rate = this.rateSource === null ? 0 : this.rateSource(varispeed.position, this.tickUs());
-      } catch (error) {
-        this.fail(`the varispeed rate source threw — ${describeError(error)}`);
-        return;
+    if (this.gateOffOwed) {
+      this.gateOffOwed = false;
+      this.lastCyclesUsed = cycles(0);
+      this.deliver(this.gateOffFrame(), dueAtMs, catchUpClamped);
+      if (!this.gateOffAdvances) return;
+      this.gateOffAdvances = false;
+      varispeed.moveBy(1);
+    } else {
+      let rate = 1;
+      if (!this.handingBack) {
+        try {
+          rate = this.rateSource === null ? 0 : this.rateSource(varispeed.position, this.tickUs());
+        } catch (error) {
+          this.fail(`the varispeed rate source threw — ${describeError(error)}`);
+          return;
+        }
+        if (!Number.isFinite(rate)) rate = 0;
       }
-      if (!Number.isFinite(rate)) rate = 0;
-    }
 
-    // A handback tick runs the loop through `enforceLoop`, so it is never held.
-    const travelled = varispeed.moveBy(rate, this.handingBack ? null : this.activeLoop.get());
-    varispeed.feed(frame);
-    frame.setRatePitch(Math.abs(travelled));
-    this.lastCyclesUsed = cycles(0);
-    this.deliver(frame.takeSnapshot(), dueAtMs, catchUpClamped);
+      // A handback tick runs the loop through `enforceLoop`, so it is never held.
+      const travelled = varispeed.moveBy(rate, this.handingBack ? null : this.activeLoop.get());
+      varispeed.feed(frame);
+      frame.setRatePitch(Math.abs(travelled));
+      this.lastCyclesUsed = cycles(0);
+      this.deliver(frame.takeSnapshot(), dueAtMs, catchUpClamped);
+    }
     this.session.framesRendered = frames(Math.floor(varispeed.position));
 
     if (!this.handingBack) return;
@@ -1558,15 +1701,26 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Runs whatever loop is in force against the frame just rendered: a lap re-enters and owes the
    *  stream a resync, as does a hand-off to a queued jump; a track end with repeat off ends the
    *  track. Each of those ends a handback, so every branch that moves the stream also ends
-   *  varispeed. Reports what it did. */
+   *  varispeed, except a lap with no entry image held whose start the record covers: that one goes
+   *  on the record and the handback carries on. Reports what it did. */
   private enforceLoop(machine: C64Machine, frame: RegisterFrame): AdvanceResult['action'] {
-    const outcome = this.activeLoop.advance(
+    let outcome = this.activeLoop.advance(
       machine,
       frame,
       this.ring,
       this.track,
       this.session.framesRendered,
     );
+    if (outcome.action === 'due-unheld') {
+      const record = this.varispeed.record;
+      if (record !== null && outcome.frame <= record.frames) {
+        this.lapOnRecord(outcome.frame);
+        return outcome.action;
+      }
+      // Nothing covers the start: the replay the tracker held back runs here, as it always has.
+      if (seekToFrame(machine, frame, this.ring, outcome.frame) === null) return 'none';
+      outcome = { action: 'looped', frame: outcome.frame };
+    }
     if (outcome.action === 'looped') {
       this.endVarispeed();
       this.session.framesRendered = outcome.frame;
@@ -1592,6 +1746,23 @@ class SidPlayerCoordinator implements SidPlayer {
       this.endTrack();
     }
     return outcome.action;
+  }
+
+  /**
+   * A lap with no entry image held re-enters on the record at the loop's start, so it never replays
+   * on this thread: the record position moves to the start and the lap's resync is owed, a gate-off
+   * that leaves the position where it is. In live play it starts a handback; one already under way
+   * carries on, with the image it asked for. The loop's own entry image is asked for here as well,
+   * which ends the handback at the next lap once it is built. A lap is not a discontinuity, so the
+   * history is not restarted.
+   */
+  private lapOnRecord(startFrame: Frames): void {
+    const handingBack = this.handingBack;
+    this.putRecordAt(startFrame, true);
+    if (!handingBack) this.beginHandback();
+    const loop = this.activeLoop.get();
+    if (loop !== null) void this.captureActiveLoopEntry(loop);
+    this.markDirty();
   }
 
   /**
@@ -1667,6 +1838,7 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Abandons the handback, and with it any image request still on its way. */
   private dropHandback(): void {
     this.handingBack = false;
+    this.gateOffAdvances = false;
     this.handbackImage = null;
     this.handbackGeneration++;
   }
@@ -2204,6 +2376,7 @@ class SidPlayerCoordinator implements SidPlayer {
               loopChange: this.activeLoop.pendingChange(),
               handOffs: this.handOffs,
               recordedFrames: this.recordedFrames(),
+              shadowRunning: this.shadow.isRunning(),
             },
       tempo: {
         multiplier: this.tempoMultiplier,

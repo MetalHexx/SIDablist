@@ -64,6 +64,9 @@ export interface PlayerSnapshot {
     readonly handOffs: number;
     /** The register record's length in play calls, or null without a record. */
     readonly recordedFrames: Frames | null;
+    /** True from `startShadow` until the shadow position stops. The count itself moves every tick
+     *  and is pulled with `getShadowPosition()`. */
+    readonly shadowRunning: boolean;
   } | null;
   readonly tempo: {
     readonly multiplier: number;

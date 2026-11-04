@@ -24,10 +24,26 @@ export type ActiveLoop = {
   readonly varispeedStart?: VarispeedLoopStart;
 } | null;
 
+/**
+ * The frame slots a re-entry's resync takes before its start frame plays while playing: the one
+ * gate-off frame a landed jump owes the stream in a tick of its own. The player hands the tracker this
+ * many frames of lead (`wrapLeadFrames`) so the gate-off takes the place of the loop's last frame
+ * rather than being added after it. Without that, every lap ran one tick longer than the loop, and a
+ * short loop drifted behind a long one at the same tempo, by one tick per lap of the short one.
+ *
+ * Lives here because the shadow position counts laps by the same lead.
+ */
+export const REENTRY_GATE_OFF_FRAMES = 1;
+
 /** What `advance` did on a given frame. */
 export type AdvanceResult =
   | { readonly action: 'none' }
   | { readonly action: 'looped'; readonly frame: Frames }
+  /** A wrap is due, no entry image is held for the loop's start, and re-entering it would replay
+   *  frames on the calling thread. The machine is untouched; the loop is armed if it was the
+   *  track's own. `frame` is the loop's start. The caller re-enters it some other way — on the
+   *  register record — or runs `seekToFrame` itself. */
+  | { readonly action: 'due-unheld'; readonly frame: Frames }
   | { readonly action: 'handed-off'; readonly frame: Frames }
   | { readonly action: 'stopped' };
 
@@ -77,7 +93,8 @@ export interface ActiveLoopTracker {
    * The image a lap re-enters through in place of a replay along the anchor path — a snapshot
    * taken exactly at the presently active loop's start frame, whichever loop that is: the track's
    * own or a performer's marker loop alike, this tracker enforces either one identically once it
-   * holds an image for it. Null falls back to `seekToFrame`.
+   * holds an image for it. Null falls back to the anchor ring: a wrap that would replay frames from it is
+   * reported as `due-unheld` for the caller to re-enter.
    *
    * Invalidated by a subtune re-init or a new detection landing — both machine-level events core
    * has no other signal of here, so the caller owns clearing it when either happens. Dropping it at
@@ -126,6 +143,11 @@ export interface ActiveLoopTracker {
    * thing — and enters it immediately, so every later lap over the same track is the ordinary case
    * above.
    *
+   * A wrap with no entry image held whose start lies past the anchor `ring` would restore replays
+   * frames: the tracker leaves the machine untouched and reports `due-unheld` at the start (arming
+   * the track's own loop first, when that is what wrapped) instead of seeking. A start the ring's
+   * anchor already sits at, such as the track's wrap to frame 0, is still restored here.
+   *
    * A seek that comes back with nothing to seek from (the ring holds no usable anchor) leaves the
    * pair and the active loop untouched and reports `none` rather than claim a lap that did not
    * happen; the same check runs again next frame.
@@ -137,6 +159,12 @@ export interface ActiveLoopTracker {
     track: TrackStructure,
     framesRendered: Frames,
   ): AdvanceResult;
+}
+
+/** The frame count at which a wrap of `startFrame`..`endFrame` falls due: `lead` frames before the
+ *  end, but no earlier than one frame past the start, so the start frame is always rendered. */
+export function wrapDueFrame(startFrame: number, endFrame: number, lead: number): number {
+  return Math.max(startFrame + 1, endFrame - lead);
 }
 
 /** How a tracker times its wraps. */
@@ -167,26 +195,26 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
   let unchanged: ActiveLoop = null;
 
   /** Re-enters `startFrame`, preferring the held entry image over a seek. Returns the frame landed
-   *  on, or null when neither is possible and the pair was left untouched. */
+   *  on; `'unheld'` when neither an image nor a replay-free anchor is at hand, leaving the pair
+   *  untouched; or null when there is nothing to seek from at all. */
   function enter(
     machine: C64Machine,
     frame: RegisterFrame,
     ring: AnchorRing,
     startFrame: Frames,
-  ): Frames | null {
+  ): Frames | 'unheld' | null {
     if (entryImage !== null) {
       machine.restore(entryImage.machine);
       frame.restoreValues(entryImage.registers);
       return entryImage.frame;
     }
+    const anchor = ring.select(startFrame);
+    if (anchor !== null && anchor.frame < startFrame) return 'unheld';
     return seekToFrame(machine, frame, ring, startFrame) === null ? null : startFrame;
   }
 
-  /** The frame count at which a wrap of `startFrame`..`endFrame` falls due: `lead` frames before the
-   *  end, but no earlier than one frame past the start, so the start frame is always rendered. */
-  function wrapDueAt(startFrame: Frames, endFrame: Frames): number {
-    return Math.max(startFrame + 1, endFrame - lead);
-  }
+  const wrapDueAt = (startFrame: Frames, endFrame: Frames): number =>
+    wrapDueFrame(startFrame, endFrame, lead);
 
   return {
     get: (): ActiveLoop => loop,
@@ -259,6 +287,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
           return { action: 'looped', frame: image.frame };
         }
         const landed = enter(machine, frame, ring, loop.startFrame);
+        if (landed === 'unheld') return { action: 'due-unheld', frame: loop.startFrame };
         return landed === null ? { action: 'none' } : { action: 'looped', frame: landed };
       }
 
@@ -273,6 +302,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
       const landed = enter(machine, frame, ring, start);
       if (landed === null) return { action: 'none' };
       loop = { startFrame: start, endFrame: trackEnd };
+      if (landed === 'unheld') return { action: 'due-unheld', frame: start };
       return { action: 'looped', frame: landed };
     },
   };

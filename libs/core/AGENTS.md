@@ -29,7 +29,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   operations core owns. An `ActiveLoop` may carry `varispeedStart`, which varispeed alone reads.
   `ActiveLoopTracker.changeAt` names a change of loop for the lap that ends at a frame.
   `crossing-captures.ts` is the bounded pool of images saved as the playhead crosses declared lines
-  (`CrossingLines`) and the arithmetic that says when to save one.
+  (`CrossingLines`) and the arithmetic that says when to save one. `shadow-position.ts` is the
+  counter behind the shadow position and `countAfter`, the pure arithmetic a host folds its own
+  count with.
 - `player/` — `createSidPlayer`, the composition root wiring the above into `SidPlayer`, plus
   `PlayerSnapshotStore` and the `PlayerSnapshot`/`PlayerStats` shapes a consumer reads. The jump
   surface: `setJumpTargets` declares the frames built ahead into ready snapshots (readiness and the
@@ -47,7 +49,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   and `holdsImageAt` says whether an entry image exists for a frame (prepared, cached or saved at a
   crossing); a loop set at such a frame re-enters from the saved image with no replay.
   `changeLoopAt` changes a running loop's bounds from the lap that ends on a named frame, published
-  as `tune.loopChange`.
+  as `tune.loopChange`. The shadow position (`startShadow`, `getShadowPosition`, `getShadowCount`,
+  `getShadowTicks`) is a second count that moves a frame a tick while playing, wherever the
+  playhead goes, and is pulled like `getPosition()`; `land` and `landOnShadow` put the playhead on
+  a frame the register record covers, playing from the record while the machine is rebuilt ahead.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
@@ -94,13 +99,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **A lap is not a discontinuity; a landing is.** The history restarts where the playhead goes
   somewhere else (load, stop, a fresh play, a subtune change, a restore, a queued-jump hand-off) and
   nowhere a lap, pause, resume or varispeed entry or exit passes through. Restart in the arrow handed
-  to `createTuneSession` and in `enforceLoop`'s `'handed-off'` branch, before `queueResync()` — never
-  inside `queueResync()` itself, which the `'looped'` branch also calls.
+  to `createTuneSession`, in `enforceLoop`'s `'handed-off'` branch and in `land`, before
+  `queueResync()` — never inside `queueResync()` itself, which the `'looped'` branch also calls.
 - **A wrap falls due one frame before the end it wraps at, not at it.** Every re-entry — a lap, a
   queued hand-off, a repeating track's wrap — owes the stream a gate-off in a tick of its own, and
-  `create-sid-player.ts` hands the tracker that lead (`REENTRY_GATE_OFF_FRAMES`, the tracker's
-  `wrapLeadFrames`) so the gate-off takes the loop's last slot and a lap is exactly
-  `endFrame - startFrame` ticks. Wrapping at the end again, or adding a step a re-entry owes
+  `create-sid-player.ts` hands the tracker that lead (`REENTRY_GATE_OFF_FRAMES`, exported by
+  `timeline/active-loop.ts`, the tracker's `wrapLeadFrames`) so the gate-off takes the loop's last
+  slot and a lap is exactly `endFrame - startFrame` ticks. Wrapping at the end again, or adding a step a re-entry owes
   without raising the lead, makes every lap a tick longer than its loop: two loops at one tempo
   whose lengths are exact multiples drift apart by a tick per lap of the shorter one, audibly
   within a minute of a two-deck mix, and only the `lap timing` specs catch it. A repeat-off stop
@@ -210,6 +215,25 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Every exit from varispeed returns the rate pitch to home through `endVarispeed`.** The rate pitch
   lives on the `RegisterFrame`, which `stop()` and a subtune change keep, so one left at 0 silences
   the next play. A new exit calls the one routine rather than setting the pitch itself.
+- **A lap with no entry image whose start the record covers goes on the record, never through
+  `seekToFrame`.** `ActiveLoopTracker.advance` reports `due-unheld` for a wrap that would replay
+  frames from the anchor ring, and `enforceLoop` then moves the record position to the loop's start
+  and owes the lap's resync, starting a handback in live play or carrying on the one under way. It
+  runs the seek only when the record does not cover the start. The track's own wrap to frame 0 is a
+  pure restore of the ring's seed and stays a `looped`. A lap on the record owes the stream a gate-off
+  that leaves the position where it is, as every other lap does, and is not a discontinuity.
+- **A landing is a jump, and its gate-off is a varispeed tick's to honour.** `land` restarts the
+  history, then owes a gate-off and a full re-emit; the varispeed branch of `onTick` returns before
+  the `gateOffOwed` check, so `varispeedTick` takes the pending gate-off itself. A landing on a bare
+  frame moves the position and the record on by one on that tick (`gateOffAdvances`); a landing on a
+  held count, and a lap, leave them where they are. Alignment with an undisturbed player is exact
+  and only the shadow's spec pair catches a slip of a frame.
+- **The shadow counts in `getPosition()`'s unit with the lap's lead.** `ShadowPosition` and
+  `countAfter` wrap `REENTRY_GATE_OFF_FRAMES` early through `wrapDueFrame`, the tracker's own
+  rule; a copy that wraps at the end drifts a frame a lap from the position it shadows. It ticks
+  at the top of `onTick` while the transport is `'playing'` and never while paused, even with a
+  non-playing varispeed running the clock, and it never notifies: only starting and stopping it
+  does (`tune.shadowRunning`).
 - **A held loop moves the varispeed record, never the machine.** A wrap under varispeed must not
   lap, restore an image or hand off: doing so would apply a queued jump mid-scratch. On a handback
   tick the hold stands aside for `enforceLoop`, since wrapping the record there would hide the loop's
@@ -267,9 +291,17 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Added a variant to `AdvanceResult` (`timeline/active-loop.ts`)?** Every `switch` or branch on
   `action` ripples — `enforceLoop` in `player/create-sid-player.ts` handles each one, and an
   unhandled variant leaves the player's position and the stream out of step without a compile
-  error. Handle it there, then run `player/create-sid-player.spec.ts`. The same branches end a
-  varispeed handback: a variant that moves the stream but does not call `endVarispeed` leaves the
-  player in varispeed with a position the machine has abandoned.
+  error. Handle it there, then run `player/create-sid-player.spec.ts` and its `lap timing` specs.
+  The same branches end a varispeed handback: a variant that moves the stream but does not call
+  `endVarispeed` leaves the player in varispeed with a position the machine has abandoned.
+  `due-unheld` is the one that does not end it on purpose: it goes on the record and the handback
+  carries on.
+- **Changed how the player's position moves on a tick or a lap (`onTick`, `varispeedTick`,
+  `wrapDueFrame`, `REENTRY_GATE_OFF_FRAMES`)?** The shadow position (`timeline/shadow-position.ts`)
+  counts the same moves, and a host folds its own count with `countAfter`: a shifted lap length or
+  gate-off tick makes it drift from `getPosition()` with no compile error. Change both and run
+  `timeline/shadow-position.spec.ts` and the `the shadow position and landing on a frame` specs in
+  `player/create-sid-player.spec.ts`.
 - **Changed `QueuedNext` or the hand-off order in `advance` (`timeline/active-loop.ts`)?**
   `queueJump` in `player/create-sid-player.ts` builds the `beforeLanding` hook and relies on it
   running ahead of the image restore; moved after it, a voice a landing unmutes stays at 0 until the
