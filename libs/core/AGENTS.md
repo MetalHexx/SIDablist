@@ -227,7 +227,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   the `gateOffOwed` check, so `varispeedTick` takes the pending gate-off itself. A landing on a bare
   frame moves the position and the record on by one on that tick (`gateOffAdvances`); a landing on a
   held count, and a lap, leave them where they are. Alignment with an undisturbed player is exact
-  and only the shadow's spec pair catches a slip of a frame.
+  and only the shadow's spec pair catches an off-by-one frame.
 - **The shadow counts in `getPosition()`'s unit with the lap's lead.** `ShadowPosition` and
   `countAfter` wrap `REENTRY_GATE_OFF_FRAMES` early through `wrapDueFrame`, the tracker's own
   rule; a copy that wraps at the end drifts a frame a lap from the position it shadows. It ticks
