@@ -41,11 +41,17 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   from the record; `computePulse`, `impliedTempo` and `marker-moments.ts` stay exported for hosts
   that still call them.
 - `grid-lines.ts` — the arithmetic over a `BeatGrid`, in frames and with no notion of what a person
-  wants: `lengthLadder` (the lengths a loop can take at a beat length), `gridLine` (line `index` of
-  lines `periodFrames` apart), `loopStartAtOrBefore` (where a loop of a length starts at or behind a
-  frame), `shrinkLanding` (where a shrink takes effect) and `foldIntoLoop` (a frame folded into a
-  loop by whole laps). Every line is `Math.round`ed to a whole frame, so a host's grid with float
-  noise in `beatFrames` still lands on frames.
+  wants: `lengthLadder` (the lengths a loop can take at a beat length: powers of two from 1/16 to 128
+  beats, each at least 2 frames, a fractional frame count kept as it is and one within 1e-9 of a whole
+  number snapped to it), `gridLine` (line `index` of lines `periodFrames` apart), `loopStartAtOrBefore`
+  (where a loop of a length starts at or behind a frame), `lapPhaseAt` (the unrounded position of the
+  line a start frame rounds from), `shrinkLanding` (where a shrink takes effect), `foldIntoLoop` (a
+  frame folded into a loop by whole laps) and `lapPhaseOfFold` (the phase of the lap it folds into).
+  Every line is `Math.round`ed to a whole frame, so a host's grid with float noise in `beatFrames`
+  still lands on frames. A ladder length that is not a whole number of frames is lapped by core in
+  alternating whole-frame lengths, and `shrinkLanding`, `foldIntoLoop` and the two phase helpers take
+  an optional lap phase and count laps through core's `lapLength`, `lapSpan` and `lapsWithin`,
+  imported from `@sidablist/core`; without one they count whole laps of `endFrame - startFrame`.
 - `tune-index.model.ts` — `TuneIndexRecord` and `TUNE_INDEX_FORMAT_VERSION`, the persisted shape
   and its compatibility gate.
 - `tune-index-readouts.ts`, `tune-length.ts`, `marker-moments.ts`, `format.ts` — display-facing
@@ -109,6 +115,16 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   both and run this module's `grid-lines.spec.ts` and core's `crossing-captures.spec.ts` and the
   `crossing captures` specs in `player/create-sid-player.spec.ts`. Detail:
   [`libs/core/AGENTS.md`](../core/AGENTS.md).
+
+- **Changed how a lap's end rounds, or the ladder's rungs (`lengthLadder`, `lapPhaseAt`, `shrinkLanding`,
+  `foldIntoLoop`, `lapPhaseOfFold`)?** `libs/core`'s `lapLength`, `lapSpan` and `lapsWithin`
+  (`timeline/active-loop.ts`) decide where each lap of a fractional length ends, with the same
+  `Math.round` as `gridLine`, and the tracker and the shadow count laps by them; a helper here that
+  counts laps another way compiles and passes the type-checker while a host's folded count or landing
+  sits a frame off the lap the player is actually in, and a rung that drops below core's
+  `MIN_FRACTIONAL_LOOP_FRAMES` while not whole is a loop the player refuses. Change both and run this module's
+  `grid-lines.spec.ts`, and core's `timeline/active-loop.spec.ts` and `timeline/shadow-position.spec.ts`.
+  Detail: [`libs/core/AGENTS.md`](../core/AGENTS.md).
 
 ## Commands
 

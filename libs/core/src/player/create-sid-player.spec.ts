@@ -3271,9 +3271,9 @@ describe('createSidPlayer', () => {
       ]);
     });
 
-    describe('on a 28-frame beat grid, between ⅛-beat markers on the beat lines at 28 and 56', () => {
+    describe('on a 28-frame beat grid, between ⅛-beat loops starting on the beat lines at 28 and 56', () => {
       // An ⅛ beat is 3.5 frames. On a beat line its lap phase is 0, which a host hands in as none,
-      // so each marker laps 4, 3, 4, 3 from its own phase. Restarting every landed marker there
+      // so each loop laps 4, 3, 4, 3 from its own phase. Restarting every landed loop there
       // made each hand-off after a single lap a 4, and 16 of them took 64 ticks, not 56.
       const eighthAt = (start: number): Exclude<ActiveLoop, null> => ({
         startFrame: frames(start),
@@ -3373,8 +3373,8 @@ describe('createSidPlayer', () => {
         expect(at[at.length - 1]).toBe(Math.round(0.5 + 29 * 3.5) - Math.round(0.5));
       });
 
-      it('stays within a frame of the ideal over end-of-pass length edits a lap apart', async () => {
-        // An edit to the running marker's length is a jump queued to its own start.
+      it('stays within a frame of the ideal over queued loops of two lengths landing a lap apart', async () => {
+        // Each hand-off queues the loop's own start at the other length.
         const h = await juggling(eighthAt(28));
 
         const at = handOffTicks(h, [eighthAt(28), quarterAt(28)], Array(16).fill(1));
@@ -3387,7 +3387,7 @@ describe('createSidPlayer', () => {
         expect(at[at.length - 1]).toBe(8 * 7 + 8 * 3.5);
       });
 
-      it('takes exactly 112 ticks over 16 hand-offs between whole 7-frame markers', async () => {
+      it('takes exactly 112 ticks over 16 hand-offs between whole 7-frame loops', async () => {
         const h = await juggling(quarterAt(28));
 
         const at = handOffTicks(h, [quarterAt(28), quarterAt(56)], Array(16).fill(1));

@@ -27,7 +27,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   paced by.
 - `timeline/` — `AnchorRing`, `seekToFrame` and `ActiveLoopTracker`: the position and loop
   operations core owns. An `ActiveLoop` may carry `varispeedStart`, which varispeed alone reads.
-  `ActiveLoopTracker.changeAt` names a change of loop for the lap that ends at a frame.
+  `ActiveLoopTracker.changeAt` names a change of loop for the lap that ends at a frame. A loop whose
+  length is not a whole number of frames laps in alternating whole-frame lengths: `ActiveLoop.lapPhase`
+  is the unrounded grid position its laps are counted from, and `lapLength`, `lapSpan`, `lapsWithin`,
+  `lapPhaseAfter` and `reduceLapPhase` (all exported) are the arithmetic the tracker, the shadow and
+  a host share. `isUsableLoopLength` and `MIN_FRACTIONAL_LOOP_FRAMES` say which lengths may run.
   `crossing-captures.ts` is the bounded pool of images saved as the playhead crosses declared lines
   (`CrossingLines`) and the arithmetic that says when to save one. `shadow-position.ts` is the
   counter behind the shadow position and `countAfter`, the pure arithmetic a host folds its own
@@ -45,6 +49,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   coordinator sequences. `keepDeliveries`/`drainDeliveries` keep a bounded history of every frame
   delivered (`delivery-history.ts`, whose `DeliveryBatch` and `createDeliveryBatch` are public and
   whose `DeliveryHistory` is not), for a host that samples slower than frames are built.
+  `getLapPhase()` reads the running loop's lap in progress, pulled like `getPosition()`.
   `setCrossingCaptures` declares lines the live machine is saved at as the playhead crosses them,
   and `holdsImageAt` says whether an entry image exists for a frame (prepared, cached or saved at a
   crossing); a loop set at such a frame re-enters from the saved image with no replay.
@@ -105,11 +110,35 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   queued hand-off, a repeating track's wrap — owes the stream a gate-off in a tick of its own, and
   `create-sid-player.ts` hands the tracker that lead (`REENTRY_GATE_OFF_FRAMES`, exported by
   `timeline/active-loop.ts`, the tracker's `wrapLeadFrames`) so the gate-off takes the loop's last
-  slot and a lap is exactly `endFrame - startFrame` ticks. Wrapping at the end again, or adding a step a re-entry owes
+  slot and a lap is exactly `endFrame - startFrame` ticks. For a length that is not whole a lap is
+  the whole frames of that lap (`lapLength`), and `endFrame` is only the average end. Wrapping at the end again, or adding a step a re-entry owes
   without raising the lead, makes every lap a tick longer than its loop: two loops at one tempo
   whose lengths are exact multiples drift apart by a tick per lap of the shorter one, audibly
   within a minute of a two-deck mix, and only the `lap timing` specs catch it. A repeat-off stop
   owes nothing and still ends on the track's true last frame.
+- **A loop whose length is not whole laps by rounding the line, never the length.** Lap `k` of a loop
+  at lap phase `p` lasts `Math.round(p + (k+1) × length) - Math.round(p + k × length)` frames
+  (`lapLength`), so any run of laps telescopes to `lapSpan` and each lap end lands on the frame the
+  grid's own line rounds to (`gridLine`). Rounding each lap's length alone, or restarting the phase at
+  each lap, passes every whole-length spec and drifts a frame at a time on a fractional one; only the
+  `lap timing` specs and `timeline/active-loop.spec.ts` catch it.
+- **A queued hand-off laps on from the outgoing loop's clock, not from its own phase.** A queued loop
+  landing at a running loop's wrap takes that loop's next lap phase (`phaseAfterWrap` in
+  `timeline/active-loop.ts`); with a change named, the change's `lapPhase`; the queued loop's own
+  `lapPhase` is used only when the track's own loop hands off. The loop still reads back with the
+  phase it was queued with, so the clock is read from `getLapPhase()`, never off the loop. Restarting
+  each landed loop at its own phase makes every hand-off's rounding permanent and drifts one way down a
+  chain of hand-offs, and only the `a queued loop landing` specs in `timeline/active-loop.spec.ts` and
+  the `a loop whose length is not a whole number of frames` specs in `player/create-sid-player.spec.ts`
+  catch it.
+- **A length that is not whole is at least `MIN_FRACTIONAL_LOOP_FRAMES` (2) long, and per-lap state
+  stays off `PlayerSnapshot`.** Every lap is then at least a play call and its gate-off, so the wrap
+  can fall due. The tracker's `set`, `queue` and `changeAt` refuse a shorter one through
+  `isUsableLoopLength`, and the player's `setActiveLoop`, `changeLoopAt`, `queueJump` and
+  `startShadow` through `isRunnableLoop`; a new entry point that takes a loop must do the same. A lap
+  changes the phase and `markDirty` fires on every lap, so a lap phase published on the snapshot would
+  notify every consumer on every lap of a short loop: `getLapPhase()` is pulled, and
+  `tune.queuedJump.lapPhase` only changes when a jump is queued.
 - **The application names only the far end's clock; the tune's clock is read from its header.**
   `setTargetClock(targetHz)` is held across loads, and `loadTune` derives the tune's φ2 by the
   same `file.clock === 'ntsc'` test that sets its tempo. A source clock taken from the host, or
@@ -282,6 +311,14 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   history, and a shifted meaning of a control write records the wrong byte, with no compile error.
   Record at the new call and run `player/delivery-history.spec.ts` and the `delivery history` specs
   in `player/create-sid-player.spec.ts`.
+- **Changed how a lap's end rounds (`lapLength`, `lapSpan`, `lapsWithin` in `timeline/active-loop.ts`)?**
+  They round with `Math.round`, as `gridLine` and `isOnLine` do, and `libs/analysis`'s
+  `grid-lines.ts` imports them for `shrinkLanding`, `foldIntoLoop`, `lapPhaseAt` and
+  `lapPhaseOfFold`: a lap end one frame off its grid line compiles and passes the type-checker while
+  every loop of a fractional length ends off the grid. Change them together and run
+  `timeline/active-loop.spec.ts`, `timeline/shadow-position.spec.ts`, the `lap timing` specs in
+  `player/create-sid-player.spec.ts` and analysis's `grid-lines.spec.ts`. Detail:
+  [`libs/analysis/src/grid-lines.ts`](../analysis/src/grid-lines.ts).
 - **Changed how a crossing line rounds (`isOnLine` in `timeline/crossing-captures.ts`)?**
   `libs/analysis`'s `gridLine` names the frames a host declares lines at by the same
   `Math.round(origin + k × period)`; a line off by one saves an image no loop can start from, with no
@@ -305,7 +342,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **Changed `QueuedNext` or the hand-off order in `advance` (`timeline/active-loop.ts`)?**
   `queueJump` in `player/create-sid-player.ts` builds the `beforeLanding` hook and relies on it
   running ahead of the image restore; moved after it, a voice a landing unmutes stays at 0 until the
-  tune writes its control register again, and nothing fails to compile. Update `queueJump`'s hook,
+  tune writes its control register again, and nothing fails to compile. `advance` also reads
+  `phaseAfterWrap` before the landing changes anything; read after, a queued loop laps from its own
+  phase and the hand-offs drift. Update `queueJump`'s hook,
   then run the `jump settings` specs in `player/create-sid-player.spec.ts` and
   `timeline/active-loop.spec.ts`. Detail: [`src/player/create-sid-player.ts`](./src/player/create-sid-player.ts)
 - **Changed `ReplayRequest`'s shape (`replay/replay-runner.ts`)?** `replay/replay.worker.ts` unpacks
