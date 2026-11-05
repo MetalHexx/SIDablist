@@ -7,6 +7,16 @@ export {
   type NoteStarts,
   type BeatGridDetection,
 } from './beat-grid.js';
+export {
+  lengthLadder,
+  gridLine,
+  loopStartAtOrBefore,
+  lapPhaseAt,
+  shrinkLanding,
+  foldIntoLoop,
+  lapPhaseOfFold,
+  type LadderSize,
+} from './grid-lines.js';
 export { formatCents, formatDuration } from './format.js';
 export {
   readFrameFeatures,

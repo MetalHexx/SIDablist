@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { createC64Machine, type SidWriteSink, UnplayableTuneError } from './c64-machine.js';
+import {
+  copyMachineImage,
+  createC64Machine,
+  createMachineImage,
+  type SidWriteSink,
+  UnplayableTuneError,
+} from './c64-machine.js';
 import {
   NTSC_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_FRAME,
@@ -420,6 +426,46 @@ describe('C64Machine on the bundled tunes', () => {
       for (let i = 0; i < 30; i++) machine.runFrame();
 
       expect(snapshot.memory).toEqual(memoryAtCapture);
+    }, 20_000);
+
+    it('fills an image the caller holds with exactly what snapshot() would have returned', () => {
+      const machine = createC64Machine(bundled('still-time'), new RecordingSink());
+      machine.initSubtune(1);
+      for (let i = 0; i < 20; i++) machine.runFrame();
+      const image = createMachineImage();
+      const memory = image.memory;
+      const cpu = image.cpu;
+
+      machine.snapshotInto(image);
+
+      expect(image).toEqual(machine.snapshot());
+      expect(image.memory).toBe(memory);
+      expect(image.cpu).toBe(cpu);
+      // Refilled in place, it still holds what it was given when the machine runs on.
+      const atCapture = image.memory.slice();
+      for (let i = 0; i < 30; i++) machine.runFrame();
+      expect(image.memory).toEqual(atCapture);
+    }, 20_000);
+
+    it('restores a machine from an image filled in place as it does from a snapshot', () => {
+      const sink = new RecordingSink();
+      const machine = createC64Machine(bundled('still-time'), sink);
+      machine.initSubtune(1);
+      for (let i = 0; i < 20; i++) machine.runFrame();
+      const image = createMachineImage();
+      machine.snapshotInto(image);
+      const copy = createMachineImage();
+      copyMachineImage(image, copy);
+      const fromImage = sink.writes.length;
+      for (let i = 0; i < 30; i++) machine.runFrame();
+      const expected = sink.writes.slice(fromImage);
+
+      machine.restore(copy);
+      const fromRestore = sink.writes.length;
+      for (let i = 0; i < 30; i++) machine.runFrame();
+
+      expect(sink.writes.slice(fromRestore)).toEqual(expected);
+      expect(expected.length).toBeGreaterThan(0);
     }, 20_000);
 
     it('rewinds an advanced machine to an earlier capture', () => {

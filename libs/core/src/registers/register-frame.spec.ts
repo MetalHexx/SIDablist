@@ -595,6 +595,21 @@ describe('RegisterFrame', () => {
       expect(frame.snapshotValues().values[24]).toBe(0x2f);
     });
 
+    it('copies the raw values into a snapshot it was given, as snapshotValues() would', () => {
+      const frame = createRegisterFrame();
+      frame.onSidWrite(24, 0x2f);
+      frame.onSidWrite(4, 0x41);
+      frame.setOutputGain(0.5);
+      const target = { values: new Uint8Array(SID_REGISTER_COUNT) };
+      const array = target.values;
+
+      frame.snapshotValuesInto(target);
+
+      expect(target.values).toBe(array);
+      expect(target.values).toEqual(frame.snapshotValues().values);
+      expect(target.values[24]).toBe(0x2f);
+    });
+
     it('keeps a resync at one write per register with gain applied', () => {
       const frame = createRegisterFrame();
       frame.onSidWrite(24, 0x1f);

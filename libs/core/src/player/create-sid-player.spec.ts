@@ -17,6 +17,10 @@ import {
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
 import { replayToFrame } from '../replay/replay-to-frame.js';
 import type { SidClock, SidFile, SidModel } from '../sid/sid-file.model.js';
+import type { ActiveLoop } from '../timeline/active-loop.js';
+import type { CrossingLines } from '../timeline/crossing-captures.js';
+import { countAfter } from '../timeline/shadow-position.js';
+import type { ShadowCount } from '../timeline/shadow-position.js';
 import { FakeClock } from '../testing/fake-clock.js';
 import { FakeSink } from '../testing/fake-sink.js';
 import { frames, microseconds, milliseconds } from '../units.js';
@@ -33,7 +37,11 @@ import type { JumpSettings, QueuedJump } from './snapshot.js';
  * `C64Machine.prototype` spying gave before the class became a factory-built, unexported internal.
  * Reset with `runFrameSpy.mockClear()` at the point a test wants to start counting from.
  */
-const { runFrameSpy } = vi.hoisted(() => ({ runFrameSpy: vi.fn() }));
+const { runFrameSpy, snapshotIntoSpy, seekToFrameSpy } = vi.hoisted(() => ({
+  runFrameSpy: vi.fn(),
+  snapshotIntoSpy: vi.fn(),
+  seekToFrameSpy: vi.fn(),
+}));
 
 vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../cpu/c64-machine.js')>();
@@ -51,9 +59,28 @@ vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
               return target.runFrame();
             };
           }
+          if (prop === 'snapshotInto') {
+            return (image: Parameters<typeof target.snapshotInto>[0]) => {
+              snapshotIntoSpy();
+              target.snapshotInto(image);
+            };
+          }
           return Reflect.get(target, prop, target);
         },
       });
+    },
+  };
+});
+
+/** Counts the seeks a loop re-entry falls back to when it holds no image — the main-thread replay
+ *  along the anchor path. */
+vi.mock('../timeline/seek.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../timeline/seek.js')>();
+  return {
+    ...actual,
+    seekToFrame: (...args: Parameters<typeof actual.seekToFrame>) => {
+      seekToFrameSpy();
+      return actual.seekToFrame(...args);
     },
   };
 });
@@ -408,6 +435,27 @@ function valueOf(frame: SidFrame, register: number): number | undefined {
     if (frame.registers[index] === register) return frame.values[index];
   }
   return undefined;
+}
+
+/** `from` to `to`, both included. */
+function range(from: number, to: number): number[] {
+  return Array.from({ length: to - from + 1 }, (_, index) => from + index);
+}
+
+/** What `counterTune` writes for the counts `from` to `to`: its counter is one byte wide. */
+function counts(from: number, to: number): number[] {
+  return range(from, to).map((count) => count & 0xff);
+}
+
+/** Ticks `count` times, collecting the byte each delivered frame carried for $D400 — null for one
+ *  that carried none, which for `counterTune` is only ever the gate-off. */
+function bytesOver(h: Harness, count: number): (number | null)[] {
+  const bytes: (number | null)[] = [];
+  for (let tick = 0; tick < count; tick++) {
+    run(h.clock, 1);
+    bytes.push(valueOf(lastDelivered(h.sink), 0) ?? null);
+  }
+  return bytes;
 }
 
 describe('createSidPlayer', () => {
@@ -796,6 +844,132 @@ describe('createSidPlayer', () => {
 
       expect(counterBytes(sink, clock, 10)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
       expect(player.getSnapshot().transport).toBe('ended');
+    });
+
+    describe('a loop whose length is not a whole number of frames', () => {
+      /** Line `index` of lines `period` apart through `beatOne`, as analysis's `gridLine` rounds
+       *  it and as core's crossing lines do. */
+      const gridLine = (beatOne: number, period: number, index: number): number =>
+        Math.round(beatOne + index * period);
+
+      it.each([
+        // [period, beat one, the start line's index]: 1/8 of 28, 22, 25 and 30, 1/16 of 40, and
+        // 1/4 of 25 frames.
+        [3.5, 0, 29],
+        [2.75, 3, 37],
+        [3.125, 1, 33],
+        [3.75, 2, 27],
+        [2.5, 1, 41],
+        [6.25, 0, 16],
+      ])(
+        'ends every lap, over a hundred and more, on the frame the grid line of period %s rounds to',
+        async (period, beatOne, index) => {
+          const { player, sink, clock } = harness();
+          player.loadTune(counterTune());
+          await player.play();
+          const start = gridLine(beatOne, period, index);
+          run(clock, start);
+          const lapPhase = beatOne + index * period;
+          player.setActiveLoop({
+            startFrame: frames(start),
+            endFrame: frames(start + period),
+            lapPhase,
+          });
+          await flushEntryImageCapture();
+
+          const laps = 120;
+          const ticks = gridLine(beatOne, period, index + laps) - start;
+          const bytes = counterBytes(sink, clock, ticks);
+
+          // Each lap: the frames after the start up to its last, and the gate-off in that slot.
+          let lapStart = 0;
+          for (let lap = 1; lap <= laps; lap++) {
+            const end = gridLine(beatOne, period, index + lap) - start;
+            expect(bytes.slice(lapStart, end)).toEqual([
+              ...counts(start + 1, start + end - lapStart - 1),
+              null,
+            ]);
+            lapStart = end;
+          }
+          expect(bytes).toHaveLength(lapStart);
+          expect(player.getPosition()).toBe(start);
+          expect(player.getSnapshot().loop).toEqual({
+            startFrame: start,
+            endFrame: start + period,
+            lapPhase,
+          });
+        },
+      );
+
+      it('reports the lap the player is in, pulled, and notifies no lap', async () => {
+        const { player, clock } = harness();
+        player.loadTune(counterTune());
+        await player.play();
+        run(clock, 100);
+        expect(player.getLapPhase()).toBeNull();
+        player.setActiveLoop({ startFrame: frames(100), endFrame: frames(103.5) });
+        await flushEntryImageCapture();
+        const listener = vi.fn();
+        player.subscribe(listener);
+        const snapshot = player.getSnapshot();
+
+        expect(player.getLapPhase()).toBe(0);
+        run(clock, 4);
+        expect(player.getLapPhase()).toBe(0.5);
+        run(clock, 3);
+        expect(player.getLapPhase()).toBe(0);
+
+        // The lap is no part of the snapshot: it moves every lap, which notifies nothing.
+        expect(listener).not.toHaveBeenCalled();
+        expect(player.getSnapshot()).toBe(snapshot);
+      });
+
+      it('changes a loop at the end of the lap in progress when the change is named past it', async () => {
+        const { player, sink, clock } = harness();
+        player.loadTune(counterTune());
+        await player.play();
+        run(clock, 100);
+        player.setActiveLoop({
+          startFrame: frames(100),
+          endFrame: frames(103.5),
+          lapPhase: 0.5,
+        });
+        await flushEntryImageCapture();
+        const next = { startFrame: frames(100), endFrame: frames(110) };
+
+        expect(player.changeLoopAt(frames(104), next)).toBe(true);
+
+        expect(player.getSnapshot().loop).toEqual({ startFrame: 100, endFrame: 103 });
+        expect(player.getSnapshot().tune?.loopChange).toEqual({ atFrame: 103, loop: next });
+        expect(counterBytes(sink, clock, 3 + 10)).toEqual([
+          ...range(101, 102),
+          null,
+          ...range(101, 109),
+          null,
+        ]);
+        expect(player.getSnapshot().loop).toEqual(next);
+      });
+
+      it('refuses a loop under two frames long that is not whole, the way each call refuses', async () => {
+        const { player, clock } = harness();
+        player.loadTune(counterTune());
+        await player.play();
+        run(clock, 10);
+        const running = { startFrame: frames(10), endFrame: frames(20) };
+        player.setActiveLoop(running);
+        await flushEntryImageCapture();
+        const before = player.getSnapshot();
+        const short = { startFrame: frames(10), endFrame: frames(11.5) };
+
+        player.setActiveLoop(short);
+        expect(player.changeLoopAt(frames(15), short)).toBe(false);
+        player.queueJump(short);
+        player.setActiveLoop({ ...running, lapPhase: Number.NaN });
+
+        expect(player.getSnapshot()).toBe(before);
+        expect(console.warn).toHaveBeenCalledTimes(4);
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('SID player: ignoring'));
+      });
     });
   });
 
@@ -1275,8 +1449,10 @@ describe('createSidPlayer', () => {
         lengthFrames: null,
         preparedFrames: [],
         queuedJump: null,
+        loopChange: null,
         handOffs: 0,
         recordedFrames: null,
+        shadowRunning: false,
       });
       expect(player.getSnapshot().repeatTrack).toBe(true);
     });
@@ -3056,11 +3232,220 @@ describe('createSidPlayer', () => {
       expect(handOffs(player)).toBe(1);
     });
 
-    it('normalises the target the way a seek does', async () => {
+    it('normalises the start the way a seek does, and keeps an end that is not whole', async () => {
       const { player } = await loopingPlayer();
 
       player.queueJump({ startFrame: frames(499.6), endFrame: frames(520.4) });
 
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520.4 });
+    });
+
+    it('lands a loop whose length is not whole and laps it on from the running loop’s clock', async () => {
+      const { player, clock, sink } = await loopingPlayer();
+      const eighth = { startFrame: frames(500), endFrame: frames(503.5), lapPhase: 0.5 };
+
+      player.queueJump(eighth);
+
+      expect(queued(player)).toEqual({ startFrame: 500, endFrame: 503.5, lapPhase: 0.5 });
+      runUntil(clock, () => handOffs(player) === 1);
+      // Reported as it was queued, so a host comparing it with what it queued sees nothing to fix…
+      expect(player.getSnapshot().loop).toEqual(eighth);
+      // …while it laps from the phase the whole loop at 100 was in, 0, rather than its own half.
+      expect(player.getLapPhase()).toBe(0);
+      // The gate-off the landing owes, then laps of 4, 3, 4, 3 frames from 500.
+      const bytes: (number | null)[] = [];
+      for (let tick = 0; tick < 1 + 3 + 3 + 4 + 3 + 1; tick++) {
+        run(clock, 1);
+        bytes.push(valueOf(lastDelivered(sink), 0) ?? null);
+      }
+      expect(bytes).toEqual([
+        null,
+        ...counts(501, 503),
+        null,
+        ...counts(501, 502),
+        null,
+        ...counts(501, 503),
+        null,
+        ...counts(501, 502),
+        null,
+      ]);
+    });
+
+    describe('on a 28-frame beat grid, between ⅛-beat loops starting on the beat lines at 28 and 56', () => {
+      // An ⅛ beat is 3.5 frames. On a beat line its lap phase is 0, which a host hands in as none,
+      // so each loop laps 4, 3, 4, 3 from its own phase. Restarting every landed loop there
+      // made each hand-off after a single lap a 4, and 16 of them took 64 ticks, not 56.
+      const eighthAt = (start: number): Exclude<ActiveLoop, null> => ({
+        startFrame: frames(start),
+        endFrame: frames(start + 3.5),
+      });
+      const quarterAt = (start: number): Exclude<ActiveLoop, null> => ({
+        startFrame: frames(start),
+        endFrame: frames(start + 7),
+      });
+
+      /** The counter tune looping `first`, set while the playhead is still at 0, with 28 and 56
+       *  declared and ready. */
+      async function juggling(first: Exclude<ActiveLoop, null>): Promise<Harness> {
+        const h = harness();
+        h.player.loadTune(counterTune());
+        await h.player.play();
+        h.player.setJumpTargets([frames(28), frames(56)]);
+        await flushEntryImageCapture();
+        h.player.setActiveLoop(first);
+        await flushEntryImageCapture();
+        return h;
+      }
+
+      /** Ticks until the lap in progress ends — a wrap puts the position back on the start, a landing
+       *  counts a hand-off — and returns how many ticks it took. */
+      function untilLapEnd(h: Harness): number {
+        const landed = handOffs(h.player);
+        let before = h.player.getPosition();
+        for (let ticks = 1; ticks <= 400; ticks++) {
+          run(h.clock, 1);
+          const now = h.player.getPosition();
+          if (now < before || handOffs(h.player) !== landed) return ticks;
+          before = now;
+        }
+        throw new Error('no lap end in 400 ticks');
+      }
+
+      /**
+       * Hands off to `targets[1]` out of the lap the loop was set in, then segment after segment
+       * lets `laps[i]` laps go by, queuing the other target once the last of them is in progress —
+       * `targets[0]` first — so it lands at that lap's end. Returns the ticks from the first hand-off
+       * to each later one: the first, made from a lap the loop was set in mid-way, is only where the
+       * count starts.
+       */
+      function handOffTicks(
+        h: Harness,
+        targets: readonly [Exclude<ActiveLoop, null>, Exclude<ActiveLoop, null>],
+        laps: readonly number[],
+      ): number[] {
+        const { player, clock } = h;
+        player.queueJump(targets[1]);
+        runUntil(clock, () => handOffs(player) === 1);
+        const at: number[] = [];
+        let ticks = 0;
+        laps.forEach((count, segment) => {
+          for (let lap = 1; lap < count; lap++) ticks += untilLapEnd(h);
+          player.queueJump(targets[segment % 2]);
+          ticks += untilLapEnd(h);
+          expect(handOffs(player)).toBe(segment + 2);
+          at.push(ticks);
+        });
+        return at;
+      }
+
+      /** How far each count in `at` lies from the ideal: the lengths of the laps taken, added up. */
+      function drifts(at: readonly number[], lengths: readonly number[]): number[] {
+        let ideal = 0;
+        return at.map((ticks, segment) => {
+          ideal += lengths[segment];
+          return ticks - ideal;
+        });
+      }
+
+      it('takes exactly 56 ticks over 16 hand-offs a lap apart, every lap 3 or 4', async () => {
+        const h = await juggling(eighthAt(28));
+
+        const at = handOffTicks(h, [eighthAt(28), eighthAt(56)], Array(16).fill(1));
+
+        expect(at[at.length - 1]).toBe(56);
+        expect(at.map((ticks, segment) => ticks - (at[segment - 1] ?? 0))).toEqual(
+          Array.from({ length: 16 }, (_, segment) => (segment % 2 === 0 ? 3 : 4)),
+        );
+      });
+
+      it('stays within a frame of the ideal at every hand-off over segments of 1 to 3 laps', async () => {
+        const laps = [1, 2, 3, 1, 2, 1, 3, 2, 1, 1, 2, 3, 1, 2, 1, 3];
+        const h = await juggling(eighthAt(28));
+
+        const at = handOffTicks(h, [eighthAt(28), eighthAt(56)], laps);
+
+        const off = drifts(
+          at,
+          laps.map((count) => count * 3.5),
+        );
+        expect(off.every((frame) => Math.abs(frame) <= 1)).toBe(true);
+        // 29 laps from the half the first hand-off carried on: the telescoped span, to the frame.
+        expect(at[at.length - 1]).toBe(Math.round(0.5 + 29 * 3.5) - Math.round(0.5));
+      });
+
+      it('stays within a frame of the ideal over queued loops of two lengths landing a lap apart', async () => {
+        // Each hand-off queues the loop's own start at the other length.
+        const h = await juggling(eighthAt(28));
+
+        const at = handOffTicks(h, [eighthAt(28), quarterAt(28)], Array(16).fill(1));
+
+        const off = drifts(
+          at,
+          at.map((_, segment) => (segment % 2 === 0 ? 7 : 3.5)),
+        );
+        expect(off.every((frame) => Math.abs(frame) <= 1)).toBe(true);
+        expect(at[at.length - 1]).toBe(8 * 7 + 8 * 3.5);
+      });
+
+      it('takes exactly 112 ticks over 16 hand-offs between whole 7-frame loops', async () => {
+        const h = await juggling(quarterAt(28));
+
+        const at = handOffTicks(h, [quarterAt(28), quarterAt(56)], Array(16).fill(1));
+
+        expect(at).toEqual(Array.from({ length: 16 }, (_, segment) => (segment + 1) * 7));
+      });
+
+      it('reports the phase carried on through getLapPhase, and the loop as it was queued', async () => {
+        const { player, clock } = await juggling(eighthAt(28));
+        const target = { ...eighthAt(56), lapPhase: 0.25 };
+
+        player.queueJump(target);
+        runUntil(clock, () => handOffs(player) === 1);
+
+        expect(player.getSnapshot().loop).toEqual(target);
+        expect(player.getLapPhase()).toBe(0.5);
+        // A shadow lapping the landed loop counts in that lap too.
+        expect(player.startShadow(target)).toBe(true);
+        expect(player.getShadowCount()).toEqual({ frame: 56, held: true, lapPhase: 0.5 });
+      });
+
+      it("lands a loop from the track's own loop at lap 0 of its own phase", async () => {
+        const h = harness();
+        const { player, clock } = h;
+        player.loadTune(counterTune());
+        player.setTrackStructure({
+          loopStartFrame: null,
+          loopPeriodFrames: null,
+          endedAtFrame: frames(40),
+        });
+        player.setRepeatTrack(true);
+        await player.play();
+        player.setJumpTargets([frames(56)]);
+        await flushEntryImageCapture();
+        runUntil(clock, () => player.getSnapshot().loop !== null);
+        expect(player.getSnapshot().loop).toEqual({ startFrame: 0, endFrame: 40 });
+        const target = { ...eighthAt(56), lapPhase: 0.5 };
+
+        player.queueJump(target);
+        runUntil(clock, () => handOffs(player) === 1);
+
+        expect(player.getSnapshot().loop).toEqual(target);
+        expect(player.getLapPhase()).toBe(0.5);
+        // From a half: 3, 4, 3, 4, the landing's gate-off taking the first lap's first tick.
+        expect([untilLapEnd(h), untilLapEnd(h), untilLapEnd(h), untilLapEnd(h)]).toEqual([
+          3, 4, 3, 4,
+        ]);
+      });
+    });
+
+    it('ignores a queued loop under two frames long that is not whole', async () => {
+      const { player } = await loopingPlayer();
+      player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+
+      player.queueJump({ startFrame: frames(500), endFrame: frames(501.5) });
+      player.queueJump({ startFrame: frames(500), endFrame: frames(510), lapPhase: Number.NaN });
+
+      expect(console.warn).toHaveBeenCalledTimes(2);
       expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
     });
 
@@ -3618,6 +4003,9 @@ describe('createSidPlayer', () => {
         'applies the settings of a seek to %s before the next frame is delivered',
         async (_, target) => {
           const h = await looping(settingsTune());
+          // The loop starts ahead of the playhead, so the tick that reaches 100 is what saves its
+          // entry image rather than a replay.
+          run(h.clock, 100);
           const requests = h.replay.requests.length;
           const delivered = h.sink.deliveredFrames.length;
 
@@ -5013,6 +5401,1203 @@ describe('createSidPlayer', () => {
         expect(snapshotOf(player).transport).toBe('error');
         expect(varispeedOn(player)).toBe(false);
         expect(sink.calls.slice(1)).toEqual(['begin', 'end']);
+      });
+    });
+  });
+
+  describe('crossing captures', () => {
+    /** A counter tune playing with `lines` declared, before the first tick. */
+    async function playing(lines: readonly CrossingLines[]): Promise<Harness> {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setCrossingCaptures(lines);
+      await h.player.play();
+      return h;
+    }
+
+    const held = (player: SidPlayer, at: readonly number[]): boolean[] =>
+      at.map((frame) => player.holdsImageAt(frames(frame)));
+
+    beforeEach(() => {
+      snapshotIntoSpy.mockClear();
+      seekToFrameSpy.mockClear();
+      vi.mocked(console.warn).mockClear();
+    });
+
+    it('holds the most recent crossings of the declared lines and lets the oldest go', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+
+      run(clock, 35);
+      expect(held(player, [0, 5, 10, 20, 30])).toEqual([false, false, true, true, true]);
+
+      run(clock, 10);
+      expect(held(player, [10, 20, 30, 40])).toEqual([false, true, true, true]);
+    });
+
+    it('crosses a fractional period at the frames its lines round to', async () => {
+      const { player, clock } = await playing([{ originFrame: 3, periodFrames: 12.5, keep: 8 }]);
+
+      run(clock, 60);
+
+      // 3, 15.5, 28, 40.5 and 53, each rounded half up.
+      expect(held(player, [3, 15, 16, 28, 40, 41, 53])).toEqual([
+        true,
+        false,
+        true,
+        true,
+        false,
+        true,
+        true,
+      ]);
+    });
+
+    it('copies the machine once for a frame that lies on several sets of lines', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 10, keep: 3 },
+        { originFrame: 0, periodFrames: 20, keep: 3 },
+        { originFrame: 0, periodFrames: 5, keep: 4 },
+      ]);
+
+      run(clock, 20);
+
+      // Frames 5, 10, 15 and 20 are crossed; 10 lies on two sets and 20 on all three.
+      expect(snapshotIntoSpy).toHaveBeenCalledTimes(4);
+      expect(held(player, [5, 10, 15, 20])).toEqual([true, true, true, true]);
+    });
+
+    it('keeps each set’s own most recent crossings, a shared frame staying while any set holds it', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 10, keep: 2 },
+        { originFrame: 0, periodFrames: 20, keep: 2 },
+      ]);
+
+      run(clock, 45);
+
+      // Tens keep 30 and 40; twenties keep 20 and 40. 10 fell out of both.
+      expect(held(player, [10, 20, 30, 40])).toEqual([false, true, true, true]);
+    });
+
+    it('keeps the images already saved on lines that are declared again', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 35);
+
+      player.setCrossingCaptures([{ originFrame: 0, periodFrames: 20, keep: 2 }]);
+
+      expect(held(player, [10, 20, 30])).toEqual([false, true, false]);
+      run(clock, 10);
+      expect(held(player, [20, 40])).toEqual([true, true]);
+    });
+
+    it('frees every image when the lines are withdrawn', async () => {
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 35);
+
+      player.setCrossingCaptures([]);
+      run(clock, 20);
+
+      expect(held(player, [10, 20, 30, 40, 50])).toEqual([false, false, false, false, false]);
+    });
+
+    it('ignores lines that cannot be crossed, with a warning', async () => {
+      const { player, clock } = await playing([
+        { originFrame: 0, periodFrames: 0.5, keep: 2 },
+        { originFrame: Number.NaN, periodFrames: 10, keep: 2 },
+        { originFrame: 0, periodFrames: 10, keep: 0 },
+      ]);
+
+      run(clock, 25);
+
+      expect(held(player, [10, 20])).toEqual([false, false]);
+      expect(console.warn).toHaveBeenCalledTimes(3);
+    });
+
+    it('drops the images on a stop, a load and a subtune change, and keeps the lines', async () => {
+      const twoSongs = tune({
+        songs: 2,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+        ],
+      });
+      const { player, clock } = await playing([{ originFrame: 0, periodFrames: 10, keep: 3 }]);
+      run(clock, 25);
+      expect(held(player, [10, 20])).toEqual([true, true]);
+
+      player.stop();
+      expect(held(player, [10, 20])).toEqual([false, false]);
+      await player.play();
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+
+      player.loadTune(twoSongs);
+      expect(held(player, [10])).toEqual([false]);
+      await player.play();
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+
+      player.selectSubtune(2);
+      expect(held(player, [10])).toEqual([false]);
+      run(clock, 15);
+      expect(held(player, [10])).toEqual([true]);
+    });
+
+    it('saves nothing in varispeed', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setRegisterRecord(recordFromTune(counterTune(), 1, 200));
+      h.player.setCrossingCaptures([{ originFrame: 0, periodFrames: 10, keep: 4 }]);
+      await h.player.play();
+      run(h.clock, 5);
+
+      h.player.enterVarispeed(() => 1);
+      run(h.clock, 30);
+
+      expect(h.player.getPosition()).toBeGreaterThan(30);
+      expect(held(h.player, [10, 20, 30])).toEqual([false, false, false]);
+      expect(snapshotIntoSpy).not.toHaveBeenCalled();
+    });
+
+    it('re-enters a loop set at a crossed line from the image saved there, for a first lap exactly the loop’s length', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 10, keep: 4 }]);
+      run(h.clock, 35);
+      const requests = h.replay.requests.length;
+      snapshotIntoSpy.mockClear();
+
+      h.player.setActiveLoop({ startFrame: frames(30), endFrame: frames(40) });
+      await flushEntryImageCapture();
+
+      // Frames 35 to 38, then the wrap, its gate-off, and two whole laps of ten ticks each.
+      const lap = [null, ...range(31, 39)];
+      expect(bytesOver(h, 24)).toEqual([...range(36, 39), ...lap, ...lap]);
+      expect(h.player.getPosition()).toBe(30);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+      // Inside the loop no declared line is reached again: the wrap restores its start, and the
+      // gate-off tick runs no machine.
+      expect(snapshotIntoSpy).not.toHaveBeenCalled();
+    });
+
+    it('lets a loop set a frame ahead of the playhead lap from the image saved as the playhead crossed its start', async () => {
+      const h = await playing([]);
+      run(h.clock, 49);
+      const requests = h.replay.requests.length;
+
+      h.player.setActiveLoop({ startFrame: frames(50), endFrame: frames(60) });
+      await flushEntryImageCapture();
+
+      expect(h.replay.requests).toHaveLength(requests);
+      // Frame 49 crosses the start; frames 50 to 58 follow, then the wrap and a lap from the image.
+      expect(bytesOver(h, 30)).toEqual([
+        ...range(50, 59),
+        null,
+        ...range(51, 59),
+        null,
+        ...range(51, 59),
+      ]);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+      expect(h.replay.requests).toHaveLength(requests);
+    });
+
+    it('still asks for a replay when no tick will cross the loop’s start', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setRegisterRecord(recordFromTune(counterTune(), 1, 200));
+      const asked = async (startFrame: number): Promise<number> => {
+        const before = h.replay.requests.length;
+        h.player.setActiveLoop({
+          startFrame: frames(startFrame),
+          endFrame: frames(startFrame + 10),
+        });
+        await flushEntryImageCapture();
+        return h.replay.requests.length - before;
+      };
+
+      expect(await asked(50)).toBe(1); // not playing
+      h.player.setActiveLoop(null);
+      await h.player.play();
+      run(h.clock, 60);
+      expect(await asked(20)).toBe(1); // behind the playhead
+      expect(await asked(60)).toBe(1); // at the playhead
+      expect(await asked(90)).toBe(0); // ahead of it, in live play
+
+      h.player.enterVarispeed(() => 1);
+      expect(await asked(150)).toBe(1); // varispeed saves nothing at a crossing
+    });
+
+    it('keeps a running loop’s image through the recycling of the slots it was found in', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 5, keep: 2 }]);
+      run(h.clock, 31);
+      expect(held(h.player, [25, 30])).toEqual([true, true]);
+      const requests = h.replay.requests.length;
+
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(45) });
+
+      // The crossings at 35 and 40 recycle both slots long before the loop first wraps.
+      const lap = [null, ...range(26, 44)];
+      expect(bytesOver(h, 13 + 20 + 20)).toEqual([...range(32, 44), ...lap, ...lap]);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps a running loop’s start across a re-declare of the lines, and finds it again for a shorter loop', async () => {
+      const h = await playing([{ originFrame: 0, periodFrames: 5, keep: 2 }]);
+      run(h.clock, 31);
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(45) });
+      run(h.clock, 20); // into the second lap, at frame 31
+      const requests = h.replay.requests.length;
+
+      h.player.setCrossingCaptures([]);
+      expect(held(h.player, [25, 35, 40])).toEqual([true, false, false]);
+      h.player.setActiveLoop({ startFrame: frames(25), endFrame: frames(35) });
+      await flushEntryImageCapture();
+
+      expect(h.replay.requests).toHaveLength(requests);
+      const lap = [null, ...range(26, 34)];
+      expect(bytesOver(h, 3 + 10 + 10)).toEqual([...range(32, 34), ...lap, ...lap]);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('changing the loop on a named frame', () => {
+    const snapshotOf = (player: SidPlayer): ReturnType<SidPlayer['getSnapshot']> =>
+      player.getSnapshot();
+    const loopChange = (player: SidPlayer): unknown => snapshotOf(player).tune?.loopChange;
+
+    function runUntil(clock: FakeClock, done: () => boolean, limit = 400): void {
+      for (let tick = 0; tick < limit && !done(); tick++) run(clock, 1);
+      expect(done()).toBe(true);
+    }
+
+    /** A counter tune at frame 100, inside the ten-frame loop that starts there. */
+    async function loopingAt100(): Promise<Harness> {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      run(h.clock, 100);
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      return h;
+    }
+
+    beforeEach(() => {
+      seekToFrameSpy.mockClear();
+    });
+
+    it('refuses, changing nothing, when no loop is running', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      const before = h.player.getSnapshot();
+
+      const accepted = h.player.changeLoopAt(frames(110), {
+        startFrame: frames(100),
+        endFrame: frames(120),
+      });
+
+      expect(accepted).toBe(false);
+      expect(h.player.getSnapshot()).toBe(before);
+    });
+
+    it('refuses, changing nothing, when no image is held for the new loop’s start', async () => {
+      const h = await loopingAt100();
+      const before = h.player.getSnapshot();
+
+      const accepted = h.player.changeLoopAt(frames(106), {
+        startFrame: frames(300),
+        endFrame: frames(310),
+      });
+
+      expect(accepted).toBe(false);
+      expect(h.player.getSnapshot()).toBe(before);
+    });
+
+    it('ends the lap on the named frame as a lap ending there would, then runs the new bounds', async () => {
+      const h = await loopingAt100();
+      const requests = h.replay.requests.length;
+      const next = { startFrame: frames(100), endFrame: frames(116) };
+
+      expect(h.player.changeLoopAt(frames(106), next)).toBe(true);
+
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 106 });
+      expect(loopChange(h.player)).toEqual({ atFrame: 106, loop: next });
+
+      // Frames 100 to 104 and the gate-off in 105's slot: six ticks, as a loop ending at 106 laps.
+      expect(bytesOver(h, 6)).toEqual([...range(101, 105), null]);
+      expect(snapshotOf(h.player).loop).toEqual(next);
+      expect(loopChange(h.player)).toBeNull();
+      // Then the new length: fifteen frames and the gate-off, sixteen ticks.
+      expect(bytesOver(h, 32)).toEqual([...range(101, 115), null, ...range(101, 115), null]);
+      expect(h.player.getPosition()).toBe(100);
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('replaces a change already named', async () => {
+      const h = await loopingAt100();
+      const second = { startFrame: frames(100), endFrame: frames(104) };
+
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+      h.player.changeLoopAt(frames(108), second);
+
+      expect(loopChange(h.player)).toEqual({ atFrame: 108, loop: second });
+      expect(bytesOver(h, 8 + 4 + 4)).toEqual([
+        ...range(101, 107),
+        null,
+        ...range(101, 103),
+        null,
+        ...range(101, 103),
+        null,
+      ]);
+    });
+
+    it('is dropped by setActiveLoop, which sets its own loop', async () => {
+      const h = await loopingAt100();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(120) });
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 120 });
+      run(h.clock, 12);
+      expect(h.player.getPosition()).toBe(112);
+    });
+
+    it('is dropped by a stop', async () => {
+      const h = await loopingAt100();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.stop();
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toBeNull();
+    });
+
+    it('keeps a queued jump, which lands at the wrap in the change’s place and drops it', async () => {
+      const h = await loopingAt100();
+      h.player.setJumpTargets([frames(500)]);
+      await flushEntryImageCapture();
+      h.player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
+      const queued = snapshotOf(h.player).tune?.queuedJump;
+
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      expect(snapshotOf(h.player).tune?.queuedJump).toEqual(queued);
+      runUntil(h.clock, () => snapshotOf(h.player).tune?.handOffs === 1);
+      expect(h.player.getPosition()).toBe(500);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 500, endFrame: 520 });
+      expect(loopChange(h.player)).toBeNull();
+      expect(bytesOver(h, 2)).toEqual([null, ...counts(501, 501)]);
+    });
+
+    it('re-enters the new loop’s own start when it is another frame', async () => {
+      const h = await loopingAt100();
+      h.player.setJumpTargets([frames(500)]);
+      await flushEntryImageCapture();
+
+      expect(
+        h.player.changeLoopAt(frames(106), { startFrame: frames(500), endFrame: frames(508) }),
+      ).toBe(true);
+
+      expect(bytesOver(h, 6 + 16)).toEqual([
+        ...range(101, 105),
+        null,
+        ...counts(501, 507),
+        null,
+        ...counts(501, 507),
+        null,
+      ]);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 500, endFrame: 508 });
+    });
+
+    it('re-enters from an image saved at a crossing, landing a change named behind the playhead on the next tick', async () => {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      h.player.setCrossingCaptures([{ originFrame: 0, periodFrames: 10, keep: 6 }]);
+      await h.player.play();
+      run(h.clock, 55);
+      h.player.setActiveLoop({ startFrame: frames(40), endFrame: frames(56) });
+      const requests = h.replay.requests.length;
+
+      expect(
+        h.player.changeLoopAt(frames(50), { startFrame: frames(20), endFrame: frames(30) }),
+      ).toBe(true);
+
+      expect(bytesOver(h, 1 + 1 + 9)).toEqual([56, null, ...range(21, 29)]);
+      expect(h.player.getPosition()).toBe(20);
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 20, endFrame: 30 });
+      expect(h.replay.requests).toHaveLength(requests);
+      expect(seekToFrameSpy).not.toHaveBeenCalled();
+    });
+
+    it('is cancelled by a subtune change, which gives the loop its end back', async () => {
+      const twoSongs = tune({
+        songs: 2,
+        blocks: [
+          { at: 0x1000, bytes: [RTS] },
+          { at: 0x1010, bytes: [0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS] },
+        ],
+      });
+      const h = harness();
+      h.player.loadTune(twoSongs);
+      await h.player.play();
+      run(h.clock, 100);
+      h.player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
+      await flushEntryImageCapture();
+      h.player.changeLoopAt(frames(106), { startFrame: frames(100), endFrame: frames(116) });
+
+      h.player.selectSubtune(2);
+
+      expect(loopChange(h.player)).toBeNull();
+      expect(snapshotOf(h.player).loop).toEqual({ startFrame: 100, endFrame: 110 });
+    });
+  });
+
+  describe('the shadow position and landing on a frame', () => {
+    /** HANDBACK_LEAD_SECONDS of a PAL tune, in play calls. */
+    const LEAD = 100;
+    const LOOP = { startFrame: frames(10), endFrame: frames(20) };
+
+    interface Recorded extends Harness {
+      readonly record: RegisterRecord;
+    }
+
+    /** A counter tune loaded with the record of its first `length` play calls. */
+    function recorded(length = 400): Recorded {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      const record = recordFromTune(counterTune(), 1, length);
+      h.player.setRegisterRecord(record);
+      return { ...h, record };
+    }
+
+    /** A counter tune playing, `ticks` ticks in. */
+    async function playingCounter(ticks = 0): Promise<Harness> {
+      const h = harness();
+      h.player.loadTune(counterTune());
+      await h.player.play();
+      run(h.clock, ticks);
+      return h;
+    }
+
+    const varispeedOn = (player: SidPlayer): boolean => player.getSnapshot().tempo.varispeed;
+
+    function sentOf(player: SidPlayer): Uint8Array {
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      player.readRegisters(written, sent);
+      return sent;
+    }
+
+    function writesOf(frame: SidFrame): [number, number][] {
+      const writes: [number, number][] = [];
+      for (let index = 0; index < frame.count; index++) {
+        writes.push([frame.registers[index], frame.values[index]]);
+      }
+      return writes;
+    }
+
+    function countOf(player: SidPlayer): ShadowCount {
+      const count = player.getShadowCount();
+      if (count === null) throw new Error('the shadow is not running');
+      return count;
+    }
+
+    const GATE_OFF = [
+      [4, 0],
+      [11, 0],
+      [18, 0],
+    ];
+
+    beforeEach(() => {
+      seekToFrameSpy.mockClear();
+    });
+
+    describe('the shadow', () => {
+      it('equals the player’s position on every tick across several laps, and so does countAfter', async () => {
+        const h = await playingCounter();
+        h.player.setActiveLoop(LOOP);
+        run(h.clock, 14);
+
+        expect(h.player.startShadow(LOOP)).toBe(true);
+        const origin = countOf(h.player);
+        expect(origin).toEqual({ frame: 14, held: false });
+        for (let tick = 1; tick <= 45; tick++) {
+          run(h.clock, 1);
+          expect(h.player.getShadowPosition()).toBe(h.player.getPosition());
+          expect(countAfter(origin, tick, LOOP).frame).toBe(h.player.getPosition());
+        }
+        expect(h.player.getShadowTicks()).toBe(45);
+      });
+
+      it('starts held when the player has a gate-off pending, and stays with it', async () => {
+        const h = await playingCounter();
+        h.player.setActiveLoop(LOOP);
+        run(h.clock, 19); // the tick that wraps the first lap
+
+        h.player.startShadow(LOOP);
+        const origin = countOf(h.player);
+
+        expect(h.player.getPosition()).toBe(10);
+        expect(origin).toEqual({ frame: 10, held: true });
+        for (let tick = 1; tick <= 25; tick++) {
+          run(h.clock, 1);
+          expect(h.player.getShadowPosition()).toBe(h.player.getPosition());
+          expect(countAfter(origin, tick, LOOP)).toEqual(countOf(h.player));
+        }
+      });
+
+      it('wraps where the track does when it is started with no loop', async () => {
+        const h = harness();
+        h.player.loadTune(counterTune());
+        h.player.setTrackStructure({
+          loopStartFrame: frames(4),
+          loopPeriodFrames: frames(6),
+          endedAtFrame: null,
+        });
+        h.player.setRepeatTrack(true);
+        await h.player.play();
+        await flushEntryImageCapture();
+        run(h.clock, 2);
+
+        h.player.startShadow(null);
+        for (let tick = 0; tick < 30; tick++) {
+          run(h.clock, 1);
+          expect(h.player.getShadowPosition()).toBe(h.player.getPosition());
+        }
+      });
+
+      it('is unmoved by a jump and by a loop, and counts a gate-off tick', async () => {
+        const h = await playingCounter(5);
+        h.player.startShadow(null);
+
+        await h.player.seek(frames(300));
+        run(h.clock, 3);
+        h.player.setActiveLoop({ startFrame: frames(300), endFrame: frames(310) });
+        run(h.clock, 2);
+
+        expect(h.player.getShadowPosition()).toBe(10);
+        expect(h.player.getShadowTicks()).toBe(5);
+        expect(h.player.getPosition()).not.toBe(10);
+      });
+
+      it('counts through varispeed at one frame a tick, whatever the rate', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 2);
+        h.player.startShadow(null);
+        h.player.enterVarispeed(() => 5);
+
+        run(h.clock, 6);
+        h.player.leaveVarispeed();
+        run(h.clock, 4);
+
+        expect(h.player.getShadowPosition()).toBe(2 + 6 + 4);
+      });
+
+      it('stands still while paused, even while a non-playing varispeed runs the clock', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 3);
+        h.player.startShadow(null);
+        run(h.clock, 2);
+        h.player.pause();
+
+        h.player.enterVarispeed(() => 1);
+        await flushEntryImageCapture();
+        run(h.clock, 5);
+
+        expect(h.player.getSnapshot().transport).toBe('paused');
+        expect(h.player.getShadowPosition()).toBe(5);
+        expect(h.player.getShadowTicks()).toBe(2);
+
+        await h.player.play();
+        run(h.clock, 2);
+
+        expect(h.player.getShadowPosition()).toBe(7);
+      });
+
+      it('re-bases on a new start, counting ticks from there', async () => {
+        const h = await playingCounter(3);
+        h.player.startShadow(null);
+        run(h.clock, 4);
+
+        h.player.startShadow(LOOP, { frame: frames(12), held: true });
+
+        expect(countOf(h.player)).toEqual({ frame: 12, held: true });
+        expect(h.player.getShadowTicks()).toBe(0);
+        run(h.clock, 2);
+        expect(countOf(h.player)).toEqual({ frame: 13, held: false });
+        expect(h.player.getShadowTicks()).toBe(2);
+      });
+
+      it('refuses with no tune loaded, and for a count that is not a number', async () => {
+        const bare = harness();
+        expect(bare.player.startShadow(null)).toBe(false);
+        expect(bare.player.getShadowPosition()).toBeNull();
+
+        const h = await playingCounter();
+        expect(h.player.startShadow(null, { frame: frames(Number.NaN), held: false })).toBe(false);
+        expect(h.player.getShadowPosition()).toBeNull();
+      });
+
+      it.each([
+        ['stopShadow', (p: SidPlayer) => p.stopShadow()],
+        ['a stop', (p: SidPlayer) => p.stop()],
+        ['a tune load', (p: SidPlayer) => p.loadTune(counterTune())],
+        ['a subtune change', (p: SidPlayer) => p.selectSubtune(2)],
+      ])('is stopped by %s', async (_, stop) => {
+        const h = harness();
+        h.player.loadTune(
+          tune({
+            songs: 2,
+            blocks: [
+              { at: 0x1000, bytes: [RTS] },
+              { at: 0x1010, bytes: [RTS] },
+            ],
+          }),
+        );
+        await h.player.play();
+        run(h.clock, 3);
+        h.player.startShadow(null);
+        expect(h.player.getSnapshot().tune?.shadowRunning).toBe(true);
+
+        stop(h.player);
+
+        expect(h.player.getShadowPosition()).toBeNull();
+        expect(h.player.getShadowCount()).toBeNull();
+        expect(h.player.getShadowTicks()).toBeNull();
+        expect(h.player.getSnapshot().tune?.shadowRunning).toBe(false);
+      });
+
+      it('notifies when it starts and stops, and never as it counts', async () => {
+        const h = await playingCounter();
+        const listener = vi.fn();
+        h.player.subscribe(listener);
+
+        h.player.startShadow(null);
+        expect(listener).toHaveBeenCalledTimes(1);
+        run(h.clock, 5);
+        h.player.getShadowPosition();
+        expect(listener).toHaveBeenCalledTimes(1);
+        h.player.stopShadow();
+        expect(listener).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    describe('landing', () => {
+      it('sounds a gate-off, then a full re-emit, then plays the record, then hands back to the machine with nothing more sent', async () => {
+        const live = await playingCounter(50);
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 3);
+
+        expect(h.player.land(frames(50))).toBe(true);
+        await flushEntryImageCapture();
+
+        expect(varispeedOn(h.player)).toBe(true);
+        expect(h.replay.requests.at(-1)?.targetFrame).toBe(50 + LEAD);
+        const delivered = h.sink.deliveredFrames.length;
+
+        run(h.clock, 1);
+        run(live.clock, 1);
+        expect(writesOf(lastDelivered(h.sink))).toEqual(GATE_OFF);
+        expect(h.player.getPosition()).toBe(51);
+
+        run(h.clock, 1);
+        run(live.clock, 1);
+        expect(lastDelivered(h.sink).count).toBe(SID_REGISTER_COUNT);
+        expect(valueOf(lastDelivered(h.sink), 0)).toBe(52);
+
+        for (let tick = 3; tick <= LEAD; tick++) {
+          run(h.clock, 1);
+          run(live.clock, 1);
+          expect(valueOf(lastDelivered(h.sink), 0)).toBe(50 + tick);
+        }
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(50 + LEAD);
+
+        for (let tick = 0; tick < 10; tick++) {
+          run(h.clock, 1);
+          run(live.clock, 1);
+          expect(writesOf(lastDelivered(h.sink))).toEqual(writesOf(lastDelivered(live.sink)));
+          expect(sentOf(h.player)).toEqual(sentOf(live.player));
+        }
+        expect(h.sink.deliveredFrames.length - delivered).toBe(LEAD + 10);
+        expect(h.sink.deliveredNowFrames).toHaveLength(0);
+        expect(h.player.getSnapshot().tune?.handOffs).toBe(0);
+        expect(h.player.getSnapshot().transport).toBe('playing');
+      });
+
+      it('lines up with an undisturbed player at that frame, tick for tick, through the handover', async () => {
+        const reference = await playingCounter(50);
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 7);
+        expect(h.player.land(frames(50))).toBe(true);
+        await flushEntryImageCapture();
+
+        for (let tick = 1; tick <= LEAD + 30; tick++) {
+          run(h.clock, 1);
+          run(reference.clock, 1);
+          expect(h.player.getPosition()).toBe(reference.player.getPosition());
+          if (tick >= 2) expect(sentOf(h.player)).toEqual(sentOf(reference.player));
+        }
+        expect(varispeedOn(h.player)).toBe(false);
+      });
+
+      it('restarts the delivery history, as a jump does', async () => {
+        const h = recorded();
+        h.player.keepDeliveries(32);
+        await h.player.play();
+        run(h.clock, 5);
+        h.player.drainDeliveries(createDeliveryBatch(32));
+
+        h.player.land(frames(50));
+        run(h.clock, 2);
+        const batch = createDeliveryBatch(32);
+        h.player.drainDeliveries(batch);
+
+        expect(batch.restarted).toBe(true);
+        expect(batch.count).toBe(2);
+      });
+
+      it('drops the rate source of the hand’s varispeed and plays the record at rate 1', async () => {
+        const h = recorded();
+        const source = vi.fn(() => 3);
+        await h.player.play();
+        h.player.enterVarispeed(source);
+        run(h.clock, 5);
+        const calls = source.mock.calls.length;
+        expect(h.player.getPosition()).toBe(15);
+
+        expect(h.player.land(frames(100))).toBe(true);
+        await flushEntryImageCapture();
+        run(h.clock, 4);
+
+        expect(source).toHaveBeenCalledTimes(calls);
+        expect(h.player.getPosition()).toBe(104);
+        expect(varispeedOn(h.player)).toBe(true);
+        run(h.clock, LEAD - 4);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(100 + LEAD);
+      });
+
+      it('takes the settings it is given', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 2);
+
+        h.player.land(frames(30), { voiceMutes: [true] });
+
+        expect(h.player.getSnapshot().voices[0].muted).toBe(true);
+      });
+
+      it('moves the landing to a later one, abandoning the image asked for', async () => {
+        const h = recorded();
+        h.replay.manual = true;
+        await h.player.play();
+        run(h.clock, 2);
+        h.player.land(frames(30));
+        run(h.clock, 3);
+
+        h.player.land(frames(200));
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+
+        expect(h.replay.requests.map((request) => request.targetFrame)).toEqual([
+          30 + LEAD,
+          200 + LEAD,
+        ]);
+        run(h.clock, 1);
+        expect(h.player.getPosition()).toBe(201);
+        run(h.clock, LEAD - 1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(200 + LEAD);
+      });
+
+      it('lands paused at the position when paused during the handback', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 2);
+        h.player.land(frames(40));
+        run(h.clock, 3);
+
+        h.player.pause();
+        await flushEntryImageCapture();
+
+        expect(h.player.getSnapshot().transport).toBe('paused');
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(43);
+        expect(h.replay.requests.at(-1)?.targetFrame).toBe(43);
+      });
+
+      it.each([
+        [
+          'with no record',
+          async () => {
+            const h = await playingCounter(3);
+            return { player: h.player, at: frames(2) };
+          },
+        ],
+        [
+          'past the record',
+          async () => {
+            const h = recorded(20);
+            await h.player.play();
+            run(h.clock, 3);
+            return { player: h.player, at: frames(21) };
+          },
+        ],
+        [
+          'while stopped',
+          () => {
+            const h = recorded();
+            return Promise.resolve({ player: h.player, at: frames(5) });
+          },
+        ],
+        [
+          'while paused',
+          async () => {
+            const h = recorded();
+            await h.player.play();
+            run(h.clock, 3);
+            h.player.pause();
+            return { player: h.player, at: frames(5) };
+          },
+        ],
+      ])('refuses %s, changing nothing', async (_, setup) => {
+        const { player, at } = await setup();
+        const before = player.getSnapshot();
+        const position = player.getPosition();
+
+        expect(player.land(at)).toBe(false);
+        expect(player.land({ frame: at, held: true })).toBe(false);
+
+        expect(player.getSnapshot()).toBe(before);
+        expect(player.getPosition()).toBe(position);
+      });
+    });
+
+    describe('landing on the shadow', () => {
+      it('refuses with the shadow stopped', async () => {
+        const h = recorded();
+        await h.player.play();
+
+        expect(h.player.landOnShadow()).toBe(false);
+      });
+
+      it.each([
+        ['no record', async () => (await playingCounter(3)).player],
+        [
+          'the player paused',
+          async () => {
+            const h = recorded();
+            await h.player.play();
+            run(h.clock, 3);
+            h.player.pause();
+            return h.player;
+          },
+        ],
+        [
+          'the shadow past the record',
+          async () => {
+            const h = recorded(4);
+            await h.player.play();
+            run(h.clock, 3);
+            return h.player;
+          },
+        ],
+      ])('refuses, changing nothing, with %s', async (_, setup) => {
+        const player = await setup();
+        player.startShadow(null, { frame: frames(player.getPosition() + 2), held: false });
+        const before = player.getSnapshot();
+
+        expect(player.landOnShadow()).toBe(false);
+
+        expect(player.getSnapshot()).toBe(before);
+      });
+
+      it('sends nothing and returns true when the player already reads the count and phase', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 14);
+        h.player.setActiveLoop(LOOP);
+        h.player.startShadow(null);
+        const delivered = h.sink.deliveredFrames.length;
+        const requests = h.replay.requests.length;
+
+        expect(h.player.landOnShadow()).toBe(true);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.sink.deliveredFrames).toHaveLength(delivered);
+        expect(h.sink.deliveredNowFrames).toHaveLength(0);
+        expect(h.replay.requests).toHaveLength(requests);
+        run(h.clock, 1);
+        expect(h.player.getShadowPosition()).toBe(h.player.getPosition());
+      });
+
+      /** Two players, one never disturbed. Both loop the same ten frames; the first starts the shadow
+       *  at frame 14 and then departs. The shadow wraps on the fifth tick after it starts, so five
+       *  departed ticks land on the tick right after the wrap: a held count. */
+      describe.each([
+        ['seek', 3],
+        ['seek', 5],
+        ['seek', 6],
+        ['seek', 8],
+        ['varispeed', 3],
+        ['varispeed', 5],
+        ['varispeed', 7],
+      ] as const)('after the playhead departs by %s for %i ticks', (departure, away) => {
+        it('lines up with a player that never departed, tick for tick, and sends the same registers from the second tick', async () => {
+          const reference = await playingCounter();
+          reference.player.setActiveLoop(LOOP);
+          const h = recorded();
+          await h.player.play();
+          h.player.setActiveLoop(LOOP);
+          run(h.clock, 14);
+          h.player.startShadow(LOOP);
+
+          if (departure === 'seek') {
+            h.player.setActiveLoop(null);
+            await h.player.seek(frames(200));
+          } else {
+            h.player.enterVarispeed(() => 3);
+          }
+          run(h.clock, away);
+          if (departure === 'seek') h.player.setActiveLoop(LOOP);
+          run(reference.clock, 14 + away);
+          expect(h.player.getShadowPosition()).toBe(reference.player.getPosition());
+          expect(countOf(h.player).held).toBe(away === 5);
+
+          expect(h.player.landOnShadow()).toBe(true);
+          await flushEntryImageCapture();
+
+          for (let tick = 1; tick <= 45; tick++) {
+            run(h.clock, 1);
+            run(reference.clock, 1);
+            expect(h.player.getPosition()).toBe(reference.player.getPosition());
+            expect(h.player.getShadowPosition()).toBe(reference.player.getPosition());
+            if (tick >= 2) expect(sentOf(h.player)).toEqual(sentOf(reference.player));
+          }
+          expect(varispeedOn(h.player)).toBe(false);
+        });
+      });
+    });
+
+    describe('laps while the record plays', () => {
+      /** A loop set ahead of the playhead and then jumped into, so it never crosses its start and no
+       *  image of it is saved: the state a first lap meets with nothing held. */
+      async function inLoopWithNoImage(length = 400): Promise<Recorded> {
+        const h = recorded(length);
+        await h.player.play();
+        run(h.clock, 2);
+        h.player.setActiveLoop(LOOP);
+        await h.player.seek(frames(15));
+        return h;
+      }
+
+      it('re-enters on the record in live play, never replaying on this thread, and a built entry image ends it at the next lap', async () => {
+        const h = await inLoopWithNoImage();
+        h.player.keepDeliveries(64);
+        h.player.drainDeliveries(createDeliveryBatch(64));
+        h.replay.manual = true;
+
+        // The gate-off the jump owes, then 16, 17, 18, and 19 wraps the lap.
+        run(h.clock, 5);
+
+        expect(seekToFrameSpy).not.toHaveBeenCalled();
+        expect(varispeedOn(h.player)).toBe(true);
+        expect(h.player.getPosition()).toBe(10);
+        expect(h.player.getStats().resync.inFlightDepth).toBe(1);
+        const requested = h.replay.requests.map((request) => request.targetFrame);
+        expect(requested).toContain(10);
+        expect(requested).toContain(10 + LEAD);
+
+        // The lap's resync: a gate-off that leaves the position, then every register, then the record.
+        expect(bytesOver(h, 10)).toEqual([null, ...range(11, 19)]);
+        expect(varispeedOn(h.player)).toBe(true);
+        const batch = createDeliveryBatch(64);
+        h.player.drainDeliveries(batch);
+        expect(batch.restarted).toBe(false);
+
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+        expect(bytesOver(h, 10)).toEqual([null, ...range(11, 19)]);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(10);
+        expect(seekToFrameSpy).not.toHaveBeenCalled();
+      });
+
+      it('keeps a handback going through a lap with no image, and the image it asked for still ends it', async () => {
+        const h = recorded();
+        h.replay.manual = true;
+        await h.player.play();
+        h.player.enterVarispeed(() => 1);
+        run(h.clock, 14);
+        h.player.setActiveLoop(LOOP);
+        h.player.leaveVarispeed();
+
+        run(h.clock, 5); // 15, 16, 17, 18, and 19 wraps the lap
+
+        expect(seekToFrameSpy).not.toHaveBeenCalled();
+        expect(varispeedOn(h.player)).toBe(true);
+        expect(h.player.getPosition()).toBe(10);
+        expect(h.replay.requests.map((request) => request.targetFrame)).toEqual([10, 14 + LEAD]);
+
+        run(h.clock, 3);
+        h.replay.resolveAll();
+        await flushEntryImageCapture();
+        run(h.clock, 7);
+
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(seekToFrameSpy).not.toHaveBeenCalled();
+      });
+
+      it('still restores the track’s own wrap to frame 0 from the ring’s seed, record or no record', async () => {
+        const h = recorded();
+        h.player.setTrackStructure({
+          loopStartFrame: frames(0),
+          loopPeriodFrames: frames(10),
+          endedAtFrame: null,
+        });
+        h.player.setRepeatTrack(true);
+        await h.player.play();
+
+        run(h.clock, 9);
+
+        expect(seekToFrameSpy).toHaveBeenCalledTimes(1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(0);
+      });
+
+      it('arms the track’s own loop and laps it on the record when its start has no image', async () => {
+        const h = recorded();
+        h.player.setTrackStructure({
+          loopStartFrame: frames(4),
+          loopPeriodFrames: frames(6),
+          endedAtFrame: null,
+        });
+        h.player.setRepeatTrack(true);
+        h.replay.manual = true;
+        await h.player.play();
+
+        run(h.clock, 9);
+
+        expect(seekToFrameSpy).not.toHaveBeenCalled();
+        expect(varispeedOn(h.player)).toBe(true);
+        expect(h.player.getPosition()).toBe(4);
+        expect(h.player.getSnapshot().loop).toEqual({ startFrame: 4, endFrame: 10 });
+      });
+
+      it('runs the seek as it always has when the record does not cover the loop’s start', async () => {
+        const h = await inLoopWithNoImage(5);
+
+        run(h.clock, 5);
+
+        expect(seekToFrameSpy).toHaveBeenCalledTimes(1);
+        expect(varispeedOn(h.player)).toBe(false);
+        expect(h.player.getPosition()).toBe(10);
+      });
+    });
+
+    describe('in a loop whose length is not a whole number of frames', () => {
+      /** 1/8 of a 28-frame beat from frame 10, whose laps run 4, 3, 4, 3. */
+      const EIGHTH = { startFrame: frames(10), endFrame: frames(13.5) };
+
+      it('counts the shadow with the player’s own laps, from the lap it is in, and countAfter agrees', async () => {
+        const h = await playingCounter();
+        h.player.setActiveLoop(EIGHTH);
+        run(h.clock, 15); // into the second lap, the three-frame one
+
+        expect(h.player.getLapPhase()).toBe(0.5);
+        expect(h.player.startShadow(EIGHTH)).toBe(true);
+        const origin = countOf(h.player);
+        expect(origin.lapPhase).toBe(0.5);
+        for (let tick = 1; tick <= 200; tick++) {
+          run(h.clock, 1);
+          expect(h.player.getShadowPosition()).toBe(h.player.getPosition());
+          expect(countAfter(origin, tick, EIGHTH)).toEqual(countOf(h.player));
+          expect(countOf(h.player).lapPhase).toBe(h.player.getLapPhase());
+        }
+      });
+
+      /** Two players looping the same eighth, one never disturbed. The first starts the shadow and
+       *  departs; landing on the shadow puts it back in the very lap the undisturbed one is in. */
+      describe.each([
+        ['seek', 3],
+        ['seek', 4],
+        ['seek', 6],
+        ['seek', 7],
+        ['seek', 11],
+        ['varispeed', 3],
+        ['varispeed', 5],
+        ['varispeed', 10],
+      ] as const)('after the playhead departs by %s for %i ticks', (departure, away) => {
+        it('lines up with a player that never departed, tick for tick, lap for lap', async () => {
+          const reference = await playingCounter();
+          reference.player.setActiveLoop(EIGHTH);
+          const h = recorded();
+          await h.player.play();
+          h.player.setActiveLoop(EIGHTH);
+          run(h.clock, 15);
+          h.player.startShadow(EIGHTH);
+
+          if (departure === 'seek') {
+            h.player.setActiveLoop(null);
+            await h.player.seek(frames(200));
+          } else {
+            h.player.enterVarispeed(() => 3);
+          }
+          run(h.clock, away);
+          // Set again, the loop starts from its own lap 0: only the landing knows the lap.
+          if (departure === 'seek') h.player.setActiveLoop(EIGHTH);
+          run(reference.clock, 15 + away);
+          expect(h.player.getShadowPosition()).toBe(reference.player.getPosition());
+          expect(countOf(h.player).lapPhase).toBe(reference.player.getLapPhase());
+
+          expect(h.player.landOnShadow()).toBe(true);
+          await flushEntryImageCapture();
+
+          for (let tick = 1; tick <= 60; tick++) {
+            run(h.clock, 1);
+            run(reference.clock, 1);
+            expect(h.player.getPosition()).toBe(reference.player.getPosition());
+            expect(h.player.getShadowPosition()).toBe(reference.player.getPosition());
+            if (tick >= 2) expect(sentOf(h.player)).toEqual(sentOf(reference.player));
+          }
+          expect(h.player.getLapPhase()).toBe(reference.player.getLapPhase());
+          expect(varispeedOn(h.player)).toBe(false);
+        });
+      });
+
+      it('lands a count’s lap even when the player already reads its frame and phase', async () => {
+        const h = recorded();
+        await h.player.play();
+        h.player.setActiveLoop(EIGHTH);
+        run(h.clock, 14); // the first lap's wrap, then its gate-off: at the start, in lap 1
+        expect(h.player.getPosition()).toBe(10);
+        expect(h.player.getLapPhase()).toBe(0.5);
+        h.player.startShadow(EIGHTH, { frame: frames(10), held: false, lapPhase: 0 });
+        const delivered = h.sink.deliveredFrames.length;
+
+        expect(h.player.landOnShadow()).toBe(true);
+
+        expect(h.sink.deliveredFrames).toHaveLength(delivered);
+        expect(h.player.getLapPhase()).toBe(0);
+      });
+
+      it('refuses a landing on a lap phase that is not a number, changing nothing', async () => {
+        const h = recorded();
+        await h.player.play();
+        run(h.clock, 3);
+        const before = h.player.getSnapshot();
+
+        expect(h.player.land({ frame: frames(5), held: false, lapPhase: Number.NaN })).toBe(false);
+        expect(
+          h.player.startShadow(EIGHTH, { frame: frames(5), held: false, lapPhase: Infinity }),
+        ).toBe(false);
+
+        expect(h.player.getSnapshot()).toBe(before);
       });
     });
   });

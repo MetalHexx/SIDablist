@@ -13,6 +13,11 @@ export interface QueuedJump {
   /** How varispeed holds the queued loop once it is running — see `ActiveLoop`. Means something
    *  only when `endFrame` is set. */
   readonly varispeedStart?: VarispeedLoopStart;
+  /** The queued loop's lap phase — see `ActiveLoop`. Reported as handed in; a landing from a
+   *  running loop laps on from that loop's clock instead (see `SidPlayer.queueJump`), and this
+   *  phase is used only for a hand-off from the track's own loop. Means something only when
+   *  `endFrame` is set and the length is not whole. */
+  readonly lapPhase?: number;
 }
 
 /** Output-stage settings a jump applies as it lands, in the engine's own terms. It applies
@@ -55,12 +60,18 @@ export interface PlayerSnapshot {
     readonly preparedFrames: readonly Frames[];
     /** The jump queued for the end of the running loop's lap, or null. */
     readonly queuedJump: QueuedJump | null;
+    /** The change of loop named for the lap that ends at `atFrame`, or null. The running loop's
+     *  `endFrame` already reads `atFrame` while it is pending; `loop` takes over at that wrap. */
+    readonly loopChange: { readonly atFrame: Frames; readonly loop: ActiveLoop } | null;
     /** How many queued jumps the engine has handed off to since this tune and subtune loaded. It
      *  increments once per hand-off and never on a cancel, a replace or a clear, so a host can tell
      *  a landing from a dropped queue. */
     readonly handOffs: number;
     /** The register record's length in play calls, or null without a record. */
     readonly recordedFrames: Frames | null;
+    /** True from `startShadow` until the shadow position stops. The count itself moves every tick
+     *  and is pulled with `getShadowPosition()`. */
+    readonly shadowRunning: boolean;
   } | null;
   readonly tempo: {
     readonly multiplier: number;

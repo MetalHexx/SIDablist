@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Cpu6502, Cpu6502Bus } from './cpu-port.js';
-import { assertCpuStateKeys, createVendorCpu } from './vendor-cpu.js';
+import { assertCpuStateKeys, createCpuStateRecord, createVendorCpu } from './vendor-cpu.js';
 
 interface RecordedWrite {
   readonly address: number;
@@ -91,6 +91,21 @@ describe('createVendorCpu', () => {
     runCycles(cpu, 60);
 
     expect(snapshot).toEqual(capturedFields);
+  });
+
+  it('copies its state into a record it was given, as getState() would return it', () => {
+    const { bus } = createLoopMachine();
+    const cpu = createVendorCpu(bus);
+    cpu.reset();
+    runCycles(cpu, 30);
+    const target = createCpuStateRecord();
+
+    cpu.copyStateInto(target);
+
+    expect(target).toEqual(cpu.getState());
+    const copied = { ...target };
+    runCycles(cpu, 60);
+    expect(target).toEqual(copied);
   });
 
   it('classifies a documented opcode as legal and an unassigned opcode as illegal', () => {

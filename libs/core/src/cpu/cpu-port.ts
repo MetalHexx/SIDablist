@@ -34,5 +34,8 @@ export interface Cpu6502 {
    *  Exposed because that table is built once, statically, and has no other route to `decode`. */
   decode(opcode: number): { readonly illegal: boolean };
   getState(): CpuState;
+  /** Writes the same fields `getState` returns into an existing record, replacing a fresh object
+   *  with one the caller allocated once. */
+  copyStateInto(target: Record<string, unknown>): void;
   setState(state: CpuState): void;
 }

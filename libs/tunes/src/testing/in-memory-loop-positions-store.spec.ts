@@ -26,6 +26,22 @@ describe('InMemoryLoopPositionsStore', () => {
     expect(await store.load(IDENTITY)).toEqual(markers);
   });
 
+  it('keeps a boundary that is not a whole frame exactly as it was saved', async () => {
+    const store = new InMemoryLoopPositionsStore();
+    const eighth: LoopMarker = {
+      ...marker('a', 102),
+      end: { frame: 105.5, offsetFrames: 0 },
+    };
+    const sixteenth: LoopMarker = {
+      ...marker('b', 104),
+      end: { frame: 106.75, offsetFrames: 1 },
+    };
+
+    await store.save(IDENTITY, [eighth, sixteenth]);
+
+    expect(await store.load(IDENTITY)).toEqual([eighth, sixteenth]);
+  });
+
   it('keeps each subtune and each file isolated', async () => {
     const store = new InMemoryLoopPositionsStore();
     const saved = [marker('a', 100)];
