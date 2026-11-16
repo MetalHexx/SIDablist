@@ -11,8 +11,11 @@ import type { DetectedBeatGrid } from './beat-grid.js';
  *
  *  Version 5 rekeyed the record by content hash, so no version-4 record is addressable anyway.
  *
- *  Version 6 replaces the pulse fields with the beat grid. */
-export const TUNE_INDEX_FORMAT_VERSION = 6;
+ *  Version 6 replaces the pulse fields with the beat grid.
+ *
+ *  Version 7: the engine's fixes to interrupt exits, play rate, and the VIC and CIA change what some
+ *  tunes play, so every stored scan is redone. */
+export const TUNE_INDEX_FORMAT_VERSION = 7;
 
 export type DetectorConfidence = 'strong' | 'weak' | 'none';
 
@@ -67,7 +70,7 @@ export interface TuneIndexRecord {
 
   readonly callsPerFrame: number; // rounded integer — reinterprets stored frames as time later
   /** The un-rounded rate the tune's timer describes, so the Timing toggle can flip between the two
-   *  without a re-scan. */
+   *  without a re-scan. Below 1 for a CIA timer slower than a frame, where `callsPerFrame` stays 1. */
   readonly exactCallsPerFrame: number;
   readonly timingMode: TimingMode;
   readonly formatVersion: number;

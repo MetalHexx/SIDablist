@@ -263,6 +263,39 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `ended`, nothing in the transport rules stops the clock varispeed started, so every exit from it
   must — `loadTune`, `selectSubtune`, `stop`, `dispose` and the paused landing each do. A new exit
   that forgets leaves a clock ticking a player that reads stopped.
+- **The play rate is the header's speed bit and the tune's own interrupt enables, and the player's
+  mirror must never lag the machine.** A PSID with a play address plays at CIA 1 timer A's rate when
+  its song's speed bit is 1 (the latch the tune wrote, else the PSID default) and once per frame when
+  it is 0, whatever the latch says; one with play address 0 ignores the bits and follows the interrupt
+  `$DC0D` and `$D01A` have left enabled; an RSID keeps "a written latch means CIA". The rate's inputs
+  ride in `MachineSnapshot` and go in all five places together — the interface,
+  `WritableMachineSnapshot`, `createMachineImage`, `copyMachineImage` and `snapshot`/`snapshotInto`/
+  `restore` — as plain values, so a snapshot still structured-clones to the replay worker. The player
+  mirrors the two rates and `followPlayRate` compares them after every tick and every place the live
+  machine is restored: `TuneSession.adoptState` (which `restoreState`, a jump landing and a handback
+  all go through) and the lap and hand-off in `enforceLoop`. A new restore that skips it runs the
+  clock at the old rate until the tune next changes it; only the `a tune that changes its own play
+rate` specs in `player/create-sid-player.spec.ts` catch it.
+- **A rate the tune changes re-times the clock and nothing else.** `followPlayRate` calls
+  `clock.setIntervalUs` and keeps `runningIntervalUs` in step; it never calls `sink.retime`, because
+  the frames the sink already holds were played at the rate they had, and that stays with a tempo
+  command through `applyIntervalChange`. It builds no snapshot either: `PlayerSnapshot.tempo.rate` and
+  `effectiveIntervalUs` catch up at the player's next notification for any other reason, a deliberate
+  lag, while `getStats().rate` reads live. It is two number compares and allocates nothing, even for a
+  tune that swings its latch every call — which is why `effectiveIntervalUs` divides through
+  `playCallIntervalUsAt` and not a `PlayRate`.
+- **Varispeed sees a rate change only where an image lands.** No machine runs there, so the rate moves
+  only when a handback adopts an image or a lap or hand-off restores one, and each of those ends the
+  varispeed: the clock re-times as it ends, through the same `followPlayRate`, and nothing applies
+  sooner. The rate source still issues no command.
+- **`exactCallsPerFrame` is below 1 for a timer slower than a frame, and every reader of it has to
+  stand that.** `callsPerFrame` and `roundedCallsPerFrame` stay at 1 or above, so `'rounded'` timing
+  plays such a tune at one call a frame, as it always did. In exact timing `playCallIntervalUs` is
+  longer than the nominal interval, `msToPlayCalls` and `playCallsPerSecond` give fewer calls to a
+  second of music, `seekReachFrames` shrinks (about 15 frames at the slowest timer a latch can
+  program) and the anchor ring re-spaces to it, and a varispeed tick is the longer running interval.
+  The handback lead and the ring spacing floor at one frame, which is what keeps a slow tune from
+  dividing them to nothing. `libs/analysis` reads the same rate; its guide says what it does there.
 - **Every exit from varispeed returns the rate pitch to home through `endVarispeed`.** The rate pitch
   lives on the `RegisterFrame`, which `stop()` and a subtune change keep, so one left at 0 silences
   the next play. A new exit calls the one routine rather than setting the pitch itself.
@@ -330,10 +363,15 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `cpu/c64-machine.spec.ts` (the `entering a handler as an interrupt` specs) and the HVSC fingerprint
   check (`fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench), since
   every tune's writes ride on this entry. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
-- **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`)
-  or `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
-  shifted meaning is a wrong index record, not a compile error. Run analysis's
-  `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+- **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`),
+  what decides the rate (`speedFlags`, `psidSpecific`, the `$DC0D` and `$D01A` handling) or
+  `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?**
+  `libs/analysis`'s `scan-tune.ts` reads both rates once, when it builds its output, not per frame — a
+  shifted meaning is a wrong index record, not a compile error, and a change to what a tune plays
+  needs `TUNE_INDEX_FORMAT_VERSION` bumped so every stored scan is redone. Run analysis's
+  `scan-tune.spec.ts`, and the HVSC fingerprint check
+  (`fingerprint.mjs check --change <name>`, in the shared SIDABLIST-ROOT bench) to see which tunes
+  moved. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 - **Changed `RegisterRecord` (`registers/register-record.ts`), or how `RegisterFrame` snapshots a
   doubled voice control write?** `libs/analysis`'s `toRegisterRecord` and `TuneScan.recordControls`
   build the record from that shape, and `feed` (`player/varispeed.ts`) plays it back. A shifted

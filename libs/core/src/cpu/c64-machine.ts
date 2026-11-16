@@ -8,6 +8,8 @@ import {
   CIA1_TIMER_A_LATCH_HIGH,
   CIA1_TIMER_A_LATCH_LOW,
   CIA2_INTERRUPT_CONTROL,
+  CIA_INTERRUPT_SET_BIT,
+  CIA_INTERRUPT_TIMER_A_BIT,
   CIA_INTERRUPT_TIMER_A_SET,
   FIRST_RELOCATABLE_PAGE,
   INIT_BUDGET_FRAMES,
@@ -43,6 +45,8 @@ import {
   PAL_CYCLES_PER_RASTER_LINE,
   PAL_RASTER_LINES,
   PLAY_BUDGET_FRAMES,
+  PSID_DEFAULT_TIMER_A_LATCH_NTSC,
+  PSID_DEFAULT_TIMER_A_LATCH_PAL,
   RESET_VECTOR,
   SID_LAST_AUDIBLE_REGISTER,
   SID_RANGE_END,
@@ -61,6 +65,8 @@ import {
   TRAMPOLINE_PLAY_TARGET_OFFSET,
   VIC_CONTROL_IDLE_BITS,
   VIC_CONTROL_REGISTER,
+  VIC_INTERRUPT_ENABLE_REGISTER,
+  VIC_RASTER_INTERRUPT_BIT,
   VIC_RASTER_REGISTER,
 } from './cpu-constants.js';
 
@@ -101,7 +107,14 @@ export interface MachineSnapshot {
   readonly trampoline: number;
   readonly idleAddress: number;
   readonly playAddress: number;
+  /** What the tune wrote to CIA 1 timer A's latch, or `null` while it has written none. */
   readonly timerALatch: number | null;
+  /** The rest of what the play rate is read from — the interrupt enables a tune's writes build on
+   *  the speed bit's default, and the played song's speed bit. Plain values, so a snapshot still
+   *  structured-clones to and from the replay worker. */
+  readonly timerAInterruptEnabled: boolean;
+  readonly rasterInterruptEnabled: boolean;
+  readonly speedBit: number;
   readonly cyclesThisCall: number;
   readonly reachedIdle: boolean;
   readonly expectingOpcodeFetch: boolean;
@@ -119,6 +132,9 @@ export interface WritableMachineSnapshot {
   idleAddress: number;
   playAddress: number;
   timerALatch: number | null;
+  timerAInterruptEnabled: boolean;
+  rasterInterruptEnabled: boolean;
+  speedBit: number;
   cyclesThisCall: number;
   reachedIdle: boolean;
   expectingOpcodeFetch: boolean;
@@ -135,6 +151,9 @@ export function createMachineImage(): WritableMachineSnapshot {
     idleAddress: 0,
     playAddress: 0,
     timerALatch: null,
+    timerAInterruptEnabled: false,
+    rasterInterruptEnabled: false,
+    speedBit: 0,
     cyclesThisCall: 0,
     reachedIdle: false,
     expectingOpcodeFetch: false,
@@ -151,6 +170,9 @@ export function copyMachineImage(source: MachineSnapshot, target: WritableMachin
   target.idleAddress = source.idleAddress;
   target.playAddress = source.playAddress;
   target.timerALatch = source.timerALatch;
+  target.timerAInterruptEnabled = source.timerAInterruptEnabled;
+  target.rasterInterruptEnabled = source.rasterInterruptEnabled;
+  target.speedBit = source.speedBit;
   target.cyclesThisCall = source.cyclesThisCall;
   target.reachedIdle = source.reachedIdle;
   target.expectingOpcodeFetch = source.expectingOpcodeFetch;
@@ -163,25 +185,30 @@ export function copyMachineImage(source: MachineSnapshot, target: WritableMachin
  * the tune makes to the SID's address range is handed to the sink.
  */
 export interface C64Machine {
-  /** Cycles between play calls when the tune programmed CIA 1 timer A; `null` for a frame-rate tune. */
+  /**
+   * Cycles between play calls when CIA 1 timer A sets the rate — its latch plus one, the latch being
+   * the tune's own or, for a CIA-timed PSID that wrote none, the PSID default; `null` when the tune
+   * plays once per frame. Read live: a latch or interrupt-enable write takes effect from the next call.
+   */
   readonly cyclesPerPlayCall: number | null;
 
   /**
    * How many play calls a second of this tune wants per frame, 1..16. This is advice for the
-   * caller's clock — `runFrame` still calls the play routine exactly once.
+   * caller's clock — `runFrame` still calls the play routine exactly once. A timer slower than a
+   * frame still reads 1 here; `exactCallsPerFrame` is the one that follows it below 1.
    */
   readonly callsPerFrame: number;
 
   /**
    * The same rate as `callsPerFrame`, but unrounded — the fractional play rate the CIA timer latch
-   * actually describes.
+   * actually describes. At most 16, and below 1 for a timer slower than a frame.
    *
    * A tune programs timer A to whatever period it wants, and that period is under no obligation to
-   * divide the frame evenly: rates like 2.4 calls per frame are ordinary. `callsPerFrame` rounds,
-   * which is right for the integer "how many calls does a frame want" question its name asks, but
-   * wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow, and
-   * the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock; use
-   * `callsPerFrame` only where an integer count is genuinely what is wanted.
+   * divide the frame evenly: rates like 2.4 calls per frame are ordinary, and so is 0.5. `callsPerFrame`
+   * rounds, which is right for the integer "how many calls does a frame want" question its name asks,
+   * but wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow,
+   * and the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock;
+   * use `callsPerFrame` only where an integer count is genuinely what is wanted.
    */
   readonly exactCallsPerFrame: number;
 
@@ -285,11 +312,22 @@ class C64MachineImpl implements C64Machine {
   private readonly entersAsInterrupt: boolean;
   /** What `$FFFE` holds until a tune installs its own handler. */
   private readonly defaultHardwareVector: number;
+  /** What timer A's latch is taken to hold in a CIA-timed PSID that never writes it. */
+  private readonly defaultTimerALatch: number;
 
   private trampoline = TRAMPOLINE_BASE;
   private idleAddress = TRAMPOLINE_BASE + TRAMPOLINE_IDLE_OFFSET;
   private playAddress = 0;
   private timerALatch: number | null = null;
+  /** The interrupt `$DC0D` has enabled for timer A. Starts as the speed bit's default environment
+   *  and follows the tune's writes; it decides the rate only of a PSID with play address 0. */
+  private timerAInterruptEnabled = false;
+  /** `$D01A`'s raster enable, likewise from the default environment. A tune without timer A's
+   *  interrupt plays once per frame whether or not this one is on, so no rate reads it; it is held
+   *  so the snapshot carries the whole interrupt environment the tune's writes built. */
+  private rasterInterruptEnabled = false;
+  /** The played song's bit of the header's speed word, set by `initSubtune`. */
+  private speedBit = 0;
   private cyclesThisCall = 0;
   private reachedIdle = false;
   private expectingOpcodeFetch = false;
@@ -305,6 +343,9 @@ class C64MachineImpl implements C64Machine {
     this.defaultHardwareVector = file.format === 'PSID' ? BRK_HANDLER_STUB : IRQ_HANDLER_STUB;
 
     const ntsc = file.clock === 'ntsc';
+    this.defaultTimerALatch = ntsc
+      ? PSID_DEFAULT_TIMER_A_LATCH_NTSC
+      : PSID_DEFAULT_TIMER_A_LATCH_PAL;
     this.cyclesPerFrame = ntsc ? NTSC_CYCLES_PER_FRAME : PAL_CYCLES_PER_FRAME;
     this.cyclesPerRasterLine = ntsc ? NTSC_CYCLES_PER_RASTER_LINE : PAL_CYCLES_PER_RASTER_LINE;
     this.rasterLineCount = ntsc ? NTSC_RASTER_LINES : PAL_RASTER_LINES;
@@ -324,6 +365,9 @@ class C64MachineImpl implements C64Machine {
       idleAddress: this.idleAddress,
       playAddress: this.playAddress,
       timerALatch: this.timerALatch,
+      timerAInterruptEnabled: this.timerAInterruptEnabled,
+      rasterInterruptEnabled: this.rasterInterruptEnabled,
+      speedBit: this.speedBit,
       cyclesThisCall: this.cyclesThisCall,
       reachedIdle: this.reachedIdle,
       expectingOpcodeFetch: this.expectingOpcodeFetch,
@@ -338,6 +382,9 @@ class C64MachineImpl implements C64Machine {
     target.idleAddress = this.idleAddress;
     target.playAddress = this.playAddress;
     target.timerALatch = this.timerALatch;
+    target.timerAInterruptEnabled = this.timerAInterruptEnabled;
+    target.rasterInterruptEnabled = this.rasterInterruptEnabled;
+    target.speedBit = this.speedBit;
     target.cyclesThisCall = this.cyclesThisCall;
     target.reachedIdle = this.reachedIdle;
     target.expectingOpcodeFetch = this.expectingOpcodeFetch;
@@ -351,6 +398,9 @@ class C64MachineImpl implements C64Machine {
     this.idleAddress = snapshot.idleAddress;
     this.playAddress = snapshot.playAddress;
     this.timerALatch = snapshot.timerALatch;
+    this.timerAInterruptEnabled = snapshot.timerAInterruptEnabled;
+    this.rasterInterruptEnabled = snapshot.rasterInterruptEnabled;
+    this.speedBit = snapshot.speedBit;
     this.cyclesThisCall = snapshot.cyclesThisCall;
     this.reachedIdle = snapshot.reachedIdle;
     this.expectingOpcodeFetch = snapshot.expectingOpcodeFetch;
@@ -358,23 +408,55 @@ class C64MachineImpl implements C64Machine {
   }
 
   get cyclesPerPlayCall(): number | null {
-    return this.timerALatch === null ? null : this.timerALatch + 1;
+    if (!this.timerAGovernsRate()) {
+      return null;
+    }
+    return (this.timerALatch ?? this.defaultTimerALatch) + 1;
   }
 
   get callsPerFrame(): number {
-    const rate = this.cyclesPerPlayCall;
-    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+    const cyclesPerCall = this.cyclesPerPlayCall;
+    if (cyclesPerCall === null || cyclesPerCall >= this.cyclesPerFrame) {
       return 1;
     }
-    return Math.min(MAX_CALLS_PER_FRAME, Math.max(1, Math.round(this.cyclesPerFrame / rate)));
+    return Math.min(
+      MAX_CALLS_PER_FRAME,
+      Math.max(1, Math.round(this.cyclesPerFrame / cyclesPerCall)),
+    );
   }
 
   get exactCallsPerFrame(): number {
-    const rate = this.cyclesPerPlayCall;
-    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+    const cyclesPerCall = this.cyclesPerPlayCall;
+    if (cyclesPerCall === null) {
       return 1;
     }
-    return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / rate);
+    return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / cyclesPerCall);
+  }
+
+  /**
+   * Whether CIA 1 timer A's rate, rather than one call per frame, is the tune's play rate.
+   *
+   * A PSID with a play address follows its speed bit, whatever the tune writes to the CIA. One
+   * without installed its own handler: the speed bits are ignored and the rate is whatever interrupt
+   * the tune has enabled. An RSID keeps the rule it always had, that a tune which wrote the latch
+   * is CIA-timed.
+   */
+  private timerAGovernsRate(): boolean {
+    if (this.file.format === 'RSID') {
+      return this.timerALatch !== null;
+    }
+    return this.entersAsInterrupt ? this.timerAInterruptEnabled : this.speedBit === 1;
+  }
+
+  /**
+   * The played song's bit of the header's speed word. Version 1 files and PSIDs flagged PlaySID
+   * specific repeat the 32 bits across songs; a later version without the flag gives every song past
+   * the 32nd the last bit.
+   */
+  private speedBitFor(song: number): number {
+    const { version, speedFlags, psidSpecific } = this.file;
+    const index = version === 1 || psidSpecific === true ? (song - 1) % 32 : Math.min(song - 1, 31);
+    return (speedFlags >>> index) & 1;
   }
 
   get frameCycleBudget(): Cycles {
@@ -401,6 +483,9 @@ class C64MachineImpl implements C64Machine {
 
     this.memory.fill(0);
     this.timerALatch = null;
+    this.speedBit = this.speedBitFor(song);
+    this.timerAInterruptEnabled = this.speedBit === 1;
+    this.rasterInterruptEnabled = this.speedBit === 0;
     this.illegalOpcodes = 0;
 
     this.installRomStubs();
@@ -496,10 +581,19 @@ class C64MachineImpl implements C64Machine {
     }
   }
 
-  /** The write side of the CPU's bus. See `read` for why banking is ignored. */
+  /**
+   * The write side of the CPU's bus. See `read` for why banking is ignored.
+   *
+   * Every register the machine reacts to lies between `$D01A` and `$DC0D`, so one range test lets an
+   * ordinary RAM store skip the rest.
+   */
   private write(address: number, value: number): void {
     const byte = value & 0xff;
     this.memory[address & 0xffff] = byte;
+
+    if (address < VIC_INTERRUPT_ENABLE_REGISTER || address > CIA1_INTERRUPT_CONTROL) {
+      return;
+    }
 
     if (address >= SID_RANGE_START && address <= SID_RANGE_END) {
       if (!this.isSecondOrThirdSidAddress(address)) {
@@ -511,8 +605,19 @@ class C64MachineImpl implements C64Machine {
       return;
     }
 
-    if (address === CIA1_TIMER_A_LATCH_LOW || address === CIA1_TIMER_A_LATCH_HIGH) {
-      this.timerALatch = this.readWord(CIA1_TIMER_A_LATCH_LOW);
+    switch (address) {
+      case CIA1_TIMER_A_LATCH_LOW:
+      case CIA1_TIMER_A_LATCH_HIGH:
+        this.timerALatch = this.readWord(CIA1_TIMER_A_LATCH_LOW);
+        break;
+      case CIA1_INTERRUPT_CONTROL:
+        if ((byte & CIA_INTERRUPT_TIMER_A_BIT) !== 0) {
+          this.timerAInterruptEnabled = (byte & CIA_INTERRUPT_SET_BIT) !== 0;
+        }
+        break;
+      case VIC_INTERRUPT_ENABLE_REGISTER:
+        this.rasterInterruptEnabled = (byte & VIC_RASTER_INTERRUPT_BIT) !== 0;
+        break;
     }
   }
 

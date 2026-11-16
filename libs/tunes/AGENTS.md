@@ -91,9 +91,10 @@ it except the `InMemory*` doubles. `plain-copy.ts` is internal too.
   change, not a refactor. `md5.spec.ts`'s HVSC-sourced Still Time digest is the check that this
   package still agrees with the file HVSC's own `Songlengths.md5` addresses by the same hash.
 - **Bumped `@sidablist/analysis`'s `TUNE_INDEX_FORMAT_VERSION` or reshaped `TuneIndexRecord`?**
-  `resolver.ts` compares `formatVersion` on every `getIndex` hit — confirm the miss path still
-  round-trips the new shape through `TuneStore.putIndex` the way the host's storage expects.
-  Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+  `resolver.ts` compares `formatVersion` on every `getIndex` hit — every record stored under the old
+  number is a miss and is scanned again, so confirm the miss path still round-trips the new shape
+  through `TuneStore.putIndex` the way the host's storage expects. A bump follows a change to what
+  the engine plays as well as to a detector. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 
 ## Commands
 

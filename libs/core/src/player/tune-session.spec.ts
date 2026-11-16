@@ -74,6 +74,7 @@ function tune(options: {
   songs?: number;
   clock?: SidClock;
   playAddress?: number;
+  speedFlags?: number;
   blocks: readonly CodeBlock[];
 }): SidFile {
   const loadAddress = 0x1000;
@@ -93,7 +94,7 @@ function tune(options: {
     playAddress: options.playAddress ?? 0x1010,
     songs: options.songs ?? 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags: options.speedFlags ?? 0,
     name: '',
     author: '',
     released: '',
@@ -133,10 +134,12 @@ function counterTune(songs = 1): SidFile {
   });
 }
 
-/** init programs CIA 1 timer A for exactly two play calls per frame; play still writes nothing. */
+/** init programs CIA 1 timer A for exactly two play calls per frame, and the header's speed bit
+ *  says CIA-timed; play still writes nothing. */
 function doubleSpeedTune(): SidFile {
   // LDA #$63 / STA $DC04 / LDA #$26 / STA $DC05 / RTS — a latch of 9827, half a PAL frame.
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },
@@ -174,10 +177,12 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
   readonly failures: string[];
   readonly resyncCount: { count: number };
   readonly dirtyCount: { count: number };
+  readonly followCount: { count: number };
 } {
   const failures: string[] = [];
   const resyncCount = { count: 0 };
   const dirtyCount = { count: 0 };
+  const followCount = { count: 0 };
   let machineRates: { exact: number; rounded: number } = { exact: 1, rounded: 1 };
   const playRate = (): PlayRate => ({
     callsPerFrame: machineRates.exact,
@@ -193,6 +198,9 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
         exact: machine?.exactCallsPerFrame ?? 1,
         rounded: machine?.callsPerFrame ?? 1,
       };
+    },
+    followPlayRate: () => {
+      followCount.count++;
     },
     effectiveMutes: () => [false, false, false],
     clearError: () => undefined,
@@ -210,6 +218,7 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
     failures,
     resyncCount,
     dirtyCount,
+    followCount,
   };
 }
 
@@ -583,6 +592,30 @@ describe('TuneSession', () => {
 
       expect(session.framesRendered).toBe(42);
       expect(host.resyncCount.count).toBe(1);
+    });
+
+    it('has the host follow the rate only once the image is on the machine', () => {
+      const source = createTuneSession(new FakeReplayRunner(), fakeHost());
+      source.load(doubleSpeedTune());
+      source.initSubtune(1);
+      const image = (source.machine as C64Machine).snapshot();
+      const registers = (source.frame as RegisterFrame).snapshotValues();
+      const ratesSeenByHost: number[] = [];
+      const session = createTuneSession(
+        new FakeReplayRunner(),
+        fakeHost({
+          followPlayRate: () => {
+            ratesSeenByHost.push(session.machine?.exactCallsPerFrame ?? 0);
+          },
+        }),
+      );
+      session.load(silentTune());
+      session.initSubtune(1);
+
+      session.restoreState(image, registers, frames(10));
+      session.adoptState(image, registers, frames(11));
+
+      expect(ratesSeenByHost).toEqual([2, 2]);
     });
   });
 

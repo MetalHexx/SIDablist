@@ -25,7 +25,7 @@ export const JUMP_CEILING_SECONDS = 300;
  */
 export interface TuneSessionHost {
   nominalIntervalUs(): number;
-  /** The rate in force — mirrors `machineRates()`, never a direct read of
+  /** The rate in force — mirrors the machine's two rates, never a direct read of
    *  `machine.exactCallsPerFrame`/`callsPerFrame`, so `ceilingFrames` stays current after a subtune
    *  init that leaves the nominal interval unchanged. */
   playRate(): PlayRate;
@@ -33,6 +33,9 @@ export interface TuneSessionHost {
    *  latch is only meaningful once init has run, so this is called from `initSubtune`, not from
    *  `load`. */
   syncPlayRate(machine: C64Machine | null): void;
+  /** Called once the live machine has been restored from an image, which carries the rate it was
+   *  taken at: re-times the running clock if the machine's rate no longer matches the mirror. */
+  followPlayRate(): void;
   effectiveMutes(): readonly boolean[];
   /** Clears the engine's error state — the tell that a subtune init succeeded. */
   clearError(): void;
@@ -172,9 +175,9 @@ export interface TuneSession {
   ): void;
 
   /**
-   * `restoreState` without the resync: puts the image on the live pair and adopts its frame number
-   * and nothing else. For a caller whose stream already holds the chip state the image describes,
-   * so a resync would only repeat it.
+   * `restoreState` without the resync: puts the image on the live pair, adopts its frame number and
+   * has the host follow the rate the image carries — nothing else. For a caller whose stream already
+   * holds the chip state the image describes, so a resync would only repeat it.
    */
   adoptState(
     machine: MachineSnapshot,
@@ -477,6 +480,7 @@ class TuneSessionImpl implements TuneSession {
     this._machine.restore(machine);
     this._frame.restoreValues(registers);
     this._framesRendered = frameNumber;
+    this.host.followPlayRate();
   }
 
   discardOutstandingJump(): void {

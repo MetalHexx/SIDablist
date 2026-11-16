@@ -11,6 +11,12 @@ export interface SidFile {
   readonly songs: number;
   readonly startSong: number; // 1-based, as stored
   readonly speedFlags: number; // u32, bit per song: 1 = CIA-timed, 0 = vertical blank
+  /**
+   * A PSID's flags bit 1, "PlaySID specific": the speed word then repeats every 32 songs. Clear — and
+   * absent means clear — a song past the 32nd takes the last speed bit instead. Only a PSID of version 2
+   * or later has one; an RSID's bit 1 means something else and is not read.
+   */
+  readonly psidSpecific?: boolean;
   readonly name: string;
   readonly author: string;
   readonly released: string;

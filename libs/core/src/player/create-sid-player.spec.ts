@@ -212,6 +212,7 @@ function tune(options: {
   songs?: number;
   clock?: SidClock;
   model?: SidModel;
+  speedFlags?: number;
   blocks: readonly CodeBlock[];
 }): SidFile {
   const loadAddress = 0x1000;
@@ -231,7 +232,7 @@ function tune(options: {
     playAddress: 0x1010,
     songs: options.songs ?? 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags: options.speedFlags ?? 0,
     name: '',
     author: '',
     released: '',
@@ -284,9 +285,11 @@ function volumeTune(value: number): SidFile {
 
 /** init programs CIA 1 timer A to a latch of $1FFD, so 19656 / 8190 = 2.4 calls per frame — a rate
  *  that does not divide the frame evenly, which is exactly the case `exactCallsPerFrame` exists to
- *  report correctly and `callsPerFrame` rounds away. */
+ *  report correctly and `callsPerFrame` rounds away. The header's speed bit says CIA-timed, which
+ *  is what makes a play address follow the timer. */
 function fractionalSpeedTune(): SidFile {
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },
@@ -329,9 +332,10 @@ function pulseWidthTune(low: number, high: number): SidFile {
   });
 }
 
-/** init programs CIA 1 timer A for exactly two play calls per frame. */
+/** init programs CIA 1 timer A for exactly two play calls per frame, and the header says CIA-timed. */
 function doubleSpeedTune(): SidFile {
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },
@@ -1727,6 +1731,157 @@ describe('createSidPlayer', () => {
       const { rate } = player.getStats();
       expect(rate.exactCallsPerFrame).toBeCloseTo(2.4, 5);
       expect(rate.roundedCallsPerFrame).toBe(2);
+    });
+  });
+
+  describe('a tune that changes its own play rate', () => {
+    /** Latches giving two calls a frame, one, and 0.6 at PAL. */
+    const TWO_PER_FRAME = 0x2663;
+    const ONE_PER_FRAME = 0x4cc7;
+    const SLOWER_THAN_A_FRAME = 0x7fff;
+    const TWO_PER_FRAME_US = PAL_FRAME_INTERVAL_US / 2;
+
+    /** LDA #low / STA $DC04 / LDA #high / STA $DC05 */
+    const writeLatch = (latch: number): number[] => [
+      ...[0xa9, latch & 0xff],
+      ...[0x8d, 0x04, 0xdc],
+      ...[0xa9, latch >> 8],
+      ...[0x8d, 0x05, 0xdc],
+    ];
+
+    /** CIA-timed: init programs `initial`, and play call number `onCall` programs `later`. */
+    function rateChangingTune(initial: number, later: number, onCall: number): SidFile {
+      return tune({
+        speedFlags: 1,
+        blocks: [
+          { at: 0x1000, bytes: [...writeLatch(initial), RTS] },
+          {
+            at: 0x1010,
+            bytes: [
+              ...[0xe6, 0xfb], // INC $FB
+              ...[0xa5, 0xfb], // LDA $FB
+              ...[0xc9, onCall], // CMP #onCall
+              ...[0xd0, 0x0a], // BNE past the latch write
+              ...writeLatch(later),
+              RTS,
+            ],
+          },
+        ],
+      });
+    }
+
+    it('re-times the clock once when the tune writes a new latch, and never the sink', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(rateChangingTune(TWO_PER_FRAME, ONE_PER_FRAME, 3));
+      await player.play();
+      const setInterval = vi.spyOn(clock, 'setIntervalUs');
+      const notified = vi.fn();
+      player.subscribe(notified);
+      expect(clock.stats.nominalIntervalUs).toBe(TWO_PER_FRAME_US);
+
+      run(clock, 2);
+      expect(setInterval).not.toHaveBeenCalled();
+      run(clock, 1);
+
+      expect(setInterval).toHaveBeenCalledTimes(1);
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+      run(clock, 5);
+      expect(setInterval).toHaveBeenCalledTimes(1);
+      expect(sink.retimeCalls).toHaveLength(0);
+      expect(player.getStats().effectiveIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+      expect(player.getStats().rate.exactCallsPerFrame).toBe(1);
+      expect(notified).not.toHaveBeenCalled();
+    });
+
+    it('still re-times both the clock and the sink on a tempo command, from the rate it now plays at', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(rateChangingTune(TWO_PER_FRAME, ONE_PER_FRAME, 1));
+      await player.play();
+      run(clock, 1);
+      expect(sink.retimeCalls).toHaveLength(0);
+
+      player.setTempo(2);
+
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US / 2);
+      expect(sink.retimeCalls).toEqual([PAL_FRAME_INTERVAL_US / 2]);
+      expect(player.getSnapshot().tempo.rate.exactCallsPerFrame).toBe(1);
+    });
+
+    it('re-times the clock to a timer slower than a frame in exact timing, and holds the frame in rounded timing', async () => {
+      const { player, clock } = harness();
+      player.loadTune(rateChangingTune(ONE_PER_FRAME, SLOWER_THAN_A_FRAME, 2));
+      await player.play();
+      run(clock, 1);
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+
+      run(clock, 1);
+
+      const slower = (PAL_FRAME_INTERVAL_US * 0x8000) / PAL_CYCLES_PER_FRAME;
+      expect(clock.stats.nominalIntervalUs).toBeCloseTo(slower, 6);
+      expect(clock.stats.nominalIntervalUs).toBeGreaterThan(PAL_FRAME_INTERVAL_US);
+      expect(player.getStats().rate.exactCallsPerFrame).toBeLessThan(1);
+      expect(player.getStats().rate.roundedCallsPerFrame).toBe(1);
+
+      player.setTimingMode('rounded');
+
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+    });
+
+    it('re-times the clock on the tick a loop wraps onto an image taken at another rate', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(rateChangingTune(TWO_PER_FRAME, ONE_PER_FRAME, 4));
+      await player.play();
+      run(clock, 2);
+      player.setActiveLoop({ startFrame: frames(2), endFrame: frames(8) });
+      await flushEntryImageCapture();
+
+      const ticks: { position: number; intervalUs: number }[] = [];
+      for (let tick = 0; tick < 12; tick++) {
+        run(clock, 1);
+        ticks.push({ position: player.getPosition(), intervalUs: clock.stats.nominalIntervalUs });
+      }
+
+      const wrap = ticks.findIndex(
+        (tick, index) => index > 0 && tick.position < ticks[index - 1].position,
+      );
+      expect(wrap).toBeGreaterThan(0);
+      expect(ticks[wrap - 1].intervalUs).toBe(PAL_FRAME_INTERVAL_US);
+      expect(ticks[wrap].intervalUs).toBe(TWO_PER_FRAME_US);
+      expect(sink.retimeCalls).toHaveLength(0);
+    });
+
+    it('re-times the clock when a seek lands on an image taken at another rate', async () => {
+      const { player, sink, clock } = harness();
+      player.loadTune(rateChangingTune(TWO_PER_FRAME, ONE_PER_FRAME, 4));
+      await player.play();
+      run(clock, 6);
+      expect(clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+
+      await player.seek(frames(1));
+
+      expect(clock.stats.nominalIntervalUs).toBe(TWO_PER_FRAME_US);
+      expect(sink.retimeCalls).toHaveLength(0);
+    });
+
+    it('re-times the clock as a handback adopts an image taken at another rate', async () => {
+      const h = harness();
+      const file = rateChangingTune(TWO_PER_FRAME, ONE_PER_FRAME, 4);
+      h.player.loadTune(file);
+      h.player.setRegisterRecord(recordFromTune(file, 1, 300));
+      await h.player.play();
+      h.player.enterVarispeed(() => 1);
+      run(h.clock, 3);
+      expect(h.clock.stats.nominalIntervalUs).toBe(TWO_PER_FRAME_US);
+
+      h.player.leaveVarispeed();
+      await flushEntryImageCapture();
+      for (let tick = 0; tick < 400 && h.player.getSnapshot().tempo.varispeed; tick++) {
+        run(h.clock, 1);
+      }
+
+      expect(h.player.getSnapshot().tempo.varispeed).toBe(false);
+      expect(h.clock.stats.nominalIntervalUs).toBe(PAL_FRAME_INTERVAL_US);
+      expect(h.sink.retimeCalls).toHaveLength(0);
     });
   });
 

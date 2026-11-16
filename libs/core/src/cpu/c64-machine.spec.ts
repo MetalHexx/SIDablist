@@ -28,6 +28,9 @@ interface TuneOptions {
   format?: 'PSID' | 'RSID';
   clock?: SidClock;
   songs?: number;
+  version?: number;
+  speedFlags?: number;
+  psidSpecific?: boolean;
   padTo?: number;
   secondSidAddress?: number | null;
   thirdSidAddress?: number | null;
@@ -48,13 +51,14 @@ function tune(options: TuneOptions): SidFile {
 
   return {
     format: options.format ?? 'PSID',
-    version: 2,
+    version: options.version ?? 2,
     loadAddress,
     initAddress: options.initAddress ?? loadAddress,
     playAddress: options.playAddress ?? 0,
     songs: options.songs ?? 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags: options.speedFlags ?? 0,
+    ...(options.psidSpecific === undefined ? {} : { psidSpecific: options.psidSpecific }),
     name: '',
     author: '',
     released: '',
@@ -205,6 +209,7 @@ describe('C64Machine', () => {
   it('derives the play rate from the CIA 1 timer A latch a tune programs during init', () => {
     // LDA #$31 / STA $DC04 / LDA #$13 / STA $DC05 / RTS — latch $1331, so 4914 cycles per call
     const file = tune({
+      speedFlags: 1,
       playAddress: 0x100b,
       blocks: [
         { at: 0x1000, bytes: [0xa9, 0x31, 0x8d, 0x04, 0xdc, 0xa9, 0x13, 0x8d, 0x05, 0xdc, 0x60] },
@@ -224,6 +229,7 @@ describe('C64Machine', () => {
     // 19656 / 8190 is exactly 2.4: a rate that does not divide the frame evenly, which is ordinary
     // for a CIA-timer tune and is precisely the case rounding gets wrong.
     const file = tune({
+      speedFlags: 1,
       playAddress: 0x100b,
       blocks: [
         { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, 0x60] },
@@ -626,6 +632,322 @@ describe('C64Machine entering a handler as an interrupt', () => {
     expect(results.every((result) => result.completed)).toBe(true);
     expect(sink.writes.slice(fromRestore)).toEqual(expected);
     expect(expected.map((write) => write.value)).toEqual([3, 4]);
+  });
+});
+
+describe('C64Machine play rate', () => {
+  const ROUTINE = 0x1100;
+  const RTS = 0x60;
+  const CIA_INTERRUPT_CONTROL = 0xdc0d;
+  const VIC_INTERRUPT_ENABLE = 0xd01a;
+
+  /** LDA #low / STA $DC04 / LDA #high / STA $DC05 */
+  const writeLatch = (latch: number): number[] => [
+    0xa9,
+    latch & 0xff,
+    0x8d,
+    0x04,
+    0xdc,
+    0xa9,
+    latch >> 8,
+    0x8d,
+    0x05,
+    0xdc,
+  ];
+  /** LDA #value / STA address */
+  const store = (value: number, address: number): number[] => [
+    0xa9,
+    value,
+    0x8d,
+    address & 0xff,
+    address >> 8,
+  ];
+
+  /** A tune with a header play address: init runs `init` and the play routine runs `play`. */
+  function playTune(
+    init: readonly number[],
+    play: readonly number[],
+    options: Partial<TuneOptions> = {},
+  ): SidFile {
+    return tune({
+      ...options,
+      playAddress: ROUTINE,
+      blocks: [
+        { at: 0x1000, bytes: [...init, RTS] },
+        { at: ROUTINE, bytes: [...play, RTS] },
+      ],
+    });
+  }
+
+  /** A PSID with play address 0: init runs `init`, then installs a `$0314` handler that runs `play`. */
+  function handlerTune(
+    init: readonly number[],
+    play: readonly number[],
+    options: Partial<TuneOptions> = {},
+  ): SidFile {
+    return tune({
+      ...options,
+      playAddress: 0,
+      blocks: [
+        {
+          at: 0x1000,
+          bytes: [...init, ...store(ROUTINE & 0xff, 0x0314), ...store(ROUTINE >> 8, 0x0315), RTS],
+        },
+        { at: ROUTINE, bytes: [...play, RTS] },
+      ],
+    });
+  }
+
+  function initialised(file: SidFile, song = 1): ReturnType<typeof createC64Machine> {
+    const machine = createC64Machine(file, new RecordingSink());
+    machine.initSubtune(song);
+    return machine;
+  }
+
+  describe('a tune with a play address', () => {
+    it('plays once per frame when the speed bit says vertical blank, whatever the latch says', () => {
+      const machine = initialised(playTune(writeLatch(0x2663), [], { speedFlags: 0 }));
+
+      expect(machine.cyclesPerPlayCall).toBeNull();
+      expect(machine.exactCallsPerFrame).toBe(1);
+      expect(machine.callsPerFrame).toBe(1);
+    });
+
+    it('plays at the latch it wrote when the speed bit says CIA, and at the PSID default when it wrote none', () => {
+      const written = initialised(playTune(writeLatch(0x2663), [], { speedFlags: 1 }));
+      const defaulted = initialised(playTune([], [], { speedFlags: 1 }));
+
+      expect(written.cyclesPerPlayCall).toBe(0x2663 + 1);
+      expect(written.exactCallsPerFrame).toBeCloseTo(2, 5);
+      expect(defaulted.cyclesPerPlayCall).toBe(0x4025 + 1);
+      expect(defaulted.exactCallsPerFrame).toBeCloseTo(1.197, 3);
+      expect(defaulted.callsPerFrame).toBe(1);
+    });
+
+    it("takes the default latch from the tune's own clock", () => {
+      const machine = initialised(playTune([], [], { speedFlags: 1, clock: 'ntsc' }));
+
+      expect(machine.cyclesPerPlayCall).toBe(0x4295 + 1);
+      expect(machine.exactCallsPerFrame).toBeCloseTo(NTSC_CYCLES_PER_FRAME / (0x4295 + 1), 10);
+    });
+
+    it('follows a timer slower than a frame below one call per frame, while the rounded rate stays at one', () => {
+      // $7FFF + 1 = 32768 cycles, a little over one and a half frames
+      const machine = initialised(playTune(writeLatch(0x7fff), [], { speedFlags: 1 }));
+
+      expect(machine.exactCallsPerFrame).toBeCloseTo(PAL_CYCLES_PER_FRAME / 0x8000, 10);
+      expect(machine.exactCallsPerFrame).toBeLessThan(1);
+      expect(machine.callsPerFrame).toBe(1);
+    });
+
+    it('caps a timer faster than sixteen calls a frame at sixteen, exact and rounded alike', () => {
+      const machine = initialised(playTune(writeLatch(0x0010), [], { speedFlags: 1 }));
+
+      expect(machine.exactCallsPerFrame).toBe(16);
+      expect(machine.callsPerFrame).toBe(16);
+    });
+
+    it('moves to a latch written mid-song from the next call on', () => {
+      const machine = initialised(playTune([], writeLatch(0x2663), { speedFlags: 1 }));
+      const before = machine.exactCallsPerFrame;
+
+      machine.runFrame();
+
+      expect(before).toBeCloseTo(1.197, 3);
+      expect(machine.exactCallsPerFrame).toBeCloseTo(2, 5);
+      expect(machine.callsPerFrame).toBe(2);
+    });
+
+    it('stays on its timer however the tune masks the CIA interrupt', () => {
+      const machine = initialised(
+        playTune([...writeLatch(0x2663), ...store(0x7f, CIA_INTERRUPT_CONTROL)], [], {
+          speedFlags: 1,
+        }),
+      );
+
+      expect(machine.exactCallsPerFrame).toBeCloseTo(2, 5);
+    });
+  });
+
+  describe('which bit of the speed word a song reads', () => {
+    const isCiaTimed = (file: SidFile, song: number): boolean =>
+      initialised(file, song).cyclesPerPlayCall !== null;
+    const manySongs = (options: Partial<TuneOptions>): SidFile =>
+      playTune([], [], { songs: 40, ...options });
+    // Songs 2 and 32 are CIA-timed.
+    const bits = 0x80000002;
+
+    it('gives every song past the 32nd the last bit when a later header version is not PlaySID specific', () => {
+      const file = manySongs({ speedFlags: bits });
+
+      expect([1, 2, 32, 33, 40].map((song) => isCiaTimed(file, song))).toEqual([
+        false,
+        true,
+        true,
+        true,
+        true,
+      ]);
+    });
+
+    it.each([
+      ['version 1', { version: 1 }],
+      ['flagged PlaySID specific', { psidSpecific: true }],
+    ])('repeats the 32 bits across songs for a header that is %s', (_name, options) => {
+      const file = manySongs({ speedFlags: bits, ...options });
+
+      expect([32, 33, 34, 40].map((song) => isCiaTimed(file, song))).toEqual([
+        true,
+        false,
+        true,
+        false,
+      ]);
+    });
+
+    it('reads the bit again on every subtune init', () => {
+      const machine = initialised(playTune([], [], { songs: 2, speedFlags: 0b10 }));
+      expect(machine.cyclesPerPlayCall).toBeNull();
+
+      machine.initSubtune(2);
+
+      expect(machine.cyclesPerPlayCall).not.toBeNull();
+    });
+  });
+
+  describe('a tune with play address 0', () => {
+    it('starts from the interrupt the speed bit names: timer A for CIA, the raster for vertical blank', () => {
+      const cia = initialised(handlerTune([], [], { speedFlags: 1 }));
+      const vbi = initialised(handlerTune([], [], { speedFlags: 0 }));
+
+      expect(cia.exactCallsPerFrame).toBeCloseTo(1.197, 3);
+      expect(vbi.exactCallsPerFrame).toBe(1);
+      expect(vbi.cyclesPerPlayCall).toBeNull();
+    });
+
+    it('follows timer A once the tune enables it, whatever the speed bit says', () => {
+      const machine = initialised(
+        handlerTune(
+          [
+            ...writeLatch(0x2663),
+            ...store(0x81, CIA_INTERRUPT_CONTROL),
+            ...store(0, VIC_INTERRUPT_ENABLE),
+          ],
+          [],
+          { speedFlags: 0 },
+        ),
+      );
+
+      expect(machine.exactCallsPerFrame).toBeCloseTo(2, 5);
+    });
+
+    it('plays once per frame when the tune masks timer A, though it programmed the latch and the speed bit says CIA', () => {
+      const machine = initialised(
+        handlerTune(
+          [
+            ...writeLatch(0x2663),
+            ...store(0x7f, CIA_INTERRUPT_CONTROL),
+            ...store(1, VIC_INTERRUPT_ENABLE),
+          ],
+          [],
+          { speedFlags: 1 },
+        ),
+      );
+
+      expect(machine.cyclesPerPlayCall).toBeNull();
+      expect(machine.exactCallsPerFrame).toBe(1);
+      expect(machine.callsPerFrame).toBe(1);
+    });
+
+    it('changes only the mask bits a $DC0D write names', () => {
+      // $82 sets bit 1 and $7E clears bits 1-6: neither names timer A, which stays enabled.
+      const machine = initialised(
+        handlerTune(
+          [...store(0x82, CIA_INTERRUPT_CONTROL), ...store(0x7e, CIA_INTERRUPT_CONTROL)],
+          [],
+          {
+            speedFlags: 1,
+          },
+        ),
+      );
+
+      expect(machine.exactCallsPerFrame).toBeCloseTo(1.197, 3);
+    });
+
+    it('follows timer A being masked and enabled again from the handler, call by call', () => {
+      // play: INC $1200 / LDA $1200 / AND #1 / BEQ even / LDA #$7F / BNE store / even: LDA #$81 / store: STA $DC0D
+      // — an odd call count masks timer A, an even one enables it.
+      const toggling = [
+        ...[0xee, 0x00, 0x12, 0xad, 0x00, 0x12, 0x29, 0x01, 0xf0, 0x04],
+        ...[0xa9, 0x7f, 0xd0, 0x02, 0xa9, 0x81, 0x8d, 0x0d, 0xdc],
+      ];
+      const machine = initialised(handlerTune(writeLatch(0x2663), toggling, { speedFlags: 1 }));
+      const rates = [machine.exactCallsPerFrame];
+
+      machine.runFrame();
+      rates.push(machine.exactCallsPerFrame);
+      machine.runFrame();
+      rates.push(machine.exactCallsPerFrame);
+
+      expect(rates[0]).toBeCloseTo(2, 5);
+      expect(rates[1]).toBe(1);
+      expect(rates[2]).toBeCloseTo(2, 5);
+    });
+  });
+
+  describe('the snapshot', () => {
+    // Two calls a frame after init; the play routine then moves the rate off it.
+    const slowing = (): SidFile =>
+      playTune(writeLatch(0x2663), writeLatch(0x7fff), { speedFlags: 1 });
+    const masking = (): SidFile =>
+      handlerTune(writeLatch(0x2663), store(0x7f, CIA_INTERRUPT_CONTROL), { speedFlags: 1 });
+
+    it.each([
+      ['a play address', slowing],
+      ['no play address', masking],
+    ])('puts the rate back with the image it was taken at, for a tune with %s', (_name, build) => {
+      const machine = initialised(build());
+      const atInit = machine.exactCallsPerFrame;
+      const snapshot = machine.snapshot();
+      machine.runFrame();
+      const afterCall = machine.exactCallsPerFrame;
+
+      machine.restore(snapshot);
+
+      expect(afterCall).toBeLessThan(atInit);
+      expect(machine.exactCallsPerFrame).toBe(atInit);
+      machine.runFrame();
+      expect(machine.exactCallsPerFrame).toBe(afterCall);
+    });
+
+    it('carries the rate to a machine that did not take it, across a structured clone', () => {
+      const source = initialised(slowing());
+      const atInit = source.exactCallsPerFrame;
+      const image = structuredClone(source.snapshot());
+      const other = initialised(slowing());
+      other.runFrame();
+      expect(other.exactCallsPerFrame).toBeLessThan(atInit);
+
+      other.restore(image);
+
+      expect(other.exactCallsPerFrame).toBe(atInit);
+    });
+
+    it('carries the rate through snapshotInto and copyMachineImage as through snapshot', () => {
+      const machine = initialised(masking());
+      const image = createMachineImage();
+      const copy = createMachineImage();
+      machine.snapshotInto(image);
+      copyMachineImage(image, copy);
+      machine.runFrame();
+      expect(machine.exactCallsPerFrame).toBe(1);
+
+      machine.restore(image);
+      const fromImage = machine.exactCallsPerFrame;
+      machine.runFrame();
+      machine.restore(copy);
+
+      expect(fromImage).toBeCloseTo(2, 5);
+      expect(machine.exactCallsPerFrame).toBeCloseTo(2, 5);
+    });
   });
 });
 

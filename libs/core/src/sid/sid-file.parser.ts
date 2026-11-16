@@ -84,9 +84,11 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
   let model: SidModel = 'unknown';
   let secondSidAddress: number | null = null;
   let thirdSidAddress: number | null = null;
+  let psidSpecific = false;
 
   if (version >= 2) {
     const flags = view.getUint16(OFFSET_FLAGS, false);
+    psidSpecific = magic === 'PSID' && (flags & 0b10) !== 0;
     clock = decodeClock((flags >> 2) & 0b11);
     model = decodeModel((flags >> 4) & 0b11);
   }
@@ -122,6 +124,7 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
     songs,
     startSong,
     speedFlags,
+    psidSpecific,
     name,
     author,
     released,

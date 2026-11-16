@@ -153,6 +153,16 @@ describe('parseSidFile', () => {
     expect(file.model).toBe(model);
   });
 
+  it.each([
+    ['a v2 PSID with flags bit 1 set', { version: 2, flags: 0b10 }, true],
+    ['a v4 PSID with flags bit 1 set', { version: 4, flags: 0b10 }, true],
+    ['a v2 PSID with it clear', { version: 2, flags: 0b01 }, false],
+    ['a v1 PSID, which has no flags', { version: 1 }, false],
+    ['an RSID, whose bit 1 is the BASIC flag', { magic: 'RSID', flags: 0b10 }, false],
+  ] as const)('reads the PlaySID-specific flag of %s', (_name, options, expected) => {
+    expect(parseSidFile(buildSidFileBytes(options)).psidSpecific).toBe(expected);
+  });
+
   it('resolves a v3 secondSidAddress from the encoded byte', () => {
     const file = parseSidFile(buildSidFileBytes({ version: 3, secondSidByte: 0x50 }));
     expect(file.secondSidAddress).toBe(0xd500);

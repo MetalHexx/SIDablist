@@ -28,10 +28,24 @@ export const VIC_RASTER_REGISTER = 0xd012;
 /** Screen on, 25 rows, no scroll — the bits a player expects around the raster line's bit 8. */
 export const VIC_CONTROL_IDLE_BITS = 0x1b;
 
+export const VIC_INTERRUPT_ENABLE_REGISTER = 0xd01a;
+/** Bit 0 of `$D01A`: the raster-compare interrupt. */
+export const VIC_RASTER_INTERRUPT_BIT = 0x01;
+
 export const CIA1_TIMER_A_LATCH_LOW = 0xdc04;
 export const CIA1_TIMER_A_LATCH_HIGH = 0xdc05;
 export const CIA1_INTERRUPT_CONTROL = 0xdc0d;
 export const CIA2_INTERRUPT_CONTROL = 0xdd0d;
+/** Bit 0 of `$DC0D`: timer A's interrupt. A write sets the mask bits it names when bit 7 is 1 and clears them when it is 0. */
+export const CIA_INTERRUPT_TIMER_A_BIT = 0x01;
+export const CIA_INTERRUPT_SET_BIT = 0x80;
+/**
+ * The latch CIA 1 timer A holds in the PSID default environment — 60 Hz of the tune's own clock,
+ * `$4025` + 1 PAL cycles and `$4295` + 1 NTSC — which is the rate of a CIA-timed tune that never
+ * programs the timer.
+ */
+export const PSID_DEFAULT_TIMER_A_LATCH_PAL = 0x4025;
+export const PSID_DEFAULT_TIMER_A_LATCH_NTSC = 0x4295;
 /** Timer A underflow set, so a player polling the CIA proceeds instead of spinning forever. */
 export const CIA_INTERRUPT_TIMER_A_SET = 0x81;
 

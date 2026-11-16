@@ -1,11 +1,6 @@
 import { describeError } from '../common/errors.js';
 import { clamp } from '../common/math.js';
-import {
-  DEFAULT_TIMING_MODE,
-  msToPlayCalls,
-  playCallIntervalUs,
-  playRateFor,
-} from '../clock/play-rate.js';
+import { DEFAULT_TIMING_MODE, msToPlayCalls, playCallIntervalUsAt } from '../clock/play-rate.js';
 import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
@@ -244,11 +239,11 @@ class SidPlayerCoordinator implements SidPlayer {
   private nominalIntervalUs: Microseconds = microseconds(PAL_FRAME_INTERVAL_US);
   private timingMode: TimingMode = DEFAULT_TIMING_MODE;
   /** The machine's two rates, mirrored on every subtune init — the CIA latch is only meaningful once
-   *  init has run, so this cannot be read at load time. */
-  private machineRates: { readonly exact: number; readonly rounded: number } = {
-    exact: 1,
-    rounded: 1,
-  };
+   *  init has run, so this cannot be read at load time — and kept in step by `followPlayRate` after
+   *  every tick and every restore, since the tune can change its own rate and an image carries the one
+   *  it was taken at. Two numbers rather than an object, so a sync builds nothing. */
+  private machineExactRate = 1;
+  private machineRoundedRate = 1;
   /** What the clock was last handed, or null before it has ever started — the rate diagnostics
    *  report, rather than one derived from a tempo that may have changed while stopped. */
   private runningIntervalUs: Microseconds | null = null;
@@ -395,12 +390,9 @@ class SidPlayerCoordinator implements SidPlayer {
       nominalIntervalUs: () => this.nominalIntervalUs,
       playRate: () => this.playRate(),
       syncPlayRate: (machine) => {
-        const rate = playRateFor(machine, this.timingMode);
-        this.machineRates = {
-          exact: rate.exactCallsPerFrame,
-          rounded: rate.roundedCallsPerFrame,
-        };
+        this.mirrorMachineRates(machine);
       },
+      followPlayRate: () => this.followPlayRate(),
       effectiveMutes: () => this.effectiveMutes(),
       clearError: () => {
         this.error = null;
@@ -458,8 +450,8 @@ class SidPlayerCoordinator implements SidPlayer {
       emitted: frame?.emittedValues() ?? EMPTY_EMITTED,
       resync: { inFlightDepth: this.gateOffOwed ? 1 : 0 },
       rate: {
-        exactCallsPerFrame: this.machineRates.exact,
-        roundedCallsPerFrame: this.machineRates.rounded,
+        exactCallsPerFrame: this.machineExactRate,
+        roundedCallsPerFrame: this.machineRoundedRate,
       },
     };
   }
@@ -1619,6 +1611,9 @@ class SidPlayerCoordinator implements SidPlayer {
     this.captureAtCrossing(machine, frame, this.session.framesRendered);
     this.ring.maybeRecord(machine, frame, this.session.framesRendered);
     this.enforceLoop(machine, frame);
+    // Last, so one comparison sees both what the play call did to the rate and what a lap's or a
+    // hand-off's restore put in its place.
+    this.followPlayRate();
   };
 
   /**
@@ -1746,7 +1741,11 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.framesRendered = frames(Math.floor(varispeed.position));
 
     if (!this.handingBack) return;
-    if (this.enforceLoop(machine, frame) !== 'none') return;
+    const action = this.enforceLoop(machine, frame);
+    // A lap or a hand-off restored the machine, and either one ended this varispeed: the clock
+    // re-times here, on the last tick of the varispeed that owned it.
+    this.followPlayRate();
+    if (action !== 'none') return;
     const image = this.handbackImage;
     if (image !== null && this.session.framesRendered === image.frame) this.adoptHandback(image);
   }
@@ -2356,8 +2355,10 @@ class SidPlayerCoordinator implements SidPlayer {
    * routine once, so a 2x tune ticks twice per video frame at half the interval.
    */
   private effectiveIntervalUs(): Microseconds {
+    const callsPerFrame =
+      this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate;
     return microseconds(
-      playCallIntervalUs(this.nominalIntervalUs, this.playRate()) / this.tempoMultiplier,
+      playCallIntervalUsAt(this.nominalIntervalUs, callsPerFrame) / this.tempoMultiplier,
     );
   }
 
@@ -2373,13 +2374,43 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The rate in force for every duration in the player — the seek reach, the ceiling and the clock
    *  interval all read this rather than choosing between the two rates themselves. */
   private playRate(): PlayRate {
-    const { exact, rounded } = this.machineRates;
     return {
-      callsPerFrame: this.timingMode === 'exact' ? exact : rounded,
-      exactCallsPerFrame: exact,
-      roundedCallsPerFrame: rounded,
+      callsPerFrame: this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate,
+      exactCallsPerFrame: this.machineExactRate,
+      roundedCallsPerFrame: this.machineRoundedRate,
       mode: this.timingMode,
     };
+  }
+
+  /** Copies `machine`'s two rates into the mirror — 1 and 1 with no machine — and says whether
+   *  either moved. Two number compares, and nothing built. */
+  private mirrorMachineRates(machine: C64Machine | null): boolean {
+    const exact = machine?.exactCallsPerFrame ?? 1;
+    const rounded = machine?.callsPerFrame ?? 1;
+    if (exact === this.machineExactRate && rounded === this.machineRoundedRate) return false;
+    this.machineExactRate = exact;
+    this.machineRoundedRate = rounded;
+    return true;
+  }
+
+  /**
+   * Brings the mirror up to the machine's rate, and the running clock with it. The tune changes its
+   * own rate when it writes the timer, and an image restored onto the machine carries the rate it was
+   * taken at, so this runs after every tick and after every restore.
+   *
+   * It re-times the clock only. The frames the sink already holds were played at the rate they had,
+   * so `sink.retime` stays with a tempo command (`applyIntervalChange`). It builds no snapshot
+   * either: `PlayerSnapshot`'s published rate catches up at the next notification for any other
+   * reason, a lag that is deliberate, and `getStats().rate` reads the mirror as it stands.
+   */
+  private followPlayRate(): void {
+    if (!this.mirrorMachineRates(this.session.machine)) return;
+    // Stopped, paused and ended read the interval fresh when the clock next starts.
+    if (this.transport === 'playing' || this.varispeedActive) {
+      const intervalUs = this.effectiveIntervalUs();
+      this.clock.setIntervalUs(intervalUs);
+      this.runningIntervalUs = intervalUs;
+    }
   }
 
   /** Derived from the tune's own rate, never the tempo multiplier — riding the tempo must not make
