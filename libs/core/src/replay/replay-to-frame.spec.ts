@@ -134,7 +134,7 @@ describe('replayToFrame', () => {
     expect(replayed.machine.memory).toEqual(live.machine.memory);
     expect(replayed.machine.cpu).toEqual(live.machine.cpu);
     expect(replayed.machine.playAddress).toBe(live.machine.playAddress);
-    expect(replayed.machine.timerALatch).toBe(live.machine.timerALatch);
+    expect(replayed.machine.chips).toEqual(live.machine.chips);
   });
 
   it('is deterministic: the same request twice gives the same answer', () => {

@@ -15,9 +15,10 @@ holds no notion of where bytes physically go or what a person wants.
 The public surface is `src/index.ts`; nothing outside it is meant to be imported directly.
 
 - `sid/` — parses a `.sid` file into the model the rest of this library runs.
-- `cpu/` — `C64Machine`, the faked 64 KB address space and CIA/VIC stubs a tune's `init`/`play`
-  routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in
-  `vendor/mos6502/` implements.
+- `cpu/` — `C64Machine`, the faked 64 KB address space a tune's `init`/`play` routines run against,
+  driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in `vendor/mos6502/` implements.
+  `io-chips.ts` is its VIC raster flag and both CIAs' timers, with the cycle count that places each
+  play call in time.
 - `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
   stage — multiplier, offset, hold — that builds one), `sid-fields.ts` (the table of chip fields an
   application can drive), `register-record.ts` (`RegisterRecord`, a tune's register stream as data,
@@ -182,6 +183,25 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`, which its `BRK` shares; a
   PSID's `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
   default `$FFFE`.
+- **A read of a chip register can change the chip, so a read is made once and nowhere else.** A PSID's
+  `$D019`, `$D01A` and CIA `$x4`–`$xF` come from `IoChips`, and a read of `$xD` returns the flags and
+  clears them. `C64MachineImpl.read` is the only caller and calls once per bus access: a classifier, a
+  snapshot, a debug dump or a "peek" that goes through `read` or `readBus` takes the flag the CPU was
+  about to see. The fingerprint bench wraps `read` and delegates once for the same reason. An RSID
+  keeps plain memory and a constant `$DC0D`/`$DD0D`.
+- **The chip model counts lazily and holds one cycle count.** Timers are not stepped: an access counts
+  a timer on to the cycle it happens at, from `IoChips.state`, one `Float64Array` of fixed layout
+  (`io-chips.ts` documents it) that a snapshot copies whole. A play call starts one period after the
+  last one started — `latch + 1` when CIA 1 timer A drove it, `cyclesPerFrame` otherwise — or when the
+  last one ended if it ran past that, and the timers count on through the gap. The cycle count is a
+  plain number, never an `int32`: it passes 2³¹ in about 36 minutes. A new register, or a field on
+  the state, goes in the layout and in `CHIP_STATE_LENGTH` so every capture carries it; one that
+  steps per cycle, builds an object per read, or lives outside `state` is the regression.
+- **CIA 1 timer A's latch reads the half a tune never wrote as 0.** That is how the play rate has
+  always read a tune that writes only `$DC04` or only `$DC05`, and the fingerprint check ties every
+  tune to its rate, so the model keeps it. A real C64 keeps the PSID default's byte: a tune that
+  writes only `$DC04` plays near 60 Hz there and up to sixteen times faster here. Fixing it is a
+  deliberate rate change for every tune that writes one half, and `--change play-rate` is its class.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
@@ -268,9 +288,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   its song's speed bit is 1 (the latch the tune wrote, else the PSID default) and once per frame when
   it is 0, whatever the latch says; one with play address 0 ignores the bits and follows the interrupt
   `$DC0D` and `$D01A` have left enabled; an RSID keeps "a written latch means CIA". The rate's inputs
-  ride in `MachineSnapshot` and go in all five places together — the interface,
+  are read from the chip model — CIA 1 timer A's latch and interrupt enable — and the speed bit, and
+  ride in `MachineSnapshot` as `chips` and `speedBit`, in all five places together — the interface,
   `WritableMachineSnapshot`, `createMachineImage`, `copyMachineImage` and `snapshot`/`snapshotInto`/
-  `restore` — as plain values, so a snapshot still structured-clones to the replay worker. The player
+  `restore` — as numbers and a typed array, so a snapshot still structured-clones to the replay
+  worker. The player
   mirrors the two rates and `followPlayRate` compares them after every tick and every place the live
   machine is restored: `TuneSession.adoptState` (which `restoreState`, a jump landing and a handback
   all go through) and the lap and hand-off in `enforceLoop`. A new restore that skips it runs the
@@ -363,6 +385,16 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   `cpu/c64-machine.spec.ts` (the `entering a handler as an interrupt` specs) and the HVSC fingerprint
   check (`fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench), since
   every tune's writes ride on this entry. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
+- **Changed the VIC or CIA model (`cpu/io-chips.ts`; the register addresses in `cpu/cpu-constants.ts`;
+  `readBus`, `readChipRegister` and `write` in `cpu/c64-machine.ts`)?** What a tune reads from
+  `$D019`, `$D01A` and the CIA timers decides which branch a player takes, so a shifted flag, period
+  or read side effect changes what a tune writes, or hangs it, with no compile error. A new slot in
+  `IoChips.state` is a new `chips` length that a snapshot carries as it is. Run `cpu/io-chips.spec.ts`
+  and `cpu/c64-machine.spec.ts`, and the HVSC fingerprint check
+  (`fingerprint.mjs check --change vic-cia`, in the shared SIDABLIST-ROOT bench), which says which
+  tunes moved and which of those it cannot explain. `TUNE_INDEX_FORMAT_VERSION` already says the
+  engine's VIC and CIA changed what tunes play; a later change to it bumps the version again. Detail:
+  [`cpu/io-chips.ts`](./src/cpu/io-chips.ts).
 - **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`),
   what decides the rate (`speedFlags`, `psidSpecific`, the `$DC0D` and `$D01A` handling) or
   `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?**

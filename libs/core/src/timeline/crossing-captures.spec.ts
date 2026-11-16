@@ -191,7 +191,7 @@ describe('image buffers', () => {
     from.frame = frames(321);
     from.machine.memory[0x1234] = 0xab;
     from.machine.playAddress = 0x1010;
-    from.machine.timerALatch = 19655;
+    from.machine.chips.fill(19655);
     from.machine.cpu['a'] = 7;
     from.registers.values[4] = 0x41;
 
@@ -200,7 +200,8 @@ describe('image buffers', () => {
     expect(to.frame).toBe(321);
     expect(to.machine.memory[0x1234]).toBe(0xab);
     expect(to.machine.playAddress).toBe(0x1010);
-    expect(to.machine.timerALatch).toBe(19655);
+    expect(to.machine.chips).toEqual(from.machine.chips);
+    expect(to.machine.chips).not.toBe(from.machine.chips);
     expect(to.machine.cpu['a']).toBe(7);
     expect(to.registers.values[4]).toBe(0x41);
     expect(to.machine.memory).not.toBe(from.machine.memory);

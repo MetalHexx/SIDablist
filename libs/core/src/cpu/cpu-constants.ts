@@ -28,17 +28,54 @@ export const VIC_RASTER_REGISTER = 0xd012;
 /** Screen on, 25 rows, no scroll — the bits a player expects around the raster line's bit 8. */
 export const VIC_CONTROL_IDLE_BITS = 0x1b;
 
+/** `$D019`: the interrupt flags. Bit 0 is the raster flag, and a write of 1 to a flag clears it. */
+export const VIC_INTERRUPT_STATUS_REGISTER = 0xd019;
+/** `$D01A`: the interrupt enables, four bits; the rest read as 1. */
 export const VIC_INTERRUPT_ENABLE_REGISTER = 0xd01a;
-/** Bit 0 of `$D01A`: the raster-compare interrupt. */
+/** Bit 0 of `$D019` and `$D01A`: the raster-compare interrupt. */
 export const VIC_RASTER_INTERRUPT_BIT = 0x01;
+export const VIC_INTERRUPT_ENABLE_MASK = 0x0f;
+export const VIC_INTERRUPT_ENABLE_UNUSED_BITS = 0xf0;
+export const VIC_INTERRUPT_STATUS_UNUSED_BITS = 0x70;
+/** Bit 7 of `$D019`: a flagged interrupt is also enabled. */
+export const VIC_INTERRUPT_ANY_BIT = 0x80;
 
-export const CIA1_TIMER_A_LATCH_LOW = 0xdc04;
-export const CIA1_TIMER_A_LATCH_HIGH = 0xdc05;
+/** The first and last register the chip model answers: `$D019` through CIA 2's timer B control. */
+export const CHIP_REGISTERS_FIRST = VIC_INTERRUPT_STATUS_REGISTER;
+export const CHIP_REGISTERS_LAST = 0xdd0f;
+
+export const CIA1_PAGE = 0xdc;
+export const CIA2_PAGE = 0xdd;
+/** The CIA registers the model answers, as offsets within a CIA's page: `$x4`–`$xF`. */
+export const CIA_TIMER_A_LOW = 0x04;
+export const CIA_TIMER_A_HIGH = 0x05;
+export const CIA_TIMER_B_LOW = 0x06;
+export const CIA_TIMER_B_HIGH = 0x07;
+export const CIA_INTERRUPT_CONTROL = 0x0d;
+export const CIA_CONTROL_A = 0x0e;
+export const CIA_CONTROL_B = 0x0f;
+
 export const CIA1_INTERRUPT_CONTROL = 0xdc0d;
 export const CIA2_INTERRUPT_CONTROL = 0xdd0d;
-/** Bit 0 of `$DC0D`: timer A's interrupt. A write sets the mask bits it names when bit 7 is 1 and clears them when it is 0. */
+/** `$xD`: bit 0 is timer A's underflow, bit 1 timer B's. A write sets the enable bits it names when bit 7 is 1 and clears them when it is 0. */
 export const CIA_INTERRUPT_TIMER_A_BIT = 0x01;
+export const CIA_INTERRUPT_TIMER_B_BIT = 0x02;
+export const CIA_INTERRUPT_MASK = 0x1f;
+/** Bit 7 of `$xD`: on a write, set versus clear; on a read, a flagged interrupt is also enabled. */
 export const CIA_INTERRUPT_SET_BIT = 0x80;
+/** `$xE` and `$xF`: bit 0 starts the timer, bit 3 makes it one-shot, bit 4 forces a load and reads as 0. */
+export const CIA_CONTROL_START = 0x01;
+export const CIA_CONTROL_ONE_SHOT = 0x08;
+export const CIA_CONTROL_FORCE_LOAD = 0x10;
+/** `$xF` bits 6:5 pick timer B's count source: `00` counts φ2 cycles, `10` counts timer A's underflows. */
+export const CIA_TIMER_B_SOURCE_SHIFT = 5;
+export const CIA_TIMER_B_SOURCE_MASK = 0x03;
+export const CIA_TIMER_B_SOURCE_PHI2 = 0;
+export const CIA_TIMER_B_SOURCE_TIMER_A = 2;
+/** `$xE` bit 5 picks timer A's: clear counts φ2 cycles, set counts the CNT pin, which nothing here drives. */
+export const CIA_CONTROL_A_CNT_BIT = 0x20;
+/** What a stopped timer holds in the PSID default environment, and a timer's latch after a reset. */
+export const CIA_TIMER_RESET_VALUE = 0xffff;
 /**
  * The latch CIA 1 timer A holds in the PSID default environment — 60 Hz of the tune's own clock,
  * `$4025` + 1 PAL cycles and `$4295` + 1 NTSC — which is the rate of a CIA-timed tune that never
@@ -46,7 +83,7 @@ export const CIA_INTERRUPT_SET_BIT = 0x80;
  */
 export const PSID_DEFAULT_TIMER_A_LATCH_PAL = 0x4025;
 export const PSID_DEFAULT_TIMER_A_LATCH_NTSC = 0x4295;
-/** Timer A underflow set, so a player polling the CIA proceeds instead of spinning forever. */
+/** What an RSID's `$DC0D` and `$DD0D` read, always: timer A underflow flagged and enabled, so a player polling the CIA proceeds instead of spinning forever. */
 export const CIA_INTERRUPT_TIMER_A_SET = 0x81;
 
 /** The KERNAL's IRQ exit, and the default `$0314` vector. A PSID gets `JMP $EA7E` here; an RSID an `RTI`. */
