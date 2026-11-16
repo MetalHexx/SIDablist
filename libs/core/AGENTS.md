@@ -80,6 +80,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - A host that needs every delivery between its reads — a one-frame gate, a doubled control write —
   uses `keepDeliveries`/`drainDeliveries`, never `readRegisters`: that is the chip at one instant,
   and anything that came and went between two reads is gone from it.
+- A stateful part the player is built from (`ActiveLoopTracker`, `TrackStructure`, `ShadowPosition`,
+  `Varispeed`, `RegisterFrame`, `CrossingCaptures`) is `Saveable` (`common/saveable.ts`):
+  `createState` allocates off the tick, `saveInto` and `restoreFrom` allocate nothing and run no
+  setter, hook or notification. A new field on one of them joins its state type, or its doc comment
+  says why it is out — a field left out restores almost exactly, which only a round-trip spec in the
+  part's own spec file catches. The tracker's three images are held by reference, not copied, so
+  whoever owns them must keep them valid between a save and its restore.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.

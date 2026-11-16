@@ -1,3 +1,4 @@
+import type { Saveable } from '../common/saveable.js';
 import { frames, type Frames } from '../units.js';
 
 /**
@@ -24,7 +25,7 @@ export interface DetectedLoopFrames {
  * always read and written together — a stray write to one alone would desynchronise it from the
  * other two with nothing to catch the mistake.
  */
-export interface TrackStructure {
+export interface TrackStructure extends Saveable<TrackStructureState> {
   /**
    * Adopts a new detection, replacing whatever was held before.
    *
@@ -55,6 +56,21 @@ export interface TrackStructure {
   repeatEnabled(): boolean;
   setRepeatEnabled(enabled: boolean): void;
 }
+
+/**
+ * Everything a `TrackStructure` decides from: the three sanitised detection fields and the repeat
+ * setting, all of them in. A frame field is NaN where the structure holds none. `trackEndFrame` is
+ * derived from these and is out.
+ */
+export interface TrackStructureState {
+  loopStart: number;
+  loopPeriod: number;
+  endedAt: number;
+  repeat: boolean;
+}
+
+const orNaN = (value: Frames | null): number => (value === null ? Number.NaN : value);
+const orNull = (value: number): Frames | null => (Number.isNaN(value) ? null : frames(value));
 
 /** A usable frame span: a finite number greater than zero, else null. */
 function sanitizePositiveFrame(value: Frames | null): Frames | null {
@@ -92,6 +108,27 @@ export function createTrackStructure(): TrackStructure {
     repeatEnabled: (): boolean => repeat,
     setRepeatEnabled(enabled: boolean): void {
       repeat = enabled;
+    },
+
+    createState: (): TrackStructureState => ({
+      loopStart: Number.NaN,
+      loopPeriod: Number.NaN,
+      endedAt: Number.NaN,
+      repeat: false,
+    }),
+
+    saveInto(target: TrackStructureState): void {
+      target.loopStart = orNaN(loopStart);
+      target.loopPeriod = orNaN(loopPeriod);
+      target.endedAt = orNaN(endedAt);
+      target.repeat = repeat;
+    },
+
+    restoreFrom(source: TrackStructureState): void {
+      loopStart = orNull(source.loopStart);
+      loopPeriod = orNull(source.loopPeriod);
+      endedAt = orNull(source.endedAt);
+      repeat = source.repeat;
     },
   };
 }

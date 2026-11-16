@@ -1,4 +1,5 @@
 import { clamp } from '../common/math.js';
+import type { Saveable } from '../common/saveable.js';
 import type { SidWriteSink } from '../cpu/c64-machine.js';
 import type { RegisterRecord } from '../registers/register-record.js';
 import { SID_REGISTER_COUNT } from '../registers/sid-constants.js';
@@ -8,13 +9,28 @@ import type { ActiveLoop } from '../timeline/active-loop.js';
 const NOTHING_FED = -1;
 
 /**
+ * What a `Varispeed` feeds from. In: `record` (held by reference: a `RegisterRecord` is data nothing
+ * mutates), `playhead`, `lastEntry`, `cursor` and `fed`, the bytes the chip holds, which decide
+ * what the next feed skips. `cursor` is only where the next feed starts its search for a
+ * retrigger, so no output depends on it; it is in so a restore leaves the part as it was. Out: `retriggering` and `retriggerFirst`, scratch a feed fills and
+ * clears within the one call, so both are zeros between calls and nothing a later feed reads.
+ */
+export interface VarispeedState {
+  record: RegisterRecord | null;
+  playhead: number;
+  lastEntry: number;
+  cursor: number;
+  readonly fed: Uint8Array;
+}
+
+/**
  * The record-driven half of varispeed: the playhead, the record it reads, and the routine that turns
  * the entry under the playhead into writes. The coordinator decides when a tick happens and what
  * the rate is; this decides what the chip has to be told.
  *
  * Everything the feed touches is preallocated, because it runs on the tick.
  */
-export interface Varispeed {
+export interface Varispeed extends Saveable<VarispeedState> {
   /** The record the playhead reads, or null. */
   readonly record: RegisterRecord | null;
   /** The playhead in play calls, fractional, within 0…`record.frames`. */
@@ -61,6 +77,32 @@ class VarispeedImpl implements Varispeed {
   /** The registers retriggering at the entry being fed, and the first byte each one sends. */
   private readonly retriggering = new Uint8Array(SID_REGISTER_COUNT);
   private readonly retriggerFirst = new Uint8Array(SID_REGISTER_COUNT);
+
+  createState(): VarispeedState {
+    return {
+      record: null,
+      playhead: 0,
+      lastEntry: NOTHING_FED,
+      cursor: 0,
+      fed: new Uint8Array(SID_REGISTER_COUNT),
+    };
+  }
+
+  saveInto(target: VarispeedState): void {
+    target.record = this.recordHeld;
+    target.playhead = this.playhead;
+    target.lastEntry = this.lastEntry;
+    target.cursor = this.cursor;
+    target.fed.set(this.fed);
+  }
+
+  restoreFrom(source: VarispeedState): void {
+    this.recordHeld = source.record;
+    this.playhead = source.playhead;
+    this.lastEntry = source.lastEntry;
+    this.cursor = source.cursor;
+    this.fed.set(source.fed);
+  }
 
   get record(): RegisterRecord | null {
     return this.recordHeld;

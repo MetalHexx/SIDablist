@@ -1,3 +1,4 @@
+import type { Saveable } from '../common/saveable.js';
 import type { C64Machine } from '../cpu/c64-machine.js';
 import type { RegisterFrame } from '../registers/register-frame.js';
 import { frames, type Frames } from '../units.js';
@@ -148,9 +149,39 @@ export interface LoopChange {
   readonly loop: Exclude<ActiveLoop, null>;
 }
 
+/**
+ * Everything an `ActiveLoopTracker` decides from, so a restore puts it exactly back. All ten of the
+ * tracker's mutable fields are in: `loop`, `unchanged`, `change`, `queued`, `phase` and
+ * `lapEnd` say which lap is running and where it ends; `trackOwn` says whether the loop is the
+ * track's own, which decides whose clock a hand-off carries on; the three images decide what a wrap
+ * restores. Out: the result `advance` refills (it describes the last call, not the next) and the
+ * wrap lead (fixed at construction).
+ *
+ * The loops, `QueuedNext` and `LoopChange` are values nothing mutates once made, held by
+ * reference. The three images are held by reference too, and are NOT copied: the tracker never owns
+ * an image, its caller does, and an image may be 64 KB the caller has already placed (the
+ * loop-entry buffer, a prepared image). So a restore finds an image where it left it only while its
+ * owner has not refilled it since the save — a caller that refills the loop-entry buffer or recycles
+ * a slot between save and restore must save that content itself, or restore a different image
+ * through `setEntryImage` after. Whether copying them here each frame is worth it is a cost decision
+ * the player's save makes once it can measure.
+ */
+export interface ActiveLoopTrackerState {
+  loop: ActiveLoop;
+  entryImage: PositionAnchor | null;
+  queued: QueuedNext | null;
+  queuedImage: PositionAnchor | null;
+  change: LoopChange | null;
+  changeImage: PositionAnchor | null;
+  unchanged: ActiveLoop;
+  phase: number;
+  lapEnd: number;
+  trackOwn: boolean;
+}
+
 /** Holds the loop presently running and enforces it, frame by frame, against the track it plays
  *  over. */
-export interface ActiveLoopTracker {
+export interface ActiveLoopTracker extends Saveable<ActiveLoopTrackerState> {
   /** The loop presently enforced, or null. */
   get(): ActiveLoop;
   /**
@@ -336,11 +367,14 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
   let changeImage: PositionAnchor | null = null;
   /** The running loop as it stood before the first change was named. */
   let unchanged: ActiveLoop = null;
-  /** The reduced phase of the lap in progress, of the running loop (the one before a change). */
-  let phase = 0;
-  /** The end the lap in progress wraps at: the loop's own for a whole length, else the lap's own
-   *  whole-frame end, or the end a change was named for. Kept here so a tick reads one number. */
-  let lapEnd = 0;
+  /**
+   * The lap in progress. `phase` is its reduced phase, of the running loop (the one before a
+   * change); `end` is the end it wraps at: the loop's own for a whole length, else the lap's own
+   * whole-frame end, or the end a change was named for. Kept here so a tick reads one number.
+   * Fields of one object rather than `let`s, because a closure slot holds a fractional number boxed
+   * and boxes a new one on every store, which a lap and a restore both make.
+   */
+  const lap = { phase: 0, end: 0 };
   /** Whether the running loop (the one before a change) is the track's own, armed by `advance`
    *  rather than handed in: it laps no grid, so its phase means nothing to a loop landing from it. */
   let trackOwn = false;
@@ -353,8 +387,8 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
 
   /** The lap in progress becomes lap 0 of `loop`, at its own phase. */
   function rebase(): void {
-    phase = loop === null ? 0 : reduceLapPhase(loop.lapPhase ?? 0);
-    lapEnd = loop === null ? 0 : lapEndOf(loop, phase);
+    lap.phase = loop === null ? 0 : reduceLapPhase(loop.lapPhase ?? 0);
+    lap.end = loop === null ? 0 : lapEndOf(loop, lap.phase);
   }
 
   /**
@@ -375,7 +409,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
     if (change !== null) return reduceLapPhase(change.loop.lapPhase ?? 0);
     if (loop === null || trackOwn) return Number.NaN;
     const length = loop.endFrame - loop.startFrame;
-    return isWholeLength(length) ? phase : reduceLapPhase(phase + length);
+    return isWholeLength(length) ? lap.phase : reduceLapPhase(lap.phase + length);
   }
 
   /** The loop has taken a lap of its own: the next is the one a length on. Numbers only, since it
@@ -383,8 +417,8 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
   function nextLap(running: Exclude<ActiveLoop, null>): void {
     const length = running.endFrame - running.startFrame;
     if (isWholeLength(length)) return;
-    phase = reduceLapPhase(phase + length);
-    lapEnd = running.startFrame + lapLength(phase, length);
+    lap.phase = reduceLapPhase(lap.phase + length);
+    lap.end = running.startFrame + lapLength(lap.phase, length);
   }
 
   /** Whether `next` is `running` set again: the same span and the same reduced phase. */
@@ -440,7 +474,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
       change = null;
       changeImage = null;
       if (carriesOn && next !== null) {
-        lapEnd = lapEndOf(next, phase);
+        lap.end = lapEndOf(next, lap.phase);
       } else {
         rebase();
       }
@@ -452,7 +486,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
       if (!isUsableLoopLength(next.startFrame, next.endFrame)) return false;
       if (change === null) unchanged = loop;
       const running = unchanged ?? loop;
-      const ownEnd = lapEndOf(running, phase);
+      const ownEnd = lapEndOf(running, lap.phase);
       const end =
         !isWholeLength(running.endFrame - running.startFrame) && atFrame > ownEnd
           ? frames(ownEnd)
@@ -464,21 +498,60 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
       };
       change = { atFrame: end, loop: next };
       changeImage = image;
-      lapEnd = end;
+      lap.end = end;
       return true;
     },
 
     pendingChange: (): LoopChange | null => change,
+
+    createState: (): ActiveLoopTrackerState => ({
+      loop: null,
+      entryImage: null,
+      queued: null,
+      queuedImage: null,
+      change: null,
+      changeImage: null,
+      unchanged: null,
+      phase: 0,
+      lapEnd: 0,
+      trackOwn: false,
+    }),
+
+    saveInto(target: ActiveLoopTrackerState): void {
+      target.loop = loop;
+      target.entryImage = entryImage;
+      target.queued = queued;
+      target.queuedImage = queuedImage;
+      target.change = change;
+      target.changeImage = changeImage;
+      target.unchanged = unchanged;
+      target.phase = lap.phase;
+      target.lapEnd = lap.end;
+      target.trackOwn = trackOwn;
+    },
+
+    restoreFrom(source: ActiveLoopTrackerState): void {
+      loop = source.loop;
+      entryImage = source.entryImage;
+      queued = source.queued;
+      queuedImage = source.queuedImage;
+      change = source.change;
+      changeImage = source.changeImage;
+      unchanged = source.unchanged;
+      lap.phase = source.phase;
+      lap.end = source.lapEnd;
+      trackOwn = source.trackOwn;
+    },
 
     cancelChange(): void {
       if (change === null) return;
       loop = unchanged;
       change = null;
       changeImage = null;
-      if (loop !== null) lapEnd = lapEndOf(loop, phase);
+      if (loop !== null) lap.end = lapEndOf(loop, lap.phase);
     },
 
-    lapPhase: (): number | null => (loop === null ? null : phase),
+    lapPhase: (): number | null => (loop === null ? null : lap.phase),
 
     lapPhaseOf(of: ActiveLoop): number | null {
       const running = change === null ? loop : unchanged;
@@ -486,14 +559,14 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
         running !== null &&
         of.startFrame === running.startFrame &&
         of.endFrame === running.endFrame
-        ? phase
+        ? lap.phase
         : null;
     },
 
     setLapPhase(next: number): void {
       if (loop === null || !Number.isFinite(next)) return;
-      phase = reduceLapPhase(next);
-      if (change === null) lapEnd = lapEndOf(loop, phase);
+      lap.phase = reduceLapPhase(next);
+      if (change === null) lap.end = lapEndOf(loop, lap.phase);
     },
 
     setEntryImage(entry: PositionAnchor | null): void {
@@ -518,7 +591,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
 
     advance(machine, frame, ring, track, framesRendered): AdvanceResult {
       if (loop !== null) {
-        if (framesRendered < wrapDueAt(loop.startFrame, lapEnd)) return NONE;
+        if (framesRendered < wrapDueAt(loop.startFrame, lap.end)) return NONE;
         if (queued !== null && queuedImage !== null) {
           const image = queuedImage;
           const carried = phaseAfterWrap();
@@ -535,8 +608,8 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
           change = null;
           changeImage = null;
           if (loop !== null && !Number.isNaN(carried)) {
-            phase = carried;
-            lapEnd = lapEndOf(loop, phase);
+            lap.phase = carried;
+            lap.end = lapEndOf(loop, lap.phase);
           } else {
             rebase();
           }

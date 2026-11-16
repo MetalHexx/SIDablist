@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { frames } from '../units.js';
-import { countAfter, ShadowPosition, type ShadowCount } from './shadow-position.js';
+import {
+  countAfter,
+  ShadowPosition,
+  type CountedLoop,
+  type ShadowCount,
+} from './shadow-position.js';
 import { createTrackStructure } from './track-structure.js';
 
 const loop = (
@@ -281,3 +286,74 @@ function lapPhaseAfterOne(phase: number, length: number): number {
   const next = phase + length;
   return next - Math.floor(next);
 }
+
+describe('saving and restoring a shadow position', () => {
+  const lapOf = (start: number, end: number, lapPhase?: number): CountedLoop => ({
+    startFrame: frames(start),
+    endFrame: frames(end),
+    ...(lapPhase === undefined ? {} : { lapPhase }),
+  });
+
+  /** What a shadow reads, tick by tick: the count and the tick count. */
+  function trace(
+    shadow: ShadowPosition,
+    track: ReturnType<typeof createTrackStructure>,
+    ticks: number,
+  ) {
+    const read: { count: ShadowCount | null; ticks: number | null }[] = [];
+    for (let tick = 0; tick < ticks; tick++) {
+      shadow.tick(track);
+      read.push({ count: shadow.count(), ticks: shadow.tickCount() });
+    }
+    return read;
+  }
+
+  const looped = createTrackStructure();
+  const repeating = createTrackStructure();
+  repeating.setTrackStructure({
+    loopStartFrame: frames(4),
+    loopPeriodFrames: frames(9),
+    endedAtFrame: null,
+  });
+
+  it.each([
+    { name: 'a whole-length loop', loop: lapOf(10, 16), track: looped },
+    { name: 'a loop of alternating lap lengths', loop: lapOf(10, 16.375, 0.625), track: looped },
+    { name: 'the track’s own wrap', loop: null, track: repeating },
+  ])(
+    'goes on exactly as if it had never left, over $name, from every tick of three laps',
+    ({ loop, track }) => {
+      const from: ShadowCount = { frame: frames(loop?.startFrame ?? 4), held: false };
+      for (let savedAfter = 0; savedAfter <= 24; savedAfter++) {
+        const shadow = new ShadowPosition();
+        shadow.start(loop, from);
+        trace(shadow, track, savedAfter);
+        const state = shadow.createState();
+        shadow.saveInto(state);
+
+        const never = trace(shadow, track, 40);
+        trace(shadow, track, 3 + (savedAfter % 7));
+        shadow.restoreFrom(state);
+        const restored = trace(shadow, track, 40);
+
+        expect(restored).toEqual(never);
+      }
+    },
+  );
+
+  it('puts back a stopped shadow, and a running one over a stopped one', () => {
+    const shadow = new ShadowPosition();
+    const stopped = shadow.createState();
+    shadow.saveInto(stopped);
+    shadow.start(lapOf(2, 9), { frame: frames(2), held: true });
+    const running = shadow.createState();
+    shadow.saveInto(running);
+
+    shadow.restoreFrom(stopped);
+    expect(shadow.count()).toBeNull();
+    expect(shadow.tickCount()).toBeNull();
+
+    shadow.restoreFrom(running);
+    expect(shadow.count()).toEqual({ frame: 2, held: true });
+  });
+});

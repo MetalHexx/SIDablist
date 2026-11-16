@@ -1,3 +1,4 @@
+import type { Saveable } from '../common/saveable.js';
 import {
   copyMachineImage,
   createMachineImage,
@@ -45,12 +46,43 @@ export function copyImageBuffer(from: ImageBuffer, to: ImageBuffer): void {
 }
 
 /**
+ * Everything a `CrossingCaptures` pool takes from, sized for the declaration it was created for:
+ * the same number of sets with the same `keep`s and the same number of buffers.
+ *
+ * In: the declared lines (`origins`, `periods`), which sets hold which buffers (`counts`,
+ * `helds`), how many sets hold each buffer (`refs`), when each was filled (`stamps`, `stamp`), and
+ * the images themselves (`images`), because a crossing recycles a slot and an image a restore
+ * points at must be the one that was saved. Only the buffers some set holds are copied; a free
+ * buffer's content is dead until `take` hands it out to be refilled. `keeps` only records the shape
+ * the state was made for, which a save and a restore check; it is never copied. Out: nothing.
+ *
+ * That makes a save copy up to `sum(keep) + 1` images of about 64 KB each. Whether to pay it every
+ * frame, or record which images a restore may rely on instead, is for the player's save to decide
+ * once it is measured.
+ */
+export interface CrossingCapturesState {
+  readonly origins: Float64Array;
+  readonly periods: Float64Array;
+  readonly keeps: Int32Array;
+  readonly counts: Int32Array;
+  readonly helds: readonly Int32Array[];
+  readonly images: readonly ImageBuffer[];
+  readonly refs: Int32Array;
+  readonly stamps: Float64Array;
+  stamp: number;
+}
+
+/**
  * The pool of images the player saves as the playhead crosses declared lines, and the check that
  * says when to save one.
  *
  * Every buffer is allocated by `declare`, so nothing here allocates once a tick is running.
+ *
+ * A state (`CrossingCapturesState`) is made for the lines declared when `createState` ran:
+ * `saveInto` and `restoreFrom` throw a `RangeError` once `declare` has changed the shape (the sets,
+ * their `keep`s, or the buffers), and a restore puts the saved lines back along with the images.
  */
-export interface CrossingCaptures {
+export interface CrossingCaptures extends Saveable<CrossingCapturesState> {
   /**
    * Replaces the lines. The pool is sized to the sum of every set's `keep`, plus one so a free
    * buffer always exists for the next crossing; buffers already allocated are reused, and an image
@@ -125,6 +157,13 @@ export function createCrossingCaptures(): CrossingCaptures {
     refs[slot]++;
     held[count] = slot;
     counts[set] = count + 1;
+  }
+
+  /** Whether `state` was made for the lines declared now: it can only hold what this pool holds. */
+  function assertShape(state: CrossingCapturesState): void {
+    let same = state.keeps.length === keeps.length && state.images.length === buffers.length;
+    for (let set = 0; same && set < keeps.length; set++) same = state.keeps[set] === keeps[set];
+    if (!same) throw new RangeError('The crossing pool was re-declared since this state was made');
   }
 
   return {
@@ -219,6 +258,48 @@ export function createCrossingCaptures(): CrossingCaptures {
     clearImages(): void {
       refs.fill(0);
       counts.fill(0);
+    },
+
+    createState(): CrossingCapturesState {
+      return {
+        origins: new Float64Array(origins.length),
+        periods: new Float64Array(periods.length),
+        keeps: keeps.slice(),
+        counts: new Int32Array(counts.length),
+        helds: helds.map((held) => new Int32Array(held.length)),
+        images: buffers.map(() => createImageBuffer()),
+        refs: new Int32Array(refs.length),
+        stamps: new Float64Array(stamps.length),
+        stamp: 0,
+      };
+    },
+
+    saveInto(target: CrossingCapturesState): void {
+      assertShape(target);
+      target.origins.set(origins);
+      target.periods.set(periods);
+      target.counts.set(counts);
+      for (let set = 0; set < helds.length; set++) target.helds[set].set(helds[set]);
+      target.refs.set(refs);
+      target.stamps.set(stamps);
+      target.stamp = stamp;
+      for (let index = 0; index < buffers.length; index++) {
+        if (refs[index] > 0) copyImageBuffer(buffers[index], target.images[index]);
+      }
+    },
+
+    restoreFrom(source: CrossingCapturesState): void {
+      assertShape(source);
+      origins.set(source.origins);
+      periods.set(source.periods);
+      counts.set(source.counts);
+      for (let set = 0; set < helds.length; set++) helds[set].set(source.helds[set]);
+      refs.set(source.refs);
+      stamps.set(source.stamps);
+      stamp = source.stamp;
+      for (let index = 0; index < buffers.length; index++) {
+        if (refs[index] > 0) copyImageBuffer(source.images[index], buffers[index]);
+      }
     },
   };
 }
