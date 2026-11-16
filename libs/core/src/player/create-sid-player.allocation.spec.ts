@@ -35,6 +35,8 @@ const nullSink: SidSink = {
   retime: () => undefined,
   reset: () => undefined,
   readAt: () => CONSUMED,
+  passedCount: () => 0,
+  replaceFrom: () => 0,
 };
 
 /** Answers a replay at once against the real `replayToFrame`: the images a jump lands on are built

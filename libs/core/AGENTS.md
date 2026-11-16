@@ -64,7 +64,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   a frame the register record covers, playing from the record while the machine is rebuilt ahead.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
-  itself.
+  itself, and `SINK_REPLACE_CASES`, the part of it a sink with no clock can run alone.
 - `ports/` — `FrameClock`, `SidSink`, `Transport`, `TimeSource`, `EngineLog`: the interfaces a host
   injects; this library depends on none of their implementations.
 - `testing/` — `FakeClock`, `FakeSink`, `FakeTransport`: fixtures for a consumer's own specs.
@@ -441,7 +441,9 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   (`ports/sink.ts`)?** `libs/asid`'s slot packing (`wire/slot-map.ts`, `wire/encoder.ts`) and its
   sink (`sink/asid-sink.ts`) both implement what these types promise. A change that stays
   type-compatible but shifts what a field means still reaches the wire wrong — a wrong packet, not
-  a compiler error. Update asid's packing/sink to match and run its specs. Detail:
+  a compiler error. A new member (`passedCount`, `replaceFrom`) is also one every implementation
+  must have, `FakeSink` and the specs' own sinks among them. Update asid's packing/sink to match and
+  run its specs. Detail:
   [`libs/asid/AGENTS.md`](../asid/AGENTS.md).
 - **Added or changed a case in `SINK_CONFORMANCE_CASES` (`conformance/cases.ts`)?**
   `libs/asid`'s `sink/conformance.spec.ts` runs every case in the suite against the real ASID

@@ -446,6 +446,53 @@ describe('createAsidSink', () => {
     });
   });
 
+  describe('committed sends own their bytes', () => {
+    it('re-sends on a retime exactly the bytes each send carried, even for a port that keeps the reference it was given', () => {
+      const kept: Uint8Array[] = [];
+      const resentAtRetime: Uint8Array[] = [];
+      let retiming = false;
+      const keepingPort: MidiOutputPort = {
+        portId: 'keeping',
+        supportsCancel: true,
+        send(bytes) {
+          kept.push(bytes);
+          if (retiming) resentAtRetime.push(Uint8Array.from(bytes));
+        },
+        cancelPending: () => true,
+      };
+      const keepingSink = createAsidSink(keepingPort, { time, scheduleAheadMs: milliseconds(200) });
+      const wanted = [
+        frame([0], [0x11]),
+        frame([1, 4, 4], [0x22, 0x21, 0x20]),
+        frame([24], [0x0f]),
+        frame([0, 1, 2, 3, 4], [1, 2, 3, 4, 5]),
+      ].map((f) => {
+        keepingSink.deliver(f, frames(0), milliseconds(1_000_000), false);
+        return buildSidDataPacket(f);
+      });
+
+      expect(kept.map((bytes) => Uint8Array.from(bytes))).toEqual(wanted);
+
+      retiming = true;
+      keepingSink.retime(microseconds(ONE_INTERVAL_US));
+
+      expect(resentAtRetime).toEqual(wanted);
+    });
+  });
+
+  describe('passedCount and replaceFrom', () => {
+    it('count deliveries but not delivered-now frames, and replaceFrom leaves the port untouched', () => {
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(1_000_000), false);
+      sink.deliverNow(frame([4], [0x20]));
+      sink.deliver(frame([1], [0x22]), frames(1), milliseconds(1_000_020), false);
+      const sentBefore = port.sent.length;
+
+      expect(sink.passedCount()).toBe(2);
+      expect(sink.replaceFrom(0)).toBe(2);
+      expect(port.sent.length).toBe(sentBefore);
+    });
+  });
+
   describe('stats', () => {
     it('counts packets and bytes across the control and frame paths, but not showText', () => {
       sink.begin({ chipModel: 'mos6581' }); // chip-type + start: 2
