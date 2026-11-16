@@ -160,6 +160,19 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   third-party source with one deliberate behavioural change (`cpu/vendor-cpu.ts`'s
   `QuietMos6502`), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
   directly. See the co-change edge below before touching a field it exposes.
+- **The CPU's step path is shared and allocation-free, and so is its bus.** The vendored core's
+  addressing modes and instructions are prototype methods, dispatched by name through tables built
+  once for the class, and `emulate` returns nothing and builds nothing. `C64MachineImpl.Bus` is a
+  class for the same reason. A per-instance closure on the path — a handler written as an arrow
+  function, or a bus built from a literal of arrows — hands the CPU's call sites a second target once
+  a second machine exists, and every machine in the process stays slower; a value returned or created
+  per cycle costs every machine too. Both pass every functional spec.
+  `cpu/vendor-cpu.allocation.spec.ts` catches an allocation (it needs `--expose-gc`, which
+  `vitest.config.ts` gives the workers), `cpu/vendor-cpu.instances.spec.ts` catches state kept off
+  the instance, and only the bench's `instances.mjs` catches a closure. The bus looks `read` and
+  `write` up on the machine instance at every access, and the machine sets `expectingOpcodeFetch`
+  before each `emulate()`: the fingerprint bench wraps both on the instance, so binding or capturing
+  them blinds its probe.
 - **A PSID with play address 0 is entered as an interrupt, and the stack is the seam.** The
   trampoline in `cpu/c64-machine.ts` pushes a hardware frame (plus A, X, Y on the `$0314` path), and
   the handler leaves through the KERNAL's own exits at `$EA31`, `$EA7E` and `$EA81`, or through an
@@ -301,7 +314,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `assertCpuStateKeys` is the only thing standing between a renamed field and a cue that restores
   incomplete CPU state silently, since `MachineSnapshot.cpu` is an opaque `CpuState` record. Keep
   the key list in sync and run `cpu/vendor-cpu.spec.ts`; `copyStateInto`, which the crossing captures
-  copy through, reads the same list. Detail:
+  copy through, reads the same list. A handler or bus method that allocates or keeps state off the
+  instance only shows in `cpu/vendor-cpu.allocation.spec.ts` and
+  `cpu/vendor-cpu.instances.spec.ts`, and a per-instance closure on the step path only in the
+  shared bench's `instances.mjs` (`SIDABLIST_DIR=… node instances.mjs`, in SIDABLIST-ROOT's
+  `bench/`). Detail:
   [`cpu/vendor-cpu.ts`](./src/cpu/vendor-cpu.ts).
 - **Changed the interrupt entry or the KERNAL exit stubs (`writeTrampoline`, `writeInterruptEntry`,
   `installRomStubs` in `cpu/c64-machine.ts`; `TRAMPOLINE_*`, `INTERRUPT_*`, `IRQ_*_STUB`,

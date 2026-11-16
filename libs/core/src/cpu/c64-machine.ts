@@ -255,6 +255,28 @@ class C64MachineImpl implements C64Machine {
   private readonly sink: SidWriteSink;
   private readonly memory: Uint8Array;
   private readonly cpu: Cpu6502;
+
+  /**
+   * The CPU's bus. A class, not a literal of arrows, because a literal builds a fresh `read` and a
+   * fresh `write` closure for every machine: the CPU's call sites see a second target once a second
+   * machine exists, lose the inlining they had on the first, and stay slower for the life of the
+   * process. A class's methods are one function shared by every machine.
+   *
+   * Each access looks `read` and `write` up on the machine instance, never binds or captures them,
+   * so a diagnostic that wraps them on the instance sees every access.
+   */
+  private static readonly Bus = class implements Cpu6502Bus {
+    constructor(private readonly machine: C64MachineImpl) {}
+
+    read(address: number): number {
+      return this.machine.read(address);
+    }
+
+    write(address: number, value: number): void {
+      this.machine.write(address, value);
+    }
+  };
+
   private readonly illegalOpcodeTable: Uint8Array;
   private readonly cyclesPerFrame: number;
   private readonly cyclesPerRasterLine: number;
@@ -287,14 +309,10 @@ class C64MachineImpl implements C64Machine {
     this.cyclesPerRasterLine = ntsc ? NTSC_CYCLES_PER_RASTER_LINE : PAL_CYCLES_PER_RASTER_LINE;
     this.rasterLineCount = ntsc ? NTSC_RASTER_LINES : PAL_RASTER_LINES;
 
-    // The core resets inside its own constructor, reading $FFFC/$FFFD back through this callback,
-    // so the address space has to exist first. The PC it lands on is meaningless — every entry
-    // re-points the reset vector and resets again.
-    const bus: Cpu6502Bus = {
-      read: (address: number): number => this.read(address),
-      write: (address: number, value: number): void => this.write(address, value),
-    };
-    this.cpu = createVendorCpu(bus);
+    // The core resets inside its own constructor, reading $FFFC/$FFFD back through the bus, so the
+    // address space has to exist first. The PC it lands on is meaningless — every entry re-points
+    // the reset vector and resets again.
+    this.cpu = createVendorCpu(new C64MachineImpl.Bus(this));
     this.illegalOpcodeTable = buildIllegalOpcodeTable(this.cpu);
   }
 

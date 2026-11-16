@@ -8,13 +8,14 @@ const IDLE_PROCESSOR_STATUS = { info: [], registers: null };
 /**
  * `mos6502` with its per-instruction debug work removed.
  *
- * The base class disassembles the current instruction and snapshots the registers on every
- * instruction boundary even with debug output unused — several objects and extra bus reads, purely
- * to fill a return value nothing here reads. `emulate` dispatches on `this`, so shadowing the method
- * on the subclass prototype removes the whole path. It is shadowed rather than declared as an
- * `override` because the base class types it `private`, so TypeScript will not let a subclass
- * redeclare it. This is the one behavioural adjustment the vendoring makes, and it belongs here in
- * the adapter rather than in the vendored files, which the conversion task keeps to a pure port.
+ * The base class disassembles the current instruction and snapshots the registers on an instruction
+ * boundary only when built with `debug` on, which this adapter never does — several objects and extra
+ * bus reads, purely to fill a value nothing here reads. The shadow below keeps that so even if a debug
+ * build were ever wired in: `emulate` dispatches on `this`, so shadowing the method on the subclass
+ * prototype removes the whole path. It is shadowed rather than declared as an `override` because the
+ * base class types it `private`, so TypeScript will not let a subclass redeclare it. This is the one
+ * behavioural adjustment the vendoring makes, and it belongs here in the adapter rather than in the
+ * vendored files.
  */
 class QuietMos6502 extends mos6502 {}
 Object.defineProperty(QuietMos6502.prototype, 'getProcessorStatus', {
@@ -65,12 +66,10 @@ class VendorCpu implements Cpu6502 {
   private readonly cpu: Mos6502Instance;
 
   constructor(bus: Cpu6502Bus) {
-    // The core resets inside its own constructor, reading $FFFC/$FFFD back through this callback,
-    // so the bus has to be ready before this runs.
-    this.cpu = new QuietMos6502(
-      (address: number): number => bus.read(address),
-      (address: number, value: number): void => bus.write(address, value),
-    );
+    // The core resets inside its own constructor, reading $FFFC/$FFFD back through the bus, so the
+    // bus has to be ready before this runs. It is handed over as it is: the core calls it directly
+    // at every access, with no wrapper between.
+    this.cpu = new QuietMos6502(bus);
     assertCpuStateKeys(this.cpu as unknown as Record<string, unknown>);
   }
 

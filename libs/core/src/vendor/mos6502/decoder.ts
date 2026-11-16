@@ -159,15 +159,9 @@ const matrix: ReadonlyMap<number, Instruction> = new Map<number, Instruction>([
   [0xfe, { instruction: 'INC', addressing: 'ABX', cycles: 7 }],
 ]);
 
-export const decode = (opcode: number): Instruction => {
-  const op = matrix.get(opcode);
+/** What an opcode outside the matrix decodes to. One shared object, so decoding never allocates. */
+const illegalInstruction: Instruction = { instruction: '???', addressing: 'IMP', cycles: 2 };
 
-  if (op === undefined) {
-    return {
-      instruction: '???',
-      addressing: 'IMP',
-      cycles: 2,
-    };
-  }
-  return op;
+export const decode = (opcode: number): Instruction => {
+  return matrix.get(opcode) ?? illegalInstruction;
 };
