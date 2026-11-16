@@ -157,8 +157,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   continuously the moment that stops holding, so a new snapshot producer must go through
   `markDirty` rather than hand back a fresh object on every read.
 - **The vendored emulator is modified, and lives behind a port.** `vendor/mos6502/` is
-  third-party source with one deliberate behavioural change (`cpu/vendor-cpu.ts`'s
-  `QuietMos6502`), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
+  third-party source reworked in place for speed and an allocation-free step (its README lists what
+  changed), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
   directly. See the co-change edge below before touching a field it exposes.
 - **The CPU's step path is shared and allocation-free, and so is its bus.** The vendored core's
   addressing modes and instructions are prototype methods, dispatched by name through tables built
@@ -167,8 +167,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   function, or a bus built from a literal of arrows — hands the CPU's call sites a second target once
   a second machine exists, and every machine in the process stays slower; a value returned or created
   per cycle costs every machine too. Both pass every functional spec.
-  `cpu/vendor-cpu.allocation.spec.ts` catches an allocation (it needs `--expose-gc`, which
-  `vitest.config.ts` gives the workers), `cpu/vendor-cpu.instances.spec.ts` catches state kept off
+  `cpu/vendor-cpu.allocation.spec.ts` catches an allocation in any legal opcode's handler (it runs
+  a program holding every one, and needs `--expose-gc`, which `vitest.config.ts` gives the workers), `cpu/vendor-cpu.instances.spec.ts` catches state kept off
   the instance, and only the bench's `instances.mjs` catches a closure. The bus looks `read` and
   `write` up on the machine instance at every access, and the machine sets `expectingOpcodeFetch`
   before each `emulate()`: the fingerprint bench wraps both on the instance, so binding or capturing
