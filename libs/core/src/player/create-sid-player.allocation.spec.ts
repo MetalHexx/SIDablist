@@ -9,7 +9,7 @@ import { FakeClock } from '../testing/fake-clock.js';
 import { ALLOCATION_NOISE_BYTES, measureAllocation } from '../testing/measure-allocation.js';
 import { frames, milliseconds } from '../units.js';
 import { createSidPlayer } from './create-sid-player.js';
-import type { SidPlayer } from './sid-player.js';
+import type { SavedPlayerState, SidPlayer } from './sid-player.js';
 
 const FRAMES = 3_000;
 /** Enough passes for the engine to have optimised every function the tick reaches, so the code it
@@ -217,6 +217,84 @@ describe('the frame path', () => {
     expect(rates.size).toBeGreaterThan(1);
 
     await expectNoAllocation(() => run(FRAMES));
+  });
+});
+
+describe('saving and restoring a player', () => {
+  const STATES = 8;
+  const RESTORE_EVERY = 50;
+
+  /** A player with a good deal in play — a loop of a length that is not whole frames, crossing
+   *  lines holding images, the shadow, a tempo, a hold, an offset and a mute — and `STATES` states
+   *  to keep restore points in, as a host does. */
+  async function keeping(): Promise<Running & { readonly states: readonly SavedPlayerState[] }> {
+    const running = await playing(counterTune());
+    const { player, run } = running;
+    player.setCrossingCaptures([{ originFrame: 0, periodFrames: 25, keep: 2 }]);
+    player.setTempo(1.25);
+    player.holdField({ name: 'resonance' }, 9, 0.5);
+    player.setFieldOffset({ name: 'frequency', voice: 0 }, 40);
+    player.setVoiceMuted(1, true);
+    run(200);
+    player.setActiveLoop({ startFrame: frames(100), endFrame: frames(150.5), lapPhase: 0 });
+    await settled();
+    player.startShadow(null);
+    return {
+      ...running,
+      states: Array.from({ length: STATES }, () => player.createSavedState()),
+    };
+  }
+
+  it('allocates nothing over frames saved every frame and restored every fifty', async () => {
+    const { player, run, states } = await keeping();
+    const published = player.getSnapshot();
+    let frame = 0;
+    let restores = 0;
+
+    // A restore goes back to the state saved seven frames before: the same loop, tempo, mutes and
+    // shadow, so nothing a snapshot publishes differs and none is built.
+    await expectNoAllocation(() => {
+      for (let index = 0; index < FRAMES; index++) {
+        run(1);
+        player.saveState(states[frame % STATES]);
+        frame++;
+        if (frame % RESTORE_EVERY === 0) {
+          player.restoreState(states[(frame + 1) % STATES]);
+          restores++;
+        }
+      }
+    });
+
+    expect(restores).toBeGreaterThan(FRAMES / RESTORE_EVERY);
+    expect(player.getSnapshot()).toBe(published);
+  });
+
+  it('allocates nothing across restores alone', async () => {
+    const { player, states } = await keeping();
+    player.saveState(states[0]);
+
+    // No tick between them: whatever a restore itself builds shows, ten times over.
+    await expectNoAllocation(() => {
+      for (let index = 0; index < FRAMES * 10; index++) player.restoreState(states[0]);
+    });
+  });
+
+  it('prints what a save costs', async () => {
+    const { player, run, states } = await keeping();
+    const samples: number[] = [];
+    for (let index = 0; index < 2_000; index++) {
+      run(1);
+      const start = performance.now();
+      player.saveState(states[0]);
+      samples.push(performance.now() - start);
+    }
+
+    samples.sort((a, b) => a - b);
+    const median = samples[samples.length >> 1];
+    const micros = (milliseconds: number): string => (milliseconds * 1000).toFixed(1);
+    console.info(
+      `saveState: median ${micros(median)} µs, p95 ${micros(samples[Math.floor(samples.length * 0.95)])} µs over ${samples.length} saves`,
+    );
   });
 });
 

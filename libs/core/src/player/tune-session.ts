@@ -87,6 +87,10 @@ export interface TuneSession {
   readonly frame: RegisterFrame | null;
   framesRendered: Frames;
 
+  /** Counts the loads: every `load` builds a new machine and frame and bumps it. What a saved state
+   *  is stamped with, since two loads of the same file are two machines. */
+  readonly loadGeneration: number;
+
   /** Rebuilds the machine and register frame for `file`. Does not initialise a subtune — the
    *  coordinator calls `initSubtune()` once it has decided what else a fresh load resets. */
   load(file: SidFile): void;
@@ -98,6 +102,10 @@ export interface TuneSession {
    *  number greater than zero is stored as null instead — a zero or negative basis would divide the
    *  playhead by nothing — which makes `positionBasisFrames` fall back to `ceilingFrames`. */
   setIndexedLengthFrames(lengthFrames: Frames | null): void;
+
+  /** `setIndexedLengthFrames` without the notification, for a restore that puts the track structure
+   *  back and notifies once itself, after everything is in place. */
+  adoptIndexedLengthFrames(lengthFrames: Frames | null): void;
 
   /** Re-inits the machine and marks every register dirty, so the chip cannot inherit the old state. */
   initSubtune(song: number): boolean;
@@ -236,6 +244,7 @@ class TuneSessionImpl implements TuneSession {
   private _machine: C64Machine | null = null;
   private _frame: RegisterFrame | null = null;
   private _framesRendered: Frames = frames(0);
+  private _loadGeneration = 0;
   /** Stamped onto every request this session hands the runner, so responses can be told apart by age.
    *  Shared with `replayImage` rather than counted separately: the runner is one shared worker, and
    *  two counters could stamp two live requests with the same id. */
@@ -270,8 +279,13 @@ class TuneSessionImpl implements TuneSession {
     this._framesRendered = value;
   }
 
+  get loadGeneration(): number {
+    return this._loadGeneration;
+  }
+
   load(file: SidFile): void {
     this._file = file;
+    this._loadGeneration++;
     this._frame = createRegisterFrame();
     this._machine = createC64Machine(file, this._frame);
     this._subtuneCount = Math.max(1, file.songs);
@@ -286,8 +300,12 @@ class TuneSessionImpl implements TuneSession {
   }
 
   setIndexedLengthFrames(lengthFrames: Frames | null): void {
-    this._indexedLengthFrames = sanitizePositiveFrame(lengthFrames);
+    this.adoptIndexedLengthFrames(lengthFrames);
     this.host.markDirty();
+  }
+
+  adoptIndexedLengthFrames(lengthFrames: Frames | null): void {
+    this._indexedLengthFrames = sanitizePositiveFrame(lengthFrames);
   }
 
   initSubtune(song: number): boolean {

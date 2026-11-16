@@ -42,6 +42,10 @@ export interface AnchorRing {
   select(frame: Frames): PositionAnchor | null;
   /** Drops every anchor, seed included — each describes a machine that no longer exists. */
   reset(): void;
+  /** Drops every anchor but the seed, allocating nothing — for a caller that cannot vouch for what
+   *  the later ones were recorded under. The seed is the machine just initialised, which no
+   *  recording along the way changes. */
+  keepSeedOnly(): void;
 }
 
 /**
@@ -126,6 +130,10 @@ export function createAnchorRing(nudgeRangeFrames: () => Frames): AnchorRing {
 
     reset(): void {
       count = 0;
+    },
+
+    keepSeedOnly(): void {
+      count = Math.min(count, 1);
     },
   };
 }

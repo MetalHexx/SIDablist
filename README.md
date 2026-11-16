@@ -152,6 +152,25 @@ A real host swaps `FakeClock` for a `FrameClock` riding an audio graph, `FakeSin
 contract and [`docs/architecture.md`](./docs/architecture.md#the-clock-port-is-split-the-same-way)
 for the clock port's own split.
 
+## Restore points
+
+A host that wants to try a change and take it back, or retry a passage, keeps a restore point and
+comes back to it exactly: the player then plays the frames, with the same numbers and due times, that
+it would have played had it never left.
+
+```js
+const restorePoint = player.createSavedState(); // once, off the tick, after loadTune
+player.saveState(restorePoint); // as often as every frame: it allocates nothing
+// ... play on, issue other commands ...
+player.restoreState(restorePoint); // synchronous, and the transport keeps playing
+```
+
+A state holds the machine, the output stage, the loop, the tempo, the shadow and the varispeed hand;
+it leaves out what the host owns (clock, sink, transport) and what only reports. One from another
+load, subtune or set of crossing lines is refused with a warning and changes nothing. See
+[`docs/architecture.md`](./docs/architecture.md#restore-points) for what a restore does and does
+not touch.
+
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).

@@ -105,7 +105,11 @@ export {
 } from './timeline/active-loop.js';
 export { type CountedLoop, type ShadowCount, countAfter } from './timeline/shadow-position.js';
 export { type CrossingLines } from './timeline/crossing-captures.js';
-export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
+export {
+  type SavedPlayerState,
+  type SidPlayer,
+  type VarispeedRateSource,
+} from './player/sid-player.js';
 export { type DeliveryBatch, createDeliveryBatch } from './player/delivery-history.js';
 export {
   type JumpSettings,

@@ -240,6 +240,18 @@ describe('TuneSession', () => {
       expect(session.subtuneCount).toBe(1);
     });
 
+    it('counts every load, and no subtune init', () => {
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
+      expect(session.loadGeneration).toBe(0);
+
+      session.load(silentTune(2));
+      session.initSubtune(2);
+      expect(session.loadGeneration).toBe(1);
+
+      session.load(silentTune(2));
+      expect(session.loadGeneration).toBe(2);
+    });
+
     it('resets the position counter, records a fresh anchor, adopts the subtune and clears the error on success', () => {
       const host = fakeHost();
       const session = createTuneSession(new FakeReplayRunner(), host);

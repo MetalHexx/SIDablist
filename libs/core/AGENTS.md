@@ -51,6 +51,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   delivered (`delivery-history.ts`, whose `DeliveryBatch` and `createDeliveryBatch` are public and
   whose `DeliveryHistory` is not), for a host that samples slower than frames are built.
   `getLapPhase()` reads the running loop's lap in progress, pulled like `getPosition()`.
+  `createSavedState`, `saveState` and `restoreState` keep a restore point of everything that decides
+  the next frames, every frame if a host likes, and come back to it exactly (`saved-state.ts` is
+  its layout; `SavedPlayerState` is opaque).
   `setCrossingCaptures` declares lines the live machine is saved at as the playhead crosses them,
   and `holdsImageAt` says whether an entry image exists for a frame (prepared, cached or saved at a
   crossing); a loop set at such a frame re-enters from the saved image with no replay.
@@ -86,7 +89,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   setter, hook or notification. A new field on one of them joins its state type, or its doc comment
   says why it is out — a field left out restores almost exactly, which only a round-trip spec in the
   part's own spec file catches. The tracker's three images are held by reference, not copied, so
-  whoever owns them must keep them valid between a save and its restore.
+  whoever owns them must keep them valid between a save and its restore: the player's save copies
+  the loop-entry buffer, the one mutable image among them, itself.
+- A new field on the player (`SidPlayerCoordinator`) joins the saved state — `player/saved-state.ts`,
+  `saveState`, `restoreState` — or the list under "A saved state holds everything…" below says why it
+  is left out.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.
@@ -98,11 +105,51 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
   of it in a fresh object or a getter for readability is a real regression, and it is audible.
   `player/create-sid-player.allocation.spec.ts` and `timeline/anchor-ring.allocation.spec.ts` measure
-  plain play, laps, landings, the hand, a tune that changes its rate every call and the anchor ring
-  against a sink that holds nothing (they need `--expose-gc`, which `vitest.config.ts` gives the
+  plain play, laps, landings, the hand, a tune that changes its rate every call, a save every frame
+  with a restore every fifty and the anchor ring against a sink that holds nothing (they need `--expose-gc`, which `vitest.config.ts` gives the
   workers). A new thing on the tick that allocates shows there: a result object, a `for…of` over a
   `Set` or `Map`, a keyed read or store of a field the CPU holds as a double (`copyStateInto` and
   `setState` name their fields for that reason), a snapshot built where nothing published changed.
+- **A saved state holds everything that decides the next frames, and a field left out restores
+  almost exactly.** It passes most specs and breaks one playing state, which is why
+  `player/create-sid-player.save-restore.spec.ts` plays two players on one tune — one straight
+  through, one saving, playing on with other commands, restoring — and compares every delivered
+  frame register for register, frame number and due time included, across each playing state. In: the
+  machine, the register frame's output stage, the position, tempo and the rate mirror, mutes, the
+  output settings the next load carries (gain, scales, target clock, pitches), field holds and
+  offsets, the running loop with its queued jump, its settings, a pending change and the images they
+  hold, the track structure and the track loop's entry image, the hand-offs landed, the crossing
+  pool, the shadow, and the hand (varispeed, rate source, the handback, the gate-off owed). Out:
+  what only reports (stats, the delivery history, snapshots), what the host owns (its clock, sink,
+  the rate source's own state, the transport), what the tune alone determines (prepared images,
+  declared frames, the entry-image cache), and the tokens that tell a late answer from a current one
+  (`handbackGeneration`, `varispeedRun`, `clockStarts`, `imageVersions`, the pool's stamps), which
+  only rise: put back, an answer in flight would pass for the next request's. A save is made
+  between ticks, never from a sink or a listener a tick reaches.
+- **A save copies a mutable image only when a fill has replaced the one it holds.** `loopEntry` is
+  numbered by `markLoopEntryFilled` and each crossing slot by the pool's stamp, and a state keeps
+  the number of the copy it holds, so a save every frame costs one machine image (about 3 µs) plus a
+  copy per fill, and a restore copies back only a slot a later fill replaced. A new place that
+  refills either without going through them hands a state an image that is stale and looks
+  current. The prepared and cached images are never refilled, so a state holds them by reference.
+- **A restore is the same player, not a landing.** It owes no gate-off and queues no resync — the sink
+  is handed the deltas an undisturbed player would send, and the history is left alone — keeps the
+  transport, drops a jump still replaying, and re-times the clock (never the sink) when the restored
+  rate or tempo moves it; the sink is retimed only for the tempo, a host command's effect. It
+  notifies once, after everything is back, and only through `restoreMovedPublished`, which compares
+  the published snapshot field against the live ones because `markDirty` builds the snapshot before it
+  compares: a published field a restore can change has to join that check, or a restore stops
+  publishing it.
+- **A restore resets the anchor ring to its seed.** An anchor recorded after the save may have been
+  taken with a voice muted, which leaves that voice's control register zeroed in the image, and a
+  loop re-entering along the ring would carry the zero into a player that is not muted. The ring
+  refills within a few anchors' spacing, so a seek or a lap with no entry image in the first
+  moments after a restore replays from frame 0, which is slower and exact.
+- **A restore across varispeed leaves the clock as the exit or entry requires.** Into varispeed it
+  needs the transport playing, since nothing from here can start the clock a non-playing varispeed
+  owns, and is refused otherwise. Out of one, `endVarispeed` returns the rate pitch to home, and a
+  non-playing varispeed's clock stops and its sink ends as for any other exit. A handback saved
+  before its image arrived asks for it again.
 - **A result handed back on the tick is the owner's, and no caller keeps it.** `C64Machine.runFrame`
   and `initSubtune` return one object the machine refills, `ActiveLoopTracker.advance` returns a
   constant or one object the tracker refills, and `AnchorRing.select` returns the ring's own image,
@@ -449,6 +496,12 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   history, and a shifted meaning of a control write records the wrong byte, with no compile error.
   Record at the new call and run `player/delivery-history.spec.ts` and the `delivery history` specs
   in `player/create-sid-player.spec.ts`.
+- **Added a field to the player, to `TuneSession`, or to a part's state?** It joins the saved state or
+  this guide says why not: `player/saved-state.ts`, `saveState`, `restoreState`, and a spec in
+  `player/create-sid-player.save-restore.spec.ts` that plays it through a rewind. One a snapshot
+  publishes also joins `restoreMovedPublished`. Left out, it restores almost exactly, which is a
+  state that sounds right until the one playing state it is wrong in; the reference test only
+  catches the fields it drives. Detail: [`src/player/saved-state.ts`](./src/player/saved-state.ts).
 - **Changed how a lap's end rounds (`lapLength`, `lapSpan`, `lapsWithin` in `timeline/active-loop.ts`)?**
   They round with `Math.round`, as `gridLine` and `isOnLine` do, and `libs/analysis`'s
   `grid-lines.ts` imports them for `shrinkLanding`, `foldIntoLoop`, `lapPhaseAt` and
