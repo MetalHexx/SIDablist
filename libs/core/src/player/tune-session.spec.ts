@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { SidFile, SidClock } from '../sid/sid-file.model.js';
 import type { C64Machine } from '../cpu/c64-machine.js';
 import type { RegisterFrame } from '../registers/register-frame.js';
@@ -175,11 +175,13 @@ function unplayableTune(): SidFile {
  * can assert on `ceilingFrames` staying current across a subtune init with no override needed. */
 function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
   readonly failures: string[];
+  readonly warnings: string[];
   readonly resyncCount: { count: number };
   readonly dirtyCount: { count: number };
   readonly followCount: { count: number };
 } {
   const failures: string[] = [];
+  const warnings: string[] = [];
   const resyncCount = { count: 0 };
   const dirtyCount = { count: 0 };
   const followCount = { count: 0 };
@@ -205,6 +207,7 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
     effectiveMutes: () => [false, false, false],
     clearError: () => undefined,
     fail: (reason: string) => failures.push(reason),
+    warn: (message: string) => warnings.push(message),
     queueResync: () => {
       resyncCount.count++;
     },
@@ -216,6 +219,7 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
     },
     ...overrides,
     failures,
+    warnings,
     resyncCount,
     dirtyCount,
     followCount,
@@ -224,11 +228,6 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
 
 describe('TuneSession', () => {
   let replay: FakeReplayRunner;
-
-  beforeEach(() => {
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-  });
 
   describe('load and subtune init', () => {
     it('builds a machine and frame, and clamps the subtune count to at least 1', () => {
@@ -524,6 +523,7 @@ describe('TuneSession', () => {
 
       expect(await session.replayImage(frames(1))).toBeNull();
       expect(host.failures).toHaveLength(0);
+      expect(host.warnings).toEqual([expect.stringMatching(/^SID player: /)]);
     });
 
     it('takes no part in the jump gating: a scrub issued alongside it still lands, under an id of its own', async () => {

@@ -65,13 +65,18 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
   itself.
-- `ports/` — `Clock`, `SidSink`, `Transport`: the interfaces a host injects; this library depends
-  on none of their implementations.
+- `ports/` — `FrameClock`, `SidSink`, `Transport`, `TimeSource`, `EngineLog`: the interfaces a host
+  injects; this library depends on none of their implementations.
 - `testing/` — `FakeClock`, `FakeSink`, `FakeTransport`: fixtures for a consumer's own specs.
 - `vendor/mos6502/` — the vendored 6502 core. See Hazards below before touching it.
 
 ## Conventions
 
+- **Core reads no clock, writes no console and builds no worker.** Time comes from the injected
+  `TimeSource`, rejected input and failures go to the optional `EngineLog` (absent means silent),
+  and `createWorkerReplayRunner` requires its worker factory. `eslint.config.mjs` enforces it:
+  `performance` and `console` are restricted globals and `new Worker(...)` is banned under
+  `libs/core/src` (specs, `testing/` and `replay/replay.worker.ts` excepted).
 - A new field on `PlayerSnapshot` or `PlayerStats` lands inside an existing named group, never as
   a new flat top-level property — see either interface's own doc comment for why.
 - Whether new player state goes on `PlayerSnapshot` (pushed through `subscribe`) or `PlayerStats`

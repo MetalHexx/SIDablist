@@ -5,6 +5,8 @@ import {
   PLAY_BUDGET_FRAMES,
 } from '../cpu/cpu-constants.js';
 import type { FrameClock, FrameClockStats } from '../ports/clock.js';
+import type { EngineLog } from '../ports/log.js';
+import type { TimeSource } from '../ports/time.js';
 import { NTSC_PHI2_HZ, PAL_PHI2_HZ, clockRatio } from '../registers/clock-ratio.js';
 import { applyFrameToChip, recordFromTune } from '../registers/__fixtures__/record-from-tune.js';
 import type { RegisterRecord } from '../registers/register-record.js';
@@ -377,6 +379,30 @@ function runawayTune(): SidFile {
   });
 }
 
+let nowMs = 10_000;
+/** The host's time, held where a test puts it rather than read off a clock. */
+const time: TimeSource = { now: () => milliseconds(nowMs) };
+
+/** Records what the player reports, so a test asserts on the log rather than the console. */
+const log: EngineLog & {
+  readonly warns: string[];
+  readonly errors: string[];
+  clear(): void;
+} = {
+  warns: [],
+  errors: [],
+  warn(message) {
+    this.warns.push(message);
+  },
+  error(message) {
+    this.errors.push(message);
+  },
+  clear() {
+    this.warns.length = 0;
+    this.errors.length = 0;
+  },
+};
+
 interface Harness {
   readonly player: SidPlayer;
   readonly sink: RecordingSink;
@@ -388,7 +414,12 @@ function harness(): Harness {
   const sink = new RecordingSink();
   const clock = new FakeClock();
   const replay = new FakeReplayRunner();
-  return { player: createSidPlayer({ sink, clock, replayRunner: replay }), sink, clock, replay };
+  return {
+    player: createSidPlayer({ sink, clock, replayRunner: replay, time, log }),
+    sink,
+    clock,
+    replay,
+  };
 }
 
 interface SplitHarness extends Harness {
@@ -402,7 +433,14 @@ function splitHarness(): SplitHarness {
   const replay = new FakeReplayRunner();
   const prepare = new FakeReplayRunner();
   return {
-    player: createSidPlayer({ sink, clock, replayRunner: replay, prepareRunner: prepare }),
+    player: createSidPlayer({
+      sink,
+      clock,
+      replayRunner: replay,
+      prepareRunner: prepare,
+      time,
+      log,
+    }),
     sink,
     clock,
     replay,
@@ -435,7 +473,7 @@ function preparedFrames(player: SidPlayer): readonly number[] | undefined {
 /** Ticks `count` frames, each one interval apart on the same rising timeline a real clock reports. */
 function run(clock: FakeClock, count: number, from = 0): void {
   for (let index = 0; index < count; index++) {
-    clock.tick(milliseconds(performance.now() + from + index));
+    clock.tick(milliseconds(time.now() + from + index));
   }
 }
 
@@ -488,8 +526,8 @@ function bytesOver(h: Harness, count: number): (number | null)[] {
 
 describe('createSidPlayer', () => {
   beforeEach(() => {
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    log.clear();
+    nowMs = 10_000;
   });
 
   describe('the transport state machine', () => {
@@ -995,8 +1033,8 @@ describe('createSidPlayer', () => {
         player.setActiveLoop({ ...running, lapPhase: Number.NaN });
 
         expect(player.getSnapshot()).toBe(before);
-        expect(console.warn).toHaveBeenCalledTimes(4);
-        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('SID player: ignoring'));
+        expect(log.warns).toHaveLength(4);
+        expect(log.warns).toContainEqual(expect.stringContaining('SID player: ignoring'));
       });
     });
   });
@@ -1105,6 +1143,8 @@ describe('createSidPlayer', () => {
         sink,
         clock: new FailingClock(),
         replayRunner: new FakeReplayRunner(),
+        time,
+        log,
       });
       player.loadTune(silentTune());
 
@@ -1522,14 +1562,74 @@ describe('createSidPlayer', () => {
     });
   });
 
+  describe('the host seams', () => {
+    it('reports rejected input and failures nowhere when no log was supplied', async () => {
+      const warn = vi.spyOn(console, 'warn');
+      const error = vi.spyOn(console, 'error');
+      const player = createSidPlayer({
+        sink: new RecordingSink(),
+        clock: new FailingClock(),
+        replayRunner: new FakeReplayRunner(),
+        time,
+      });
+      player.loadTune(silentTune());
+
+      player.setTempo(0);
+      player.keepDeliveries(Number.NaN);
+      await player.play();
+
+      expect(player.getSnapshot().transport).toBe('error');
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    });
+
+    it('sends the exact warning and failure text to the log it was given', async () => {
+      const player = createSidPlayer({
+        sink: new RecordingSink(),
+        clock: new FailingClock(),
+        replayRunner: new FakeReplayRunner(),
+        time,
+        log,
+      });
+      player.loadTune(silentTune());
+
+      player.setTempo(0);
+      player.keepDeliveries(Number.NaN);
+      await player.play();
+
+      expect(log.warns).toEqual([
+        'SID player: ignoring a tempo multiplier of 0.',
+        'SID player: ignoring a delivery history of NaN (must be 0…4096).',
+      ]);
+      expect(log.errors).toEqual([
+        'SID player: the frame clock could not start — the audio context refused to resume',
+      ]);
+    });
+
+    it('reads no clock of its own while playing, retiming and recording deliveries', async () => {
+      const now = vi.spyOn(performance, 'now');
+      const { player, clock } = harness();
+      player.loadTune(counterTune());
+      player.keepDeliveries(8);
+      await player.play();
+
+      run(clock, 5);
+      player.setTempo(1.5);
+      run(clock, 5, 5);
+      player.pause();
+
+      expect(now).not.toHaveBeenCalled();
+    });
+  });
+
   describe('delivery measurement', () => {
     it('counts a clamped frame as clamped, and still counts its lag', async () => {
       const { player, clock } = harness();
       player.loadTune(silentTune());
       await player.play();
 
-      clock.tick(milliseconds(performance.now()), true);
-      clock.tick(milliseconds(performance.now()), false);
+      clock.tick(milliseconds(time.now()), true);
+      clock.tick(milliseconds(time.now()), false);
 
       const { delivery } = player.getStats();
       expect(delivery.clampedFrames).toBe(1);
@@ -1553,10 +1653,10 @@ describe('createSidPlayer', () => {
       player.loadTune(silentTune());
       await player.play();
 
-      clock.tick(milliseconds(performance.now()));
+      clock.tick(milliseconds(time.now()));
       expect(player.getStats().delivery.lateFrames).toBe(0);
 
-      clock.tick(milliseconds(performance.now() - 500));
+      clock.tick(milliseconds(time.now() - 500));
       expect(player.getStats().delivery.lateFrames).toBe(1);
     });
 
@@ -1565,8 +1665,8 @@ describe('createSidPlayer', () => {
       player.loadTune(silentTune());
       await player.play();
 
-      clock.tick(milliseconds(performance.now() - 40));
-      clock.tick(milliseconds(performance.now()));
+      clock.tick(milliseconds(time.now() - 40));
+      clock.tick(milliseconds(time.now()));
 
       const { delivery } = player.getStats();
       expect(delivery.meanLagMs).toBeGreaterThan(0);
@@ -2040,13 +2140,12 @@ describe('createSidPlayer', () => {
 
     it('warns about a refused value and does not carry it into the next load', async () => {
       const { player, sink, clock } = harness();
-      const warn = vi.spyOn(console, 'warn');
-      warn.mockClear();
+      log.clear();
 
       player.holdField(VOLUME_FIELD, 16);
       player.holdField(VOLUME_FIELD, 5, 1.5);
       player.holdField({ name: 'gate', voice: 3 }, 1);
-      expect(warn).toHaveBeenCalledTimes(3);
+      expect(log.warns).toHaveLength(3);
 
       player.loadTune(volumeTune(TUNE_VOLUME_BYTE));
       await player.play();
@@ -2068,12 +2167,11 @@ describe('createSidPlayer', () => {
 
     it('warns about a release of a field that does not resolve and carries on', () => {
       const { player } = harness();
-      const warn = vi.spyOn(console, 'warn');
-      warn.mockClear();
+      log.clear();
 
       player.releaseField({ name: 'gate', voice: -1 });
 
-      expect(warn).toHaveBeenCalledTimes(1);
+      expect(log.warns).toHaveLength(1);
     });
 
     it('treats one field given as two different objects as a single hold', async () => {
@@ -2258,12 +2356,11 @@ describe('createSidPlayer', () => {
       'warns once about %s and leaves an offset already in place alone',
       async (_, field, amount) => {
         const { player, sink, clock } = harness();
-        const warn = vi.spyOn(console, 'warn');
         player.setFieldOffset(PULSE_FIELD, 512);
-        warn.mockClear();
+        log.clear();
 
         player.setFieldOffset(field, amount);
-        expect(warn).toHaveBeenCalledTimes(1);
+        expect(log.warns).toHaveLength(1);
 
         player.loadTune(pulseWidthTune(TUNE_LOW, TUNE_HIGH));
         await player.play();
@@ -2274,12 +2371,11 @@ describe('createSidPlayer', () => {
 
     it('warns once about a release of a field that does not resolve and carries on', () => {
       const { player } = harness();
-      const warn = vi.spyOn(console, 'warn');
-      warn.mockClear();
+      log.clear();
 
       player.clearFieldOffset({ name: 'gate', voice: -1 });
 
-      expect(warn).toHaveBeenCalledTimes(1);
+      expect(log.warns).toHaveLength(1);
     });
   });
 
@@ -2720,7 +2816,7 @@ describe('createSidPlayer', () => {
     });
 
     it('ignores a capacity it cannot honour, with a warning, and leaves the history as it was', async () => {
-      vi.mocked(console.warn).mockClear();
+      log.clear();
       const { player, clock } = harness();
       player.loadTune(counterTune());
       player.keepDeliveries(8);
@@ -2731,7 +2827,7 @@ describe('createSidPlayer', () => {
         player.keepDeliveries(unusable);
       }
 
-      expect(console.warn).toHaveBeenCalledTimes(4);
+      expect(log.warns).toHaveLength(4);
       expect(drain(player, 8).count).toBe(2);
     });
 
@@ -3164,8 +3260,8 @@ describe('createSidPlayer', () => {
       player.setJumpTargets([NaN, 0, -7, 99.6, 100, Infinity].map((frame) => frames(frame)));
       await flushEntryImageCapture();
 
-      expect(console.warn).toHaveBeenCalledWith('SID player: ignoring a jump target of NaN.');
-      expect(console.warn).toHaveBeenCalledWith('SID player: ignoring a jump target of Infinity.');
+      expect(log.warns).toContain('SID player: ignoring a jump target of NaN.');
+      expect(log.warns).toContain('SID player: ignoring a jump target of Infinity.');
       expect(preparedFrames(player)).toEqual([0, 100]);
 
       const requests = replay.requests.length;
@@ -3185,9 +3281,7 @@ describe('createSidPlayer', () => {
 
       expect(preparedFrames(player)).toEqual([]);
       expect(replay.requests).toHaveLength(1);
-      expect(console.warn).toHaveBeenCalledWith(
-        expect.stringContaining('exceeded its cycle budget'),
-      );
+      expect(log.warns).toContainEqual(expect.stringContaining('exceeded its cycle budget'));
 
       player.setJumpTargets([frames(5)]);
       await flushEntryImageCapture();
@@ -3224,6 +3318,8 @@ describe('createSidPlayer', () => {
         clock: new FakeClock(),
         replayRunner: shared,
         prepareRunner: shared,
+        time,
+        log,
       });
       player.dispose();
       expect(shared.disposeCount).toBe(1);
@@ -3624,7 +3720,7 @@ describe('createSidPlayer', () => {
       player.queueJump({ startFrame: frames(500), endFrame: frames(501.5) });
       player.queueJump({ startFrame: frames(500), endFrame: frames(510), lapPhase: Number.NaN });
 
-      expect(console.warn).toHaveBeenCalledTimes(2);
+      expect(log.warns).toHaveLength(2);
       expect(queued(player)).toEqual({ startFrame: 500, endFrame: 520 });
     });
 
@@ -3711,11 +3807,11 @@ describe('createSidPlayer', () => {
       player.loadTune(counterTune());
 
       player.queueJump({ startFrame: frames(500), endFrame: frames(520) });
-      expect(console.warn).toHaveBeenCalledWith(expect.stringContaining('SID player: ignoring'));
+      expect(log.warns).toContainEqual(expect.stringContaining('SID player: ignoring'));
       expect(queued(player)).toBeNull();
 
       player.queueJump(null);
-      expect(console.warn).toHaveBeenCalledTimes(1);
+      expect(log.warns).toHaveLength(1);
 
       player.setActiveLoop({ startFrame: frames(100), endFrame: frames(110) });
       for (const target of [
@@ -3728,7 +3824,7 @@ describe('createSidPlayer', () => {
         player.queueJump(target);
         expect(queued(player)).toBeNull();
       }
-      expect(console.warn).toHaveBeenCalledTimes(6);
+      expect(log.warns).toHaveLength(6);
     });
 
     it('keeps the queued jump when a later call is rejected', async () => {
@@ -4024,9 +4120,8 @@ describe('createSidPlayer', () => {
       });
 
       it('warns about each refused entry when the jump is queued, once, and applies the rest', async () => {
-        const warn = vi.spyOn(console, 'warn');
         const h = await looping(settingsTune());
-        warn.mockClear();
+        log.clear();
 
         h.player.queueJump(
           jump({
@@ -4042,13 +4137,13 @@ describe('createSidPlayer', () => {
             ],
           }),
         );
-        expect(warn).toHaveBeenCalledTimes(4);
-        for (const [message] of warn.mock.calls) {
+        expect(log.warns).toHaveLength(4);
+        for (const message of log.warns) {
           expect(message).toEqual(expect.stringContaining('SID player: ignoring'));
         }
         const { resync } = landQueued(h);
 
-        expect(warn).toHaveBeenCalledTimes(4);
+        expect(log.warns).toHaveLength(4);
         expect(valueOf(resync, 1)).toBe(0x24);
         expect(valueOf(resync, VOICE_1_FREQUENCY_HIGH)).toBe(0x10);
         expect(valueOf(resync, 3)).toBe(0x03);
@@ -4501,7 +4596,7 @@ describe('createSidPlayer', () => {
 
     const clockIsStopped = (clock: FakeClock): boolean => {
       try {
-        clock.tick(milliseconds(performance.now()));
+        clock.tick(milliseconds(time.now()));
         return false;
       } catch {
         return true;
@@ -4524,7 +4619,7 @@ describe('createSidPlayer', () => {
         h.player.setRegisterRecord({ ...h.record, values: new Uint8Array(3) });
 
         expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
-        expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/^SID player:/));
+        expect(log.warns).toContainEqual(expect.stringMatching(/^SID player:/));
       });
 
       it('refuses a record while in varispeed, with a warning', () => {
@@ -4534,7 +4629,7 @@ describe('createSidPlayer', () => {
         h.player.setRegisterRecord(null);
 
         expect(snapshotOf(h.player).tune?.recordedFrames).toBe(12);
-        expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/^SID player:/));
+        expect(log.warns).toContainEqual(expect.stringMatching(/^SID player:/));
       });
 
       it('is dropped by loadTune and by a subtune change, and kept by selecting the same subtune', () => {
@@ -5552,7 +5647,13 @@ describe('createSidPlayer', () => {
       it('is stopped again when it starts after its varispeed has already ended', async () => {
         const sink = new RecordingSink();
         const clock = new DeferredStartClock();
-        const player = createSidPlayer({ sink, clock, replayRunner: new FakeReplayRunner() });
+        const player = createSidPlayer({
+          sink,
+          clock,
+          replayRunner: new FakeReplayRunner(),
+          time,
+          log,
+        });
         player.loadTune(rampTune());
         player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
         player.enterVarispeed(() => 1);
@@ -5570,6 +5671,8 @@ describe('createSidPlayer', () => {
           sink,
           clock: new FailingClock(),
           replayRunner: new FakeReplayRunner(),
+          time,
+          log,
         });
         player.loadTune(rampTune());
         player.setRegisterRecord(recordFromTune(rampTune(), 1, 10));
@@ -5600,7 +5703,7 @@ describe('createSidPlayer', () => {
     beforeEach(() => {
       snapshotIntoSpy.mockClear();
       seekToFrameSpy.mockClear();
-      vi.mocked(console.warn).mockClear();
+      log.clear();
     });
 
     it('holds the most recent crossings of the declared lines and lets the oldest go', async () => {
@@ -5687,7 +5790,7 @@ describe('createSidPlayer', () => {
       run(clock, 25);
 
       expect(held(player, [10, 20])).toEqual([false, false]);
-      expect(console.warn).toHaveBeenCalledTimes(3);
+      expect(log.warns).toHaveLength(3);
     });
 
     it('drops the images on a stop, a load and a subtune change, and keeps the lines', async () => {

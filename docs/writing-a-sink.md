@@ -112,7 +112,7 @@ The harness is where the real work is, and it is necessarily sink-specific — `
 decode the sink's own wire format back into `{ register, value }` pairs, because a sink that cannot
 show what it actually sent cannot be conformance-tested at all. `libs/asid`'s
 `sink/conformance.spec.ts` is the worked example: its `makeHarness()` wraps a fake `MidiOutputPort`,
-decodes ASID's present/MSB masks back into register writes, and advances a mocked `performance.now()`
+decodes ASID's present/MSB masks back into register writes, and advances the `TimeSource` it hands the sink
 so `advanceMs` releases whatever is due. A case a new sink fails is the suite doing its job — the sink
 needs to change, not the case.
 

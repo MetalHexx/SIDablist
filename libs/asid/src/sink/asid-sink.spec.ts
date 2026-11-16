@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import type { SidFrame } from '@sidablist/core';
+import type { EngineLog, SidFrame, TimeSource } from '@sidablist/core';
 import { frames, microseconds, milliseconds } from '@sidablist/core';
 import {
   buildDisplayCharsPacket,
@@ -51,14 +51,25 @@ function frame(registers: readonly number[], values: readonly number[]): SidFram
   };
 }
 
+let nowMs = 10_000;
+/** The host's time, held where a test puts it rather than read off a clock. */
+const time: TimeSource = { now: () => milliseconds(nowMs) };
+
+let warnings: string[] = [];
+const recordingLog: EngineLog = {
+  warn: (message) => warnings.push(message),
+  error: () => undefined,
+};
+
 describe('createAsidSink', () => {
   let port: FakeMidiOutputPort;
   let sink: AsidSink;
 
   beforeEach(() => {
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    nowMs = 10_000;
+    warnings = [];
     port = new FakeMidiOutputPort();
-    sink = createAsidSink(port);
+    sink = createAsidSink(port, { time, log: recordingLog });
   });
 
   afterEach(() => {
@@ -78,7 +89,7 @@ describe('createAsidSink', () => {
     it('sends the stop packet on end, and drops whatever was still outstanding', () => {
       port.supportsCancel = true;
       sink.setScheduleAhead(milliseconds(200));
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now() + 1000), false);
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now() + 1000), false);
       expect(sink.readAt().inFlight).toBe(1);
 
       sink.end();
@@ -90,7 +101,7 @@ describe('createAsidSink', () => {
     it('sends a delivered-now frame immediately, with no timestamp, without touching in-flight depth', () => {
       port.supportsCancel = true;
       sink.setScheduleAhead(milliseconds(200));
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now() + 1000), false);
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now() + 1000), false);
       const inFlightBefore = sink.readAt().inFlight;
 
       sink.deliverNow(frame([4], [0x20]));
@@ -109,7 +120,7 @@ describe('createAsidSink', () => {
     });
 
     function deliverDueNow(): number {
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now()), false);
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now()), false);
       return port.sent.at(-1)?.timestampMs ?? Number.NaN;
     }
 
@@ -142,7 +153,7 @@ describe('createAsidSink', () => {
     });
 
     it('sends at once when nothing it stamped is still ahead', () => {
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now() - 1000), false);
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now() - 1000), false);
 
       sink.deliverNow(frame([4], [0x20]));
       sink.begin({ chipModel: 'mos6581' });
@@ -225,6 +236,48 @@ describe('createAsidSink', () => {
       sink.setScheduleAhead(milliseconds(NaN));
 
       expect(sink.capabilities.scheduleAheadMs).toBe(10);
+      expect(warnings).toEqual([
+        'ASID sink: ignoring a schedule-ahead of -5 ms.',
+        'ASID sink: ignoring a schedule-ahead of NaN ms.',
+      ]);
+    });
+
+    it('says why it clamped a window the port cannot honour', () => {
+      sink.setScheduleAhead(milliseconds(500));
+
+      expect(warnings).toEqual([
+        expect.stringMatching(/^ASID sink: clamped schedule-ahead from 500 ms to 40 ms — /),
+      ]);
+    });
+  });
+
+  describe('the host seams', () => {
+    it('reports nothing anywhere when no log was supplied', () => {
+      const warn = vi.spyOn(console, 'warn');
+      const error = vi.spyOn(console, 'error');
+      const quiet = createAsidSink(port, { time });
+
+      quiet.setScheduleAhead(milliseconds(-5));
+      quiet.setScheduleAhead(milliseconds(500));
+
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    });
+
+    it('reads no clock of its own through delivery, retime, readAt and stats', () => {
+      const now = vi.spyOn(performance, 'now');
+      port.supportsCancel = true;
+      port.cancelPendingReturns = true;
+      sink.setScheduleAhead(milliseconds(200));
+
+      sink.begin({ chipModel: 'mos6581' });
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(nowMs + 100), false);
+      sink.deliverNow(frame([1], [0x22]));
+      sink.retime(microseconds(ONE_INTERVAL_US));
+      sink.readAt();
+      void sink.stats;
+
+      expect(now).not.toHaveBeenCalled();
     });
   });
 
@@ -276,7 +329,7 @@ describe('createAsidSink', () => {
       port.supportsCancel = true;
       port.cancelPendingReturns = true;
       sink.setScheduleAhead(milliseconds(200));
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now() - 1000), false); // already past due
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now() - 1000), false); // already past due
       sink.deliver(frame([1], [0x22]), frames(1), milliseconds(1_000_000), false);
       const before = port.sent.length;
 
@@ -288,7 +341,7 @@ describe('createAsidSink', () => {
     it('records how far the furthest-out committed send reached past the cancel request', () => {
       port.supportsCancel = true;
       port.cancelPendingReturns = true;
-      const nowMs = performance.now();
+      const nowMs = time.now();
       sink.setScheduleAhead(milliseconds(200));
       sink.deliver(frame([0], [0x11]), frames(0), milliseconds(nowMs), false);
       sink.deliver(frame([1], [0x22]), frames(1), milliseconds(nowMs), false);
@@ -319,7 +372,7 @@ describe('createAsidSink', () => {
       port.supportsCancel = true;
       port.cancelPendingReturns = true;
       sink.setScheduleAhead(milliseconds(200));
-      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(performance.now()), false);
+      sink.deliver(frame([0], [0x11]), frames(0), milliseconds(time.now()), false);
       sink.retime(microseconds(ONE_INTERVAL_US));
       expect(sink.stats.lastCancelLatencyMs).toBeGreaterThan(-1);
 
@@ -358,13 +411,13 @@ describe('createAsidSink', () => {
 
   describe('readAt', () => {
     it('reports unknown consumption with the live outstanding-send depth, pruning what has become due', () => {
-      vi.spyOn(performance, 'now').mockReturnValue(1_000_000);
+      nowMs = 1_000_000;
       sink.deliver(frame([0], [0x11]), frames(0), milliseconds(1_000_100), false);
       sink.deliver(frame([1], [0x22]), frames(1), milliseconds(1_000_200), false);
 
       expect(sink.readAt()).toEqual({ kind: 'unknown', inFlight: 2 });
 
-      vi.spyOn(performance, 'now').mockReturnValue(1_000_250); // both now due
+      nowMs = 1_000_250; // both now due
 
       expect(sink.readAt()).toEqual({ kind: 'unknown', inFlight: 0 });
     });

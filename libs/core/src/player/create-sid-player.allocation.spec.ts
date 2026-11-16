@@ -115,7 +115,12 @@ interface Running {
 
 async function playing(file: SidFile): Promise<Running> {
   const clock = new FakeClock();
-  const player = createSidPlayer({ sink: nullSink, clock, replayRunner });
+  const player = createSidPlayer({
+    sink: nullSink,
+    clock,
+    replayRunner,
+    time: { now: () => milliseconds(0) },
+  });
   player.loadTune(file);
   // Every scenario records its deliveries, so the history's append is on the path measured.
   player.keepDeliveries(64);

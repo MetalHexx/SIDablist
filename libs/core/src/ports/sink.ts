@@ -56,7 +56,7 @@ export interface SidSink {
   end(): void;
 
   /** Hands one frame over with the host time it is due, on the same timeline the clock
-   *  reports (`performance.now()` milliseconds). `frameNumber` is the timeline position this
+   *  reports (the host's `TimeSource` timeline). `frameNumber` is the timeline position this
    *  frame represents — it is what lets a sink that can read its far end say *what* was
    *  consumed rather than only how much is outstanding. `catchUpClamped` marks a frame whose
    *  due time is later than the truth because its clock advance hit the catch-up ceiling —

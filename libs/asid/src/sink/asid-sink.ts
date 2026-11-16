@@ -5,6 +5,8 @@ import type {
   SidFrame,
   Frames,
   SidModel,
+  TimeSource,
+  EngineLog,
 } from '@sidablist/core';
 import type { Microseconds, Milliseconds } from '@sidablist/core';
 import { milliseconds, MICROSECONDS_PER_SECOND } from '@sidablist/core';
@@ -80,6 +82,8 @@ class AsidSinkImpl implements AsidSink {
 
   constructor(
     private readonly port: MidiOutputPort,
+    private readonly time: TimeSource,
+    private readonly log: EngineLog | undefined,
     scheduleAheadMs: Milliseconds,
   ) {
     this.scheduleAheadMsValue = scheduleAheadMs;
@@ -107,7 +111,7 @@ class AsidSinkImpl implements AsidSink {
       // mid-session port swap, so a swap to a non-cancelling port must force this back to -1 rather
       // than surface a stale reading from the port it replaced.
       lastCancelLatencyMs: cancelSupported ? this.lastCancelLatencyMs : -1,
-      inFlight: this.inFlightCount(performance.now()),
+      inFlight: this.inFlightCount(this.time.now()),
     };
   }
 
@@ -165,7 +169,7 @@ class AsidSinkImpl implements AsidSink {
    * so `setScheduleAhead()`'s live clamp is what keeps that window inaudible instead.
    */
   retime(intervalUs: Microseconds): void {
-    const nowMs = performance.now();
+    const nowMs = this.time.now();
     this.pruneCommittedHostSends(nowMs);
     if (this.committedHostSends.length === 0 || !this.port.supportsCancel) {
       return;
@@ -216,7 +220,7 @@ class AsidSinkImpl implements AsidSink {
 
   readAt(): FarEndConsumption {
     // ASID cannot know what the far end has consumed, but it does know its own in-flight depth.
-    return { kind: 'unknown', inFlight: this.inFlightCount(performance.now()) };
+    return { kind: 'unknown', inFlight: this.inFlightCount(this.time.now()) };
   }
 
   showText(text: string): void {
@@ -225,14 +229,14 @@ class AsidSinkImpl implements AsidSink {
 
   setScheduleAhead(ms: Milliseconds): void {
     if (!Number.isFinite(ms) || ms < 0) {
-      console.warn(`ASID sink: ignoring a schedule-ahead of ${ms} ms.`);
+      this.log?.warn(`ASID sink: ignoring a schedule-ahead of ${ms} ms.`);
       return;
     }
     const clamped = this.port.supportsCancel
       ? ms
       : milliseconds(Math.min(ms, UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS));
     if (clamped !== ms) {
-      console.warn(
+      this.log?.warn(
         `ASID sink: clamped schedule-ahead from ${ms} ms to ${clamped} ms — the selected MIDI ` +
           `port cannot cancel a pending send, so a deeper window would risk stale-tempo frames ` +
           `playing out audibly.`,
@@ -272,7 +276,7 @@ class AsidSinkImpl implements AsidSink {
    * `UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS` caps for exactly this kind of port.
    */
   private sendUnscheduled(packet: Uint8Array): void {
-    if (this.port.supportsCancel || this.lastStampedAtMs <= performance.now()) {
+    if (this.port.supportsCancel || this.lastStampedAtMs <= this.time.now()) {
       this.port.send(packet);
       return;
     }
@@ -293,7 +297,7 @@ class AsidSinkImpl implements AsidSink {
    *  this sink, has been handed over for immediate release: there is nothing left to cancel or
    *  re-time, so it never belonged in this collection. */
   private recordCommittedHostSend(packet: Uint8Array, scheduledAtMs: Milliseconds): void {
-    const nowMs = performance.now();
+    const nowMs = this.time.now();
     this.pruneCommittedHostSends(nowMs);
     if (scheduledAtMs > nowMs) {
       this.committedHostSends.push({ packet, scheduledAtMs });
@@ -308,11 +312,21 @@ class AsidSinkImpl implements AsidSink {
   }
 }
 
-/** Builds an ASID sink over an injected `MidiOutputPort`. The class itself is not exported —
- *  `AsidSink` is the contract a consumer builds against. */
+/** Builds an ASID sink over an injected `MidiOutputPort`, reading time from the host's
+ *  `TimeSource` and reporting rejected input to `log` (silent when absent). The class itself is not
+ *  exported — `AsidSink` is the contract a consumer builds against. */
 export function createAsidSink(
   port: MidiOutputPort,
-  options?: { readonly scheduleAheadMs?: Milliseconds },
+  options: {
+    readonly time: TimeSource;
+    readonly scheduleAheadMs?: Milliseconds;
+    readonly log?: EngineLog;
+  },
 ): AsidSink {
-  return new AsidSinkImpl(port, options?.scheduleAheadMs ?? milliseconds(0));
+  return new AsidSinkImpl(
+    port,
+    options.time,
+    options.log,
+    options.scheduleAheadMs ?? milliseconds(0),
+  );
 }

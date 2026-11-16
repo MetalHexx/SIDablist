@@ -221,6 +221,15 @@ one new timer value and flushes nothing, because nothing needs re-declaring.
 
 Core's half is only ever _this frame is due at T_.
 
+### Time, log and worker come from the host
+
+Core and the ASID sink read no clock, write to no console and construct no worker. The host injects
+all three: a `TimeSource` (milliseconds on the same timeline the frame clock's `dueAtMs` uses), an
+optional `EngineLog` for the input the engine rejects and the failures it hits (absent means
+silent), and the worker factory `createWorkerReplayRunner` requires. A lint rule on `libs/core/src`
+and `libs/asid/src` bans `performance`, `console` and `new Worker(...)` outside specs, the testing
+fixtures, `web-midi/` and the worker entry.
+
 ### The clock port is split the same way
 
 `FrameClock`, the port core depends on, states only _this frame is due at T_ and leaves precision to

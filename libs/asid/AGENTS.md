@@ -18,8 +18,8 @@ DOM type.
 - `wire/` — pure byte layout, no I/O: `asid-constants.ts` (the protocol values, transcribed from
   firmware), `slot-map.ts` (`packFrame`, mapping a frame's writes onto the 28 ASID slots) and
   `encoder.ts` (the SysEx packet builders).
-- `sink/` — `createAsidSink` (`asid-sink.ts`), `core`'s `SidSink` plus the ASID-specific
-  `showText`/`setScheduleAhead`/`stats`; `midi-output-port.ts` (`MidiOutputPort`, the injected
+- `sink/` — `createAsidSink` (`asid-sink.ts`, taking `{ time, scheduleAheadMs?, log? }`), `core`'s
+  `SidSink` plus the ASID-specific `showText`/`setScheduleAhead`/`stats`; `midi-output-port.ts` (`MidiOutputPort`, the injected
   transport this sink schedules against); `delivery-stats.ts` (the counters `AsidSink.stats`
   reports).
 - `web-midi/` — `midiOutputPortFrom`, the one file in this library that touches a browser global:
@@ -31,6 +31,9 @@ DOM type.
   I/O belong in `sink/`.
 - Anything that touches a browser global belongs only under `web-midi/`, exported through the
   `./web-midi` subpath — never re-exported from the package root.
+- The sink reads no clock and writes no console: time comes from the `TimeSource` and the two
+  schedule-ahead warnings go to the `EngineLog` passed to `createAsidSink`, silent when absent.
+  `eslint.config.mjs` restricts `performance` and `console` here, except under `web-midi/`.
 - A member `core`'s `SidSink` has no concept of (`showText`, `setScheduleAhead`, `stats`) goes on
   `AsidSink`, not smuggled onto the shared contract.
 

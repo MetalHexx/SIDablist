@@ -41,6 +41,8 @@ export interface TuneSessionHost {
   clearError(): void;
   /** Marks the engine's failure state and logs why. */
   fail(reason: string): void;
+  /** Reports input the session rejected; goes nowhere when the host supplied no log. */
+  warn(message: string): void;
   /** Queues the chip resync a restore owes the stream. */
   queueResync(): void;
   /** Drops the marker state's anchor ring — its entries describe a machine a subtune re-init has
@@ -319,7 +321,7 @@ class TuneSessionImpl implements TuneSession {
     try {
       const result = machine.initSubtune(clamped);
       if (!result.completed) {
-        console.warn(
+        this.host.warn(
           `SID player: subtune ${clamped} init ran out of cycles (${result.cyclesUsed}) — playing it anyway.`,
         );
       }
@@ -431,7 +433,7 @@ class TuneSessionImpl implements TuneSession {
     }
 
     if (!response.ok) {
-      console.warn(`SID player: ${response.error}`);
+      this.host.warn(`SID player: ${response.error}`);
       return null;
     }
     return response.result;

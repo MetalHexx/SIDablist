@@ -63,7 +63,8 @@ It also stands in for the collaborators a browser host would supply with its own
 `FakeSink` are real, exported fixtures (not test-only mocks smuggled into a public API) meant for
 exactly this — driving a player with no audio graph and no MIDI device in the loop — and the
 `replayRunner` below is `replayToFrame` run on the calling thread instead of on the worker a browser
-host would use via `createWorkerReplayRunner()`.
+host would use via `createWorkerReplayRunner(factory)`, handing it a factory that builds the worker
+from the `@sidablist/core/replay.worker` entry — core never constructs a `Worker` itself.
 
 ```js
 // hello-register-writes.mjs
@@ -115,7 +116,10 @@ const replayRunner = {
   dispose() {},
 };
 
-const player = createSidPlayer({ sink, clock, replayRunner });
+// `time` is the host's time on the same timeline the clock's due times use; `log` is where the
+// player reports input it rejects. Leave `log` out and the player is silent.
+const time = { now: () => performance.now() };
+const player = createSidPlayer({ sink, clock, replayRunner, time, log: console });
 player.loadTune(tune);
 await player.play();
 
@@ -147,8 +151,8 @@ frame 4: reg 0 = 5
 ```
 
 A real host swaps `FakeClock` for a `FrameClock` riding an audio graph, `FakeSink` for
-`createAsidSink(midiOutputPort)` from `@sidablist/asid`, and `replayRunner` for
-`createWorkerReplayRunner()` — see [`docs/writing-a-sink.md`](./docs/writing-a-sink.md) for the sink
+`createAsidSink(midiOutputPort, { time })` from `@sidablist/asid`, and `replayRunner` for
+`createWorkerReplayRunner(() => new Worker(...))` — see [`docs/writing-a-sink.md`](./docs/writing-a-sink.md) for the sink
 contract and [`docs/architecture.md`](./docs/architecture.md#the-clock-port-is-split-the-same-way)
 for the clock port's own split.
 

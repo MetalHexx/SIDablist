@@ -4,7 +4,9 @@ import { DEFAULT_TIMING_MODE, msToPlayCalls, playCallIntervalUsAt } from '../clo
 import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
+import type { EngineLog } from '../ports/log.js';
 import type { SidSink } from '../ports/sink.js';
+import type { TimeSource } from '../ports/time.js';
 import { clockRatio, NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
 import { FILTER_MODE_BITS, createRegisterFrame } from '../registers/register-frame.js';
 import type {
@@ -158,6 +160,10 @@ export interface SidPlayerCollaborators {
   /** Runs prepared-snapshot builds. Supply a second runner (its own worker) so a scrub never
    *  waits behind a batch of builds; when absent, builds share `replayRunner`'s queue. */
   readonly prepareRunner?: ReplayRunner;
+  /** The host's time, on the timeline the clock's `dueAtMs` uses. */
+  readonly time: TimeSource;
+  /** Where rejected input and failures are reported; absent means silent. */
+  readonly log?: EngineLog;
 }
 
 /** An entry image and what is known about how it was taken. */
@@ -204,6 +210,8 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly clock: FrameClock;
   private readonly replayRunner: ReplayRunner;
   private readonly prepareRunner: ReplayRunner | undefined;
+  private readonly time: TimeSource;
+  private readonly log: EngineLog | undefined;
   private readonly session: TuneSession;
   private readonly store: PlayerSnapshotStore;
 
@@ -400,6 +408,8 @@ class SidPlayerCoordinator implements SidPlayer {
     this.clock = collaborators.clock;
     this.replayRunner = collaborators.replayRunner;
     this.prepareRunner = collaborators.prepareRunner;
+    this.time = collaborators.time;
+    this.log = collaborators.log;
     this.session = createTuneSession(collaborators.replayRunner, {
       nominalIntervalUs: () => this.nominalIntervalUs,
       playRate: () => this.playRate(),
@@ -412,6 +422,7 @@ class SidPlayerCoordinator implements SidPlayer {
         this.error = null;
       },
       fail: (reason) => this.fail(reason),
+      warn: (message) => this.log?.warn(message),
       // A restore (seek, scrub, jump landing) moves the playhead, so the stream is discontinuous
       // here. Restarting before the resync means a paused landing's immediate frame is recorded into
       // the fresh history.
@@ -766,7 +777,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setActiveLoop(loop: ActiveLoop): void {
     if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a loop of ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
       );
       return;
@@ -797,7 +808,7 @@ class SidPlayerCoordinator implements SidPlayer {
       !(loop.endFrame > loop.startFrame) ||
       !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)
     ) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a loop change at ${frame} to ${loop.startFrame}-${loop.endFrame}.`,
       );
       return false;
@@ -820,7 +831,7 @@ class SidPlayerCoordinator implements SidPlayer {
         !Number.isFinite(line.keep) ||
         line.keep < 1
       ) {
-        console.warn(
+        this.log?.warn(
           `SID player: ignoring crossing lines from ${line.originFrame} every ${line.periodFrames} keeping ${line.keep}.`,
         );
         continue;
@@ -846,7 +857,7 @@ class SidPlayerCoordinator implements SidPlayer {
       return;
     }
     if (!Number.isFinite(target.startFrame)) {
-      console.warn(`SID player: ignoring a queued jump to ${target.startFrame}.`);
+      this.log?.warn(`SID player: ignoring a queued jump to ${target.startFrame}.`);
       return;
     }
     const startFrame = frames(Math.max(0, Math.round(target.startFrame)));
@@ -858,13 +869,13 @@ class SidPlayerCoordinator implements SidPlayer {
       endFrame !== null &&
       (!(endFrame > startFrame) || !isRunnableLoop(startFrame, endFrame, lapPhase))
     ) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a queued jump to ${startFrame} ending at ${target.endFrame} at lap phase ${lapPhase}.`,
       );
       return;
     }
     if (this.activeLoop.get() === null) {
-      console.warn(`SID player: ignoring a queued jump to ${startFrame} with no loop running.`);
+      this.log?.warn(`SID player: ignoring a queued jump to ${startFrame} with no loop running.`);
       return;
     }
 
@@ -908,7 +919,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.declared.clear();
     for (const requestedFrame of requested) {
       if (!Number.isFinite(requestedFrame)) {
-        console.warn(`SID player: ignoring a jump target of ${requestedFrame}.`);
+        this.log?.warn(`SID player: ignoring a jump target of ${requestedFrame}.`);
         continue;
       }
       this.declared.add(Math.max(0, Math.round(requestedFrame)));
@@ -1005,11 +1016,11 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setRegisterRecord(record: RegisterRecord | null): void {
     if (this.varispeedActive) {
-      console.warn('SID player: ignoring a register record while in varispeed.');
+      this.log?.warn('SID player: ignoring a register record while in varispeed.');
       return;
     }
     if (record !== null && !isUsableRegisterRecord(record)) {
-      console.warn('SID player: ignoring a register record of an unusable shape.');
+      this.log?.warn('SID player: ignoring a register record of an unusable shape.');
       return;
     }
     this.varispeed.setRecord(record);
@@ -1101,7 +1112,7 @@ class SidPlayerCoordinator implements SidPlayer {
       return false;
     }
     if (!Number.isFinite(target) || (lapPhase !== undefined && !Number.isFinite(lapPhase))) {
-      console.warn(`SID player: ignoring a landing on ${target} at lap phase ${lapPhase}.`);
+      this.log?.warn(`SID player: ignoring a landing on ${target} at lap phase ${lapPhase}.`);
       return false;
     }
     const landing = frames(Math.max(0, Math.round(target)));
@@ -1167,11 +1178,11 @@ class SidPlayerCoordinator implements SidPlayer {
       (lapPhase !== undefined && !Number.isFinite(lapPhase)) ||
       (loop !== null && (!Number.isFinite(loop.startFrame) || !Number.isFinite(loop.endFrame)))
     ) {
-      console.warn('SID player: ignoring a shadow started on a frame that is not a number.');
+      this.log?.warn('SID player: ignoring a shadow started on a frame that is not a number.');
       return false;
     }
     if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a shadow lapping ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
       );
       return false;
@@ -1231,7 +1242,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  by. */
   setTempo(multiplier: number): void {
     if (!Number.isFinite(multiplier) || multiplier <= 0) {
-      console.warn(`SID player: ignoring a tempo multiplier of ${multiplier}.`);
+      this.log?.warn(`SID player: ignoring a tempo multiplier of ${multiplier}.`);
       return;
     }
     this.tempoMultiplier = multiplier;
@@ -1240,7 +1251,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setNominalIntervalUs(us: Microseconds): void {
     if (!Number.isFinite(us) || us <= 0) {
-      console.warn(`SID player: ignoring a nominal interval of ${us} µs.`);
+      this.log?.warn(`SID player: ignoring a nominal interval of ${us} µs.`);
       return;
     }
     this.nominalIntervalUs = us;
@@ -1285,7 +1296,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  which a typed-array write silently coerces to 0 and mutes the channel instead of erroring. */
   setOutputGain(gain: number): void {
     if (!Number.isFinite(gain) || gain < 0 || gain > 1) {
-      console.warn(`SID player: ignoring an output gain of ${gain} (must be 0…1).`);
+      this.log?.warn(`SID player: ignoring an output gain of ${gain} (must be 0…1).`);
       return;
     }
     this.outputGain = gain;
@@ -1304,7 +1315,7 @@ class SidPlayerCoordinator implements SidPlayer {
   holdField(field: SidField, value: number, amount = 1): void {
     const index = resolveSidField(field);
     if (!isUsableHold(index, value, amount)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a hold of ${value} (amount ${amount}) on ${describeField(field)}.`,
       );
       return;
@@ -1316,7 +1327,7 @@ class SidPlayerCoordinator implements SidPlayer {
   releaseField(field: SidField): void {
     const index = resolveSidField(field);
     if (index < 0) {
-      console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring a release of ${describeField(field)}.`);
       return;
     }
     this.fieldHolds[index] = null;
@@ -1331,7 +1342,7 @@ class SidPlayerCoordinator implements SidPlayer {
   setFieldOffset(field: SidField, amount: number): void {
     const index = resolveSidField(field);
     if (!isUsableOffset(index, amount)) {
-      console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
       return;
     }
     this.fieldOffsets[index] = amount === 0 ? null : { field: { ...field }, amount };
@@ -1341,7 +1352,7 @@ class SidPlayerCoordinator implements SidPlayer {
   clearFieldOffset(field: SidField): void {
     const index = resolveSidField(field);
     if (index < 0) {
-      console.warn(`SID player: ignoring an offset release of ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring an offset release of ${describeField(field)}.`);
       return;
     }
     this.fieldOffsets[index] = null;
@@ -1359,7 +1370,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (let voice = 0; voice < Math.min(voicePitch.length, VOICE_COUNT); voice++) {
       const coefficient = voicePitch[voice];
       if (!Number.isFinite(coefficient) || coefficient <= 0) {
-        console.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
+        this.log?.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
         continue;
       }
       pitches.push({ voice, coefficient });
@@ -1369,7 +1380,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (const { field, amount } of settings.fieldOffsets ?? []) {
       const index = resolveSidField(field);
       if (!isUsableOffset(index, amount)) {
-        console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+        this.log?.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
         continue;
       }
       offsets.push({ index, record: { field: { ...field }, amount } });
@@ -1381,7 +1392,7 @@ class SidPlayerCoordinator implements SidPlayer {
       const carried = { ...field };
       if (value === null) {
         if (index < 0) {
-          console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+          this.log?.warn(`SID player: ignoring a release of ${describeField(field)}.`);
           continue;
         }
         holds.push({ index, field: carried, record: null });
@@ -1389,7 +1400,7 @@ class SidPlayerCoordinator implements SidPlayer {
       }
       const blend = amount ?? 1;
       if (!isUsableHold(index, value, blend)) {
-        console.warn(
+        this.log?.warn(
           `SID player: ignoring a hold of ${value} (amount ${blend}) on ${describeField(field)}.`,
         );
         continue;
@@ -1402,7 +1413,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (let voice = 0; voice < Math.min(voiceMutes.length, VOICE_COUNT); voice++) {
       const muted = voiceMutes[voice];
       if (typeof muted !== 'boolean') {
-        console.warn(`SID player: ignoring a mute of ${String(muted)} on voice ${voice}.`);
+        this.log?.warn(`SID player: ignoring a mute of ${String(muted)} on voice ${voice}.`);
         continue;
       }
       mutes.push({ voice, muted });
@@ -1480,7 +1491,7 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   keepDeliveries(capacity: number): void {
     if (!Number.isFinite(capacity) || capacity < 0 || capacity > MAX_KEPT_DELIVERIES) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a delivery history of ${capacity} (must be 0…${MAX_KEPT_DELIVERIES}).`,
       );
       return;
@@ -1532,7 +1543,7 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   setTargetClock(targetHz: number | null): void {
     if (targetHz !== null && clockRatio(this.tuneClockHz, targetHz) === null) {
-      console.warn(`SID player: ignoring a target clock of ${targetHz} Hz.`);
+      this.log?.warn(`SID player: ignoring a target clock of ${targetHz} Hz.`);
       return;
     }
     this.targetClockHz = targetHz;
@@ -1546,7 +1557,7 @@ class SidPlayerCoordinator implements SidPlayer {
   setVoicePitch(voice: number, coefficient: number): void {
     if (voice < 0 || voice >= VOICE_COUNT) return;
     if (!Number.isFinite(coefficient) || coefficient <= 0) {
-      console.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
+      this.log?.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
       return;
     }
     this.voicePitch[voice] = coefficient;
@@ -1578,18 +1589,18 @@ class SidPlayerCoordinator implements SidPlayer {
   saveState(into: SavedPlayerState): void {
     const state = readSavedState(into);
     if (state === null || state.owner !== this) {
-      console.warn('SID player: ignoring a save into a state this player did not make.');
+      this.log?.warn('SID player: ignoring a save into a state this player did not make.');
       return;
     }
     const machine = this.session.machine;
     const frame = this.session.frame;
     const file = this.session.file;
     if (machine === null || frame === null || file === null) {
-      console.warn('SID player: ignoring a save with no tune loaded.');
+      this.log?.warn('SID player: ignoring a save with no tune loaded.');
       return;
     }
     if (!this.crossing.fits(state.crossing)) {
-      console.warn('SID player: ignoring a save into a state made for other crossing lines.');
+      this.log?.warn('SID player: ignoring a save into a state made for other crossing lines.');
       return;
     }
 
@@ -1664,7 +1675,7 @@ class SidPlayerCoordinator implements SidPlayer {
     const state = readSavedState(from);
     const refusal = this.refusalFor(state);
     if (state === null || refusal !== null) {
-      console.warn(`SID player: ignoring a saved state ${refusal}.`);
+      this.log?.warn(`SID player: ignoring a saved state ${refusal}.`);
       return;
     }
     const machine = this.session.machine;
@@ -1953,7 +1964,7 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Hands one frame to the sink and measures the hand-off. The reading is taken before the call so
    *  it measures core's own lag against the frame grid, not the sink's work. */
   private deliver(frame: SidFrame, dueAtMs: Milliseconds, catchUpClamped: boolean): void {
-    const handOffMs = performance.now();
+    const handOffMs = this.time.now();
     this.sink.deliver(frame, this.session.framesRendered, dueAtMs, catchUpClamped);
     // After the sink call, so the append never delays the wire.
     this.history?.record(frame, dueAtMs);
@@ -2243,7 +2254,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   private seekVarispeed(target: Frames, settings?: JumpSettings): Promise<void> {
     if (Number.isNaN(target)) {
-      console.warn(`SID player: ignoring a seek to ${target}.`);
+      this.log?.warn(`SID player: ignoring a seek to ${target}.`);
       return Promise.resolve();
     }
     const prepared = settings === undefined ? null : this.prepareSettings(settings);
@@ -2335,7 +2346,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  went out, not a due time. */
   private deliverNow(frame: SidFrame): void {
     this.sink.deliverNow(frame);
-    this.history?.record(frame, performance.now());
+    this.history?.record(frame, this.time.now());
   }
 
   /** A frame that gates every voice off — enough to release every note, and nothing else. */
@@ -2627,7 +2638,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.transport = 'error';
     this.endVarispeed();
     this.markDirty();
-    console.error(`SID player: ${reason}`);
+    this.log?.error(`SID player: ${reason}`);
   }
 
   private resetCounters(): void {

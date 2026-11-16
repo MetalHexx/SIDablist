@@ -53,6 +53,8 @@ export { describeError } from './common/errors.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';
+export { type TimeSource } from './ports/time.js';
+export { type EngineLog } from './ports/log.js';
 export {
   type FrameAccumulator,
   MAX_CATCH_UP_US,

@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { MockInstance } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { EngineLog } from '../ports/log.js';
+import type { TimeSource } from '../ports/time.js';
 import { recordFromTune } from '../registers/__fixtures__/record-from-tune.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import { SID_REGISTER_COUNT } from '../registers/sid-constants.js';
@@ -16,6 +17,10 @@ import type { JumpSettings } from './snapshot.js';
 
 const RTS = 0x60;
 const INTERVAL_MS = 19.95;
+
+const time: TimeSource = { now: () => milliseconds(0) };
+const warn = vi.fn<(message: string) => void>();
+const log: EngineLog = { warn, error: () => undefined };
 
 function tune(play: readonly number[], init: readonly number[] = [RTS], songs = 1): SidFile {
   const data = new Uint8Array(0x10 + play.length);
@@ -150,6 +155,8 @@ class Rig {
       sink: this.sink,
       clock: this.clock,
       replayRunner: this.replay,
+      time,
+      log,
     });
     this.player.loadTune(file);
   }
@@ -296,14 +303,8 @@ const LOOP = { startFrame: frames(10), endFrame: frames(26) };
 const SWEEP: VarispeedRateSource = (position) => Math.sin(position / 3) * 2;
 
 describe('restoring a saved state', () => {
-  let warn: MockInstance<typeof console.warn>;
-
   beforeEach(() => {
-    warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  });
-
-  afterEach(() => {
-    warn.mockRestore();
+    warn.mockClear();
   });
 
   describe('plays on as a player that never left', () => {
@@ -835,6 +836,8 @@ describe('restoring a saved state', () => {
         sink: new FakeSink(),
         clock: new FakeClock(),
         replayRunner: new Replayer(),
+        time,
+        log,
       });
 
       player.saveState(player.createSavedState());
