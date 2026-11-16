@@ -160,6 +160,15 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   third-party source with one deliberate behavioural change (`cpu/vendor-cpu.ts`'s
   `QuietMos6502`), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
   directly. See the co-change edge below before touching a field it exposes.
+- **A PSID with play address 0 is entered as an interrupt, and the stack is the seam.** The
+  trampoline in `cpu/c64-machine.ts` pushes a hardware frame (plus A, X, Y on the `$0314` path), and
+  the handler leaves through the KERNAL's own exits at `$EA31`, `$EA7E` and `$EA81`, or through an
+  `RTI` or `RTS` of its own. All of them must end on a `JMP idle`; a frame a byte off sends the
+  handler into zeroed memory and the call never completes. The entry's extra cycles over a `JSR` are
+  left out of the call's cycle count so the handler sees the same raster and budget
+  (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`; a
+  `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
+  default `$FFFE`.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
@@ -294,6 +303,16 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   the key list in sync and run `cpu/vendor-cpu.spec.ts`; `copyStateInto`, which the crossing captures
   copy through, reads the same list. Detail:
   [`cpu/vendor-cpu.ts`](./src/cpu/vendor-cpu.ts).
+- **Changed the interrupt entry or the KERNAL exit stubs (`writeTrampoline`, `writeInterruptEntry`,
+  `installRomStubs` in `cpu/c64-machine.ts`; `TRAMPOLINE_*`, `INTERRUPT_*`, `IRQ_*_STUB`,
+  `BRK_HANDLER_STUB` in `cpu/cpu-constants.ts`)?** `INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL` and
+  `_HARDWARE` are the entry's cycle counts past a `JSR`, and nothing derives them from the bytes: a
+  stale one shifts the raster and the budget every handler sees, with no compile error. A moved
+  trampoline byte must also stay inside `TRAMPOLINE_INTERRUPT_LENGTH` and the continuation, or a tune
+  covering it is overwritten rather than relocated around. Update the constants, then run
+  `cpu/c64-machine.spec.ts` (the `entering a handler as an interrupt` specs) and the HVSC fingerprint
+  check (`fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench), since
+  every tune's writes ride on this entry. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
 - **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`)
   or `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
   shifted meaning is a wrong index record, not a compile error. Run analysis's

@@ -3,6 +3,7 @@ import { cycles, type Cycles } from '../units.js';
 import { createCpuStateRecord, createVendorCpu } from './vendor-cpu.js';
 import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 import {
+  BRK_HANDLER_STUB,
   CIA1_INTERRUPT_CONTROL,
   CIA1_TIMER_A_LATCH_HIGH,
   CIA1_TIMER_A_LATCH_LOW,
@@ -10,9 +11,15 @@ import {
   CIA_INTERRUPT_TIMER_A_SET,
   FIRST_RELOCATABLE_PAGE,
   INIT_BUDGET_FRAMES,
+  INTERRUPT_CONTINUATION_LENGTH,
+  INTERRUPT_ENTRY_EXTRA_CYCLES_HARDWARE,
+  INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL,
+  INTERRUPT_STATUS_BYTE,
   IO_FIRST_PAGE,
   IO_LAST_PAGE,
+  IRQ_ACKNOWLEDGE_STUB,
   IRQ_HANDLER_STUB,
+  IRQ_RESTORE_STUB,
   IRQ_VECTOR_HARDWARE,
   IRQ_VECTOR_KERNAL,
   KERNAL_STUB_ADDRESSES,
@@ -24,9 +31,14 @@ import {
   NTSC_RASTER_LINES,
   OPCODE_JMP_ABSOLUTE,
   OPCODE_JSR_ABSOLUTE,
+  OPCODE_LDA_ABSOLUTE,
   OPCODE_LDA_IMMEDIATE,
+  OPCODE_PHA,
+  OPCODE_PLA,
   OPCODE_RTI,
   OPCODE_RTS,
+  OPCODE_TAX,
+  OPCODE_TAY,
   PAL_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_RASTER_LINE,
   PAL_RASTER_LINES,
@@ -39,6 +51,11 @@ import {
   TRAMPOLINE_BASE,
   TRAMPOLINE_IDLE_OFFSET,
   TRAMPOLINE_INIT_OFFSET,
+  TRAMPOLINE_INTERRUPT_HANDLER_OFFSET,
+  TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET,
+  TRAMPOLINE_INTERRUPT_KERNAL_OFFSET,
+  TRAMPOLINE_INTERRUPT_LENGTH,
+  TRAMPOLINE_INTERRUPT_TAIL_OFFSET,
   TRAMPOLINE_LENGTH,
   TRAMPOLINE_PLAY_OFFSET,
   TRAMPOLINE_PLAY_TARGET_OFFSET,
@@ -242,6 +259,10 @@ class C64MachineImpl implements C64Machine {
   private readonly cyclesPerFrame: number;
   private readonly cyclesPerRasterLine: number;
   private readonly rasterLineCount: number;
+  /** A PSID with header play address 0: the play call enters the tune's own handler as an interrupt. */
+  private readonly entersAsInterrupt: boolean;
+  /** What `$FFFE` holds until a tune installs its own handler. */
+  private readonly defaultHardwareVector: number;
 
   private trampoline = TRAMPOLINE_BASE;
   private idleAddress = TRAMPOLINE_BASE + TRAMPOLINE_IDLE_OFFSET;
@@ -251,11 +272,15 @@ class C64MachineImpl implements C64Machine {
   private reachedIdle = false;
   private expectingOpcodeFetch = false;
   private illegalOpcodes = 0;
+  /** Cycles the interrupt entry spent past a `JSR`'s, left uncounted when the handler's first opcode is fetched. */
+  private pendingEntryCredit = 0;
 
   constructor(file: SidFile, sink: SidWriteSink) {
     this.file = file;
     this.sink = sink;
     this.memory = new Uint8Array(MEMORY_SIZE);
+    this.entersAsInterrupt = file.format === 'PSID' && file.playAddress === 0;
+    this.defaultHardwareVector = file.format === 'PSID' ? BRK_HANDLER_STUB : IRQ_HANDLER_STUB;
 
     const ntsc = file.clock === 'ntsc';
     this.cyclesPerFrame = ntsc ? NTSC_CYCLES_PER_FRAME : PAL_CYCLES_PER_FRAME;
@@ -370,7 +395,7 @@ class C64MachineImpl implements C64Machine {
     );
 
     this.playAddress = this.resolvePlayAddress();
-    this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
+    this.patchPlayTarget();
 
     if (result.completed && this.playAddress === 0) {
       throw new UnplayableTuneError(
@@ -387,11 +412,14 @@ class C64MachineImpl implements C64Machine {
     return this.runRoutine(
       this.trampoline + TRAMPOLINE_PLAY_OFFSET,
       this.cyclesPerFrame * PLAY_BUDGET_FRAMES,
+      this.interruptEntryCredit(),
     );
   }
 
-  private runRoutine(entryAddress: number, budget: number): FrameResult {
+  /** `entryCredit` cycles are dropped from the count when the handler's first opcode is fetched. */
+  private runRoutine(entryAddress: number, budget: number, entryCredit = 0): FrameResult {
     this.writeWord(RESET_VECTOR, entryAddress);
+    this.pendingEntryCredit = entryCredit;
     this.cyclesThisCall = 0;
     this.reachedIdle = false;
     this.expectingOpcodeFetch = false;
@@ -423,6 +451,10 @@ class C64MachineImpl implements C64Machine {
       // The only reason the CPU ever fetches from the idle block is that the routine returned.
       // Detecting it here keeps the hot loop free of the allocations `getState()` would cost.
       this.reachedIdle = true;
+    }
+    if (this.pendingEntryCredit !== 0 && fetchingOpcode && address === this.playAddress) {
+      this.cyclesThisCall -= this.pendingEntryCredit;
+      this.pendingEntryCredit = 0;
     }
 
     const value = this.readBus(address);
@@ -485,13 +517,35 @@ class C64MachineImpl implements C64Machine {
     return ((this.cyclesThisCall / this.cyclesPerRasterLine) | 0) % this.rasterLineCount;
   }
 
+  /**
+   * A PSID gets the KERNAL's real IRQ exits — `$EA31` jumps to `$EA7E`, which acknowledges the CIA
+   * and falls into `$EA81`, which pops Y, X, A and returns — and a separate `RTI` for `BRK` behind
+   * `$FFFE`. An RSID keeps one `RTI` at `$EA31` for both vectors.
+   */
   private installRomStubs(): void {
     for (const address of KERNAL_STUB_ADDRESSES) {
       this.memory[address] = OPCODE_RTS;
     }
-    this.memory[IRQ_HANDLER_STUB] = OPCODE_RTI;
     this.writeWord(IRQ_VECTOR_KERNAL, IRQ_HANDLER_STUB);
-    this.writeWord(IRQ_VECTOR_HARDWARE, IRQ_HANDLER_STUB);
+    this.writeWord(IRQ_VECTOR_HARDWARE, this.defaultHardwareVector);
+
+    if (this.file.format !== 'PSID') {
+      this.memory[IRQ_HANDLER_STUB] = OPCODE_RTI;
+      return;
+    }
+    this.memory.set(
+      [OPCODE_JMP_ABSOLUTE, IRQ_ACKNOWLEDGE_STUB & 0xff, IRQ_ACKNOWLEDGE_STUB >> 8],
+      IRQ_HANDLER_STUB,
+    );
+    this.memory.set(
+      [OPCODE_LDA_ABSOLUTE, CIA1_INTERRUPT_CONTROL & 0xff, CIA1_INTERRUPT_CONTROL >> 8],
+      IRQ_ACKNOWLEDGE_STUB,
+    );
+    this.memory.set(
+      [OPCODE_PLA, OPCODE_TAY, OPCODE_PLA, OPCODE_TAX, OPCODE_PLA, OPCODE_RTI],
+      IRQ_RESTORE_STUB,
+    );
+    this.memory[BRK_HANDLER_STUB] = OPCODE_RTI;
   }
 
   /** Copies the payload over the stubs, so the tune wins any overlap. */
@@ -513,6 +567,25 @@ class C64MachineImpl implements C64Machine {
    * base+0x0B:  JMP idle
    * base+0x0E:  JMP idle          ; branches to itself
    * ```
+   *
+   * A PSID with play address 0 enters its handler as an interrupt instead. `base+0x08` becomes a
+   * `JMP` to one of two entries, picked after init by which vector holds the handler. Both push
+   * a hardware frame — return PC `P:P`, status `$0A`, with `P` the trampoline's page — and the
+   * `$0314` entry also pushes A, X, Y as the KERNAL's `$FF48` does. The shared tail then zeroes
+   * A, X and Y, as a `JSR` entry leaves them, and jumps to the handler:
+   *
+   * ```
+   * base+0x11:  LDA #P / PHA / PHA / LDA #$0A / PHA        ; $0314 entry: PCH, PCL, status
+   * base+0x18:  PHA / LDA #P / PHA / LDA #$0A / PHA         ; A = $0A, X = P, Y = $0A
+   * base+0x1F:  JMP tail
+   * base+0x22:  LDA #P / PHA / PHA / LDA #$0A / PHA        ; $FFFE entry: the frame alone
+   * base+0x29:  LDA #0 / TAX / TAY / JMP handler           ; handler patched after init
+   * P:P:        JMP idle                                    ; where an RTI lands
+   * ```
+   *
+   * An `RTI` pulls status `$0A` and goes to `P:P`. An `RTS` pulls the top two bytes as a low and
+   * high address byte — Y and X on the `$0314` path, status and PCL on the `$FFFE` path — which
+   * are `$0A` and `P` either way, and goes to `base+0x0B`. Both end in `JMP idle`.
    */
   private writeTrampoline(song: number): void {
     this.trampoline = this.chooseTrampolineBase();
@@ -533,7 +606,7 @@ class C64MachineImpl implements C64Machine {
         OPCODE_JMP_ABSOLUTE,
         idleLow,
         idleHigh,
-        OPCODE_JSR_ABSOLUTE,
+        this.entersAsInterrupt ? OPCODE_JMP_ABSOLUTE : OPCODE_JSR_ABSOLUTE,
         0x00,
         0x00,
         OPCODE_JMP_ABSOLUTE,
@@ -545,14 +618,112 @@ class C64MachineImpl implements C64Machine {
       ],
       this.trampoline,
     );
+
+    if (this.entersAsInterrupt) {
+      this.writeInterruptEntry(idleLow, idleHigh);
+    }
   }
 
+  /** Writes everything past `base+0x11` that `writeTrampoline`'s doc comment lays out. */
+  private writeInterruptEntry(idleLow: number, idleHigh: number): void {
+    const page = this.trampoline >> 8;
+    const tail = this.trampoline + TRAMPOLINE_INTERRUPT_TAIL_OFFSET;
+    const pushFrame = [
+      OPCODE_LDA_IMMEDIATE,
+      page,
+      OPCODE_PHA,
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      INTERRUPT_STATUS_BYTE,
+      OPCODE_PHA,
+    ];
+    const pushRegisters = [
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      page,
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      INTERRUPT_STATUS_BYTE,
+      OPCODE_PHA,
+    ];
+
+    this.memory.set(
+      [...pushFrame, ...pushRegisters, OPCODE_JMP_ABSOLUTE, tail & 0xff, tail >> 8],
+      this.trampoline + TRAMPOLINE_INTERRUPT_KERNAL_OFFSET,
+    );
+    this.memory.set(
+      [
+        ...pushFrame,
+        OPCODE_LDA_IMMEDIATE,
+        0x00,
+        OPCODE_TAX,
+        OPCODE_TAY,
+        OPCODE_JMP_ABSOLUTE,
+        0x00,
+        0x00,
+      ],
+      this.trampoline + TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET,
+    );
+    this.memory.set(
+      [OPCODE_JMP_ABSOLUTE, idleLow, idleHigh],
+      this.interruptContinuation(this.trampoline),
+    );
+  }
+
+  /** Where an `RTI` out of a handler lands: `P:P`, a page byte that also serves as `RTS`'s high byte. */
+  private interruptContinuation(base: number): number {
+    const page = base >> 8;
+    return (page << 8) | page;
+  }
+
+  /**
+   * Points the play entry at what init resolved: the handler itself for a `JSR` entry, otherwise
+   * the interrupt entry for the vector that holds it, with the handler patched into its tail.
+   */
+  private patchPlayTarget(): void {
+    if (!this.entersAsInterrupt) {
+      this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
+      return;
+    }
+    const entryOffset = this.handlerIsOnKernalVector()
+      ? TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      : TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET;
+    this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.trampoline + entryOffset);
+    this.writeWord(this.trampoline + TRAMPOLINE_INTERRUPT_HANDLER_OFFSET, this.playAddress);
+  }
+
+  /** Cycles to leave uncounted on this call: what the entry costs beyond a `JSR`. */
+  private interruptEntryCredit(): number {
+    if (!this.entersAsInterrupt) {
+      return 0;
+    }
+    const entry = this.readWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET);
+    return entry === this.trampoline + TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      ? INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL
+      : INTERRUPT_ENTRY_EXTRA_CYCLES_HARDWARE;
+  }
+
+  /**
+   * The base the trampoline goes at: the default page, else the first one clear of the tune. An
+   * interrupt-entry tune's continuation must be clear too, and must lie past the trampoline.
+   */
   private chooseTrampolineBase(): number {
     const start = this.file.loadAddress;
     const end = Math.min(start + this.file.data.length, MEMORY_SIZE);
-    const overlapsTune = (base: number): boolean => base < end && start < base + TRAMPOLINE_LENGTH;
+    const overlapsTune = (at: number, length: number): boolean => at < end && start < at + length;
+    const fits = (base: number): boolean => {
+      if (!this.entersAsInterrupt) {
+        return !overlapsTune(base, TRAMPOLINE_LENGTH);
+      }
+      const continuation = this.interruptContinuation(base);
+      return (
+        continuation >= base + TRAMPOLINE_INTERRUPT_LENGTH &&
+        !overlapsTune(base, TRAMPOLINE_INTERRUPT_LENGTH) &&
+        !overlapsTune(continuation, INTERRUPT_CONTINUATION_LENGTH)
+      );
+    };
 
-    if (!overlapsTune(TRAMPOLINE_BASE)) {
+    if (fits(TRAMPOLINE_BASE)) {
       return TRAMPOLINE_BASE;
     }
     for (let page = FIRST_RELOCATABLE_PAGE; page <= LAST_RELOCATABLE_PAGE; page++) {
@@ -560,7 +731,7 @@ class C64MachineImpl implements C64Machine {
         continue;
       }
       const base = page << 8;
-      if (!overlapsTune(base)) {
+      if (fits(base)) {
         return base;
       }
     }
@@ -571,18 +742,21 @@ class C64MachineImpl implements C64Machine {
 
   /**
    * A header play address of 0 means the tune installed its own interrupt handler during init.
-   * Returns 0 when neither vector moved off the RTI stub, rather than jumping to address 0.
+   * Returns 0 when neither vector moved off its default stub, rather than jumping to address 0.
    */
   private resolvePlayAddress(): number {
     if (this.file.playAddress !== 0) {
       return this.file.playAddress;
     }
-    const kernalVector = this.readWord(IRQ_VECTOR_KERNAL);
-    if (kernalVector !== IRQ_HANDLER_STUB) {
-      return kernalVector;
+    if (this.handlerIsOnKernalVector()) {
+      return this.readWord(IRQ_VECTOR_KERNAL);
     }
     const hardwareVector = this.readWord(IRQ_VECTOR_HARDWARE);
-    return hardwareVector === IRQ_HANDLER_STUB ? 0 : hardwareVector;
+    return hardwareVector === this.defaultHardwareVector ? 0 : hardwareVector;
+  }
+
+  private handlerIsOnKernalVector(): boolean {
+    return this.readWord(IRQ_VECTOR_KERNAL) !== IRQ_HANDLER_STUB;
   }
 
   private readWord(address: number): number {

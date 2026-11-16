@@ -361,6 +361,274 @@ describe('C64Machine', () => {
   });
 });
 
+describe('C64Machine entering a handler as an interrupt', () => {
+  const HANDLER = 0x1100;
+  const KERNAL_VECTOR = 0x0314;
+  const HARDWARE_VECTOR = 0xfffe;
+
+  /** Init stores `HANDLER` in `vector`; the handler is `handler`. */
+  function interruptTune(
+    vector: number,
+    handler: readonly number[],
+    options: Partial<TuneOptions> = {},
+  ): SidFile {
+    return tune({
+      ...options,
+      blocks: [
+        {
+          at: 0x1000,
+          bytes: [
+            0xa9,
+            HANDLER & 0xff,
+            0x8d,
+            vector & 0xff,
+            vector >> 8,
+            0xa9,
+            HANDLER >> 8,
+            0x8d,
+            (vector + 1) & 0xff,
+            (vector + 1) >> 8,
+            0x60,
+          ],
+        },
+        { at: HANDLER, bytes: handler },
+      ],
+    });
+  }
+
+  /** A handler entered by a plain `JSR`, as a header play address gives. */
+  function jsrTune(handler: readonly number[]): SidFile {
+    return tune({
+      playAddress: HANDLER,
+      blocks: [
+        { at: 0x1000, bytes: [0x60] },
+        { at: HANDLER, bytes: handler },
+      ],
+    });
+  }
+
+  function stackPointer(machine: ReturnType<typeof createC64Machine>): unknown {
+    return machine.snapshot().cpu['stkp'];
+  }
+
+  function playOnce(file: SidFile): {
+    sink: RecordingSink;
+    machine: ReturnType<typeof createC64Machine>;
+    result: ReturnType<ReturnType<typeof createC64Machine>['runFrame']>;
+  } {
+    const sink = new RecordingSink();
+    const machine = createC64Machine(file, sink);
+    machine.initSubtune(1);
+    sink.writes.length = 0;
+    return { sink, machine, result: machine.runFrame() };
+  }
+
+  // LDA #$5A / STA $D400 / JMP exit
+  const writeThenJump = (exit: number): number[] => [
+    0xa9,
+    0x5a,
+    0x8d,
+    0x00,
+    0xd4,
+    0x4c,
+    exit & 0xff,
+    exit >> 8,
+  ];
+
+  it.each([
+    ['$EA31', 0xea31],
+    ['$EA7E', 0xea7e],
+    ['$EA81', 0xea81],
+  ])(
+    'completes a $0314 handler that ends in JMP %s with the stack back where it started',
+    (_name, exit) => {
+      const { sink, machine, result } = playOnce(interruptTune(KERNAL_VECTOR, writeThenJump(exit)));
+
+      expect(result.completed).toBe(true);
+      expect(result.cyclesUsed).toBeLessThan(200);
+      expect(sink.writes).toEqual([{ register: 0, value: 0x5a }]);
+      expect(stackPointer(machine)).toBe(0xff);
+    },
+  );
+
+  it('completes a $FFFE handler that restores its own register and returns with RTI', () => {
+    // PHA / LDA #$7F / STA $D400 / PLA / RTI
+    const handler = [0x48, 0xa9, 0x7f, 0x8d, 0x00, 0xd4, 0x68, 0x40];
+
+    const { sink, machine, result } = playOnce(interruptTune(HARDWARE_VECTOR, handler));
+
+    expect(result.completed).toBe(true);
+    expect(sink.writes).toEqual([{ register: 0, value: 0x7f }]);
+    expect(stackPointer(machine)).toBe(0xff);
+  });
+
+  it.each([
+    ['$0314', KERNAL_VECTOR],
+    ['$FFFE', HARDWARE_VECTOR],
+  ])('completes a %s handler that ends in RTS', (_name, vector) => {
+    // LDA #$33 / STA $D400 / RTS
+    const { sink, result } = playOnce(interruptTune(vector, [0xa9, 0x33, 0x8d, 0x00, 0xd4, 0x60]));
+
+    expect(result.completed).toBe(true);
+    expect(sink.writes).toEqual([{ register: 0, value: 0x33 }]);
+  });
+
+  describe('as seen by the handler on entry', () => {
+    // STA $D400 / STX $D401 / STY $D402 / PHP / PLA / STA $D404 / LDY #$FF / DEY / BNE -3 /
+    // LDA $D012 / STA $D403 / RTS — A, X, Y and the flags, then a delay, then the raster line
+    const probe = [
+      0x8d, 0x00, 0xd4, 0x8e, 0x01, 0xd4, 0x8c, 0x02, 0xd4, 0x08, 0x68, 0x8d, 0x04, 0xd4, 0xa0,
+      0xff, 0x88, 0xd0, 0xfd, 0xad, 0x12, 0xd0, 0x8d, 0x03, 0xd4, 0x60,
+    ];
+
+    it.each([
+      ['$0314', KERNAL_VECTOR],
+      ['$FFFE', HARDWARE_VECTOR],
+    ])('sees what a JSR entry shows it, on the %s path, in the same cycles', (_name, vector) => {
+      const today = playOnce(jsrTune(probe));
+      const entered = playOnce(interruptTune(vector, probe));
+
+      expect(today.sink.writes.length).toBe(5);
+      expect(entered.sink.writes).toEqual(today.sink.writes);
+      expect(entered.result).toEqual(today.result);
+    });
+
+    it('sees the same budget: a handler that never returns runs out at exactly the same cycle', () => {
+      const spin = [0x4c, 0x00, 0x11];
+
+      const today = playOnce(jsrTune(spin));
+      const entered = playOnce(interruptTune(KERNAL_VECTOR, spin));
+
+      expect(entered.result.completed).toBe(false);
+      expect(entered.result).toEqual(today.result);
+    });
+
+    it('leaves the stack as deep as the frame it pushed', () => {
+      // TSX / STX $D400 / RTS
+      const handler = [0xba, 0x8e, 0x00, 0xd4, 0x60];
+
+      expect(playOnce(jsrTune(handler)).sink.writes).toEqual([{ register: 0, value: 0xfd }]);
+      expect(playOnce(interruptTune(KERNAL_VECTOR, handler)).sink.writes).toEqual([
+        { register: 0, value: 0xf9 },
+      ]);
+      expect(playOnce(interruptTune(HARDWARE_VECTOR, handler)).sink.writes).toEqual([
+        { register: 0, value: 0xfc },
+      ]);
+    });
+  });
+
+  it('keeps an RSID tune on the JSR entry and the single RTI stub', () => {
+    // TSX / STX $D400 / RTS
+    const handler = [0xba, 0x8e, 0x00, 0xd4, 0x60];
+
+    const { sink, machine, result } = playOnce(
+      interruptTune(KERNAL_VECTOR, handler, { format: 'RSID' }),
+    );
+
+    expect(result.completed).toBe(true);
+    expect(sink.writes).toEqual([{ register: 0, value: 0xfd }]);
+    expect(machine.snapshot().memory[0xea31]).toBe(0x40);
+  });
+
+  it('lets a handler read $DC0D as 0x81 on its way out', () => {
+    // LDA $DC0D / STA $D400 / JMP $EA31
+    const { sink } = playOnce(
+      interruptTune(KERNAL_VECTOR, [0xad, 0x0d, 0xdc, 0x8d, 0x00, 0xd4, 0x4c, 0x31, 0xea]),
+    );
+
+    expect(sink.writes).toEqual([{ register: 0, value: 0x81 }]);
+  });
+
+  it.each([
+    ['an interrupt entry', (handler: number[]) => interruptTune(KERNAL_VECTOR, handler)],
+    ['a JSR entry', (handler: number[]) => jsrTune(handler)],
+  ])('resumes after a BRK inside a play routine, on %s', (_name, build) => {
+    // LDA #1 / STA $D400 / BRK / padding / LDA #2 / STA $D400 / RTS
+    const handler = [0xa9, 0x01, 0x8d, 0x00, 0xd4, 0x00, 0xea, 0xa9, 0x02, 0x8d, 0x00, 0xd4, 0x60];
+
+    const { sink, result } = playOnce(build(handler));
+
+    expect(result.completed).toBe(true);
+    expect(sink.writes.map((write) => write.value)).toEqual([1, 2]);
+  });
+
+  it('keeps the bytes of a tune loaded over $EA7E', () => {
+    // init at $EA40 vectors to $EA50; the handler jumps to the tune's own $EA7E, which writes $44
+    // and carries on to its own copy of the register restore at $EA90.
+    const file = tune({
+      loadAddress: 0xea40,
+      initAddress: 0xea40,
+      blocks: [
+        {
+          at: 0xea40,
+          bytes: [0xa9, 0x50, 0x8d, 0x14, 0x03, 0xa9, 0xea, 0x8d, 0x15, 0x03, 0x60],
+        },
+        { at: 0xea50, bytes: [0x4c, 0x7e, 0xea] },
+        { at: 0xea7e, bytes: [0xa9, 0x44, 0x8d, 0x00, 0xd4, 0x4c, 0x90, 0xea] },
+        { at: 0xea90, bytes: [0x68, 0xa8, 0x68, 0xaa, 0x68, 0x40] },
+      ],
+    });
+
+    const { sink, result } = playOnce(file);
+
+    expect(result.completed).toBe(true);
+    expect(sink.writes).toEqual([{ register: 0, value: 0x44 }]);
+  });
+
+  it('moves the trampoline off a page whose continuation the tune covers', () => {
+    // The tune spans $EA40-$EAFF: clear of the trampoline at $EA00, but over its $EAEA continuation.
+    const file = tune({
+      loadAddress: 0xea40,
+      initAddress: 0xea40,
+      padTo: 0xeb00,
+      blocks: [
+        {
+          at: 0xea40,
+          bytes: [0xa9, 0x50, 0x8d, 0x14, 0x03, 0xa9, 0xea, 0x8d, 0x15, 0x03, 0x60],
+        },
+        // LDA #$66 / STA $D400 / PLA / TAY / PLA / TAX / PLA / RTI � the tune covers the KERNAL exits
+        {
+          at: 0xea50,
+          bytes: [0xa9, 0x66, 0x8d, 0x00, 0xd4, 0x68, 0xa8, 0x68, 0xaa, 0x68, 0x40],
+        },
+      ],
+    });
+
+    const { sink, machine, result } = playOnce(file);
+
+    expect(machine.trampolineBase).not.toBe(TRAMPOLINE_BASE);
+    expect(result.completed).toBe(true);
+    expect(sink.writes).toEqual([{ register: 0, value: 0x66 }]);
+  });
+
+  it('round-trips a snapshot taken between calls', () => {
+    // INC $1200 / LDA $1200 / STA $D400 / JMP $EA31
+    const file = interruptTune(
+      KERNAL_VECTOR,
+      [0xee, 0x00, 0x12, 0xad, 0x00, 0x12, 0x8d, 0x00, 0xd4, 0x4c, 0x31, 0xea],
+    );
+    const sink = new RecordingSink();
+    const machine = createC64Machine(file, sink);
+    machine.initSubtune(1);
+    machine.runFrame();
+    machine.runFrame();
+
+    const snapshot = machine.snapshot();
+    const fromSnapshot = sink.writes.length;
+    machine.runFrame();
+    machine.runFrame();
+    const expected = sink.writes.slice(fromSnapshot);
+
+    machine.restore(snapshot);
+    const fromRestore = sink.writes.length;
+    const results = [machine.runFrame(), machine.runFrame()];
+
+    expect(results.every((result) => result.completed)).toBe(true);
+    expect(sink.writes.slice(fromRestore)).toEqual(expected);
+    expect(expected.map((write) => write.value)).toEqual([3, 4]);
+  });
+});
+
 describe('C64Machine on the bundled tunes', () => {
   function bundled(id: string): SidFile {
     const entry = BUNDLED_TUNES.find((candidate) => candidate.id === id);
