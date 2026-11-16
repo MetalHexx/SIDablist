@@ -440,7 +440,7 @@ describe('C64Machine entering a handler as an interrupt', () => {
     ['$EA7E', 0xea7e],
     ['$EA81', 0xea81],
   ])(
-    'completes a $0314 handler that ends in JMP %s with the stack back where it started',
+    'completes a 0x0314 handler that ends in JMP %s with the stack back where it started',
     (_name, exit) => {
       const { sink, machine, result } = playOnce(interruptTune(KERNAL_VECTOR, writeThenJump(exit)));
 
@@ -586,7 +586,7 @@ describe('C64Machine entering a handler as an interrupt', () => {
           at: 0xea40,
           bytes: [0xa9, 0x50, 0x8d, 0x14, 0x03, 0xa9, 0xea, 0x8d, 0x15, 0x03, 0x60],
         },
-        // LDA #$66 / STA $D400 / PLA / TAY / PLA / TAX / PLA / RTI � the tune covers the KERNAL exits
+        // LDA #$66 / STA $D400 / PLA / TAY / PLA / TAX / PLA / RTI - the tune covers the KERNAL exits
         {
           at: 0xea50,
           bytes: [0xa9, 0x66, 0x8d, 0x00, 0xd4, 0x68, 0xa8, 0x68, 0xaa, 0x68, 0x40],

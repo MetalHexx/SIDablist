@@ -166,8 +166,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `RTI` or `RTS` of its own. All of them must end on a `JMP idle`; a frame a byte off sends the
   handler into zeroed memory and the call never completes. The entry's extra cycles over a `JSR` are
   left out of the call's cycle count so the handler sees the same raster and budget
-  (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`; a
-  `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
+  (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`, which its `BRK` shares; a
+  PSID's `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
   default `$FFFE`.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
