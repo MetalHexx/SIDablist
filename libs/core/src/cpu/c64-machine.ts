@@ -73,7 +73,12 @@ export interface SidWriteSink {
   onSidWrite(register: number, value: number): void;
 }
 
-/** The outcome of one emulated routine call. */
+/**
+ * The outcome of one emulated routine call.
+ *
+ * The machine hands back one object it refills on every call, so a tick allocates none: read it
+ * before the next `initSubtune` or `runFrame` and never keep it.
+ */
 export interface FrameResult {
   readonly cyclesUsed: number;
   /** `false` means the cycle budget ran out before the routine returned — the tune is broken. */
@@ -260,6 +265,8 @@ export interface C64Machine {
    * Runs the play routine exactly once. Batching several calls into one frame would collapse them
    * downstream, which is precisely the data a multispeed tune exists to deliver.
    *
+   * The returned result is the machine's own, refilled by the next call to this or `initSubtune`.
+   *
    * @throws {UnplayableTuneError} when no play address has been resolved.
    */
   runFrame(): FrameResult;
@@ -317,6 +324,8 @@ class C64MachineImpl implements C64Machine {
   private speedBit = 0;
   private cyclesThisCall = 0;
   private reachedIdle = false;
+  /** Refilled by every routine call and handed back as it is, so a tick builds no result. */
+  private readonly result = { cyclesUsed: 0, completed: false };
   private expectingOpcodeFetch = false;
   private illegalOpcodes = 0;
   /** Cycles the interrupt entry spent past a `JSR`'s, left uncounted when the handler's first opcode is fetched. */
@@ -522,7 +531,9 @@ class C64MachineImpl implements C64Machine {
       this.cyclesThisCall++;
     }
 
-    return { cyclesUsed: this.cyclesThisCall, completed: this.reachedIdle };
+    this.result.cyclesUsed = this.cyclesThisCall;
+    this.result.completed = this.reachedIdle;
+    return this.result;
   }
 
   /**

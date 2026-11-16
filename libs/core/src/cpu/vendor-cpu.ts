@@ -69,22 +69,45 @@ class VendorCpu implements Cpu6502 {
 
   getState(): CpuState {
     const state: Record<string, unknown> = {};
-    this.copyStateInto(state);
+    const record = this.cpu as unknown as Record<string, unknown>;
+    for (const key of CPU_STATE_KEYS) {
+      state[key] = record[key];
+    }
     return state;
   }
 
+  /**
+   * Written out field by field rather than looped over `CPU_STATE_KEYS`: a keyed load of a field the
+   * core holds as a double (`addr`, `cycle`) boxes a fresh number on every call, and a capture on the
+   * frame path copies this every few frames. Keep it in step with `CPU_STATE_KEYS`;
+   * `vendor-cpu.spec.ts` compares the two.
+   */
   copyStateInto(target: Record<string, unknown>): void {
-    const record = this.cpu as unknown as Record<string, unknown>;
-    for (const key of CPU_STATE_KEYS) {
-      target[key] = record[key];
-    }
+    const cpu = this.cpu as unknown as Record<string, unknown>;
+    target.a = cpu.a;
+    target.x = cpu.x;
+    target.y = cpu.y;
+    target.pc = cpu.pc;
+    target.stkp = cpu.stkp;
+    target.status = cpu.status;
+    target.addr = cpu.addr;
+    target.currentInstruction = cpu.currentInstruction;
+    target.cycle = cpu.cycle;
   }
 
+  /** Field by field for the reason `copyStateInto` is: a lap and a hand-off restore on the frame
+   *  path. Keep it in step with `CPU_STATE_KEYS`. */
   setState(state: CpuState): void {
-    const record = this.cpu as unknown as Record<string, unknown>;
-    for (const key of CPU_STATE_KEYS) {
-      record[key] = state[key];
-    }
+    const cpu = this.cpu as unknown as Record<string, unknown>;
+    cpu.a = state.a;
+    cpu.x = state.x;
+    cpu.y = state.y;
+    cpu.pc = state.pc;
+    cpu.stkp = state.stkp;
+    cpu.status = state.status;
+    cpu.addr = state.addr;
+    cpu.currentInstruction = state.currentInstruction;
+    cpu.cycle = state.cycle;
   }
 }
 

@@ -32,7 +32,12 @@ import {
   createActiveLoopTracker,
   isUsableLoopLength,
 } from '../timeline/active-loop.js';
-import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
+import type {
+  ActiveLoop,
+  ActiveLoopTracker,
+  AdvanceResult,
+  LoopChange,
+} from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
 import {
@@ -295,6 +300,11 @@ class SidPlayerCoordinator implements SidPlayer {
   /** True from `enterVarispeed` until live playback or the paused landing takes over. The clock's
    *  ticks go to `varispeedTick` meanwhile, whatever the transport reads. */
   private varispeedActive = false;
+  /** The loop, pending change and varispeed flag the snapshot last built published, so a lap can tell
+   *  whether it moved any of them without building one to compare. */
+  private publishedLoop: ActiveLoop = null;
+  private publishedChange: LoopChange | null = null;
+  private publishedVarispeed = false;
   /** Asked for the rate once a tick; null outside varispeed and while handing back. */
   private rateSource: VarispeedRateSource | null = null;
   /** The host has left varispeed while playing: the record plays at rate 1 until the machine's
@@ -1762,36 +1772,45 @@ class SidPlayerCoordinator implements SidPlayer {
    *  varispeed, except a lap with no entry image held whose start the record covers: that one goes
    *  on the record and the handback carries on. Reports what it did. */
   private enforceLoop(machine: C64Machine, frame: RegisterFrame): AdvanceResult['action'] {
-    let outcome = this.activeLoop.advance(
+    const outcome = this.activeLoop.advance(
       machine,
       frame,
       this.ring,
       this.track,
       this.session.framesRendered,
     );
-    if (outcome.action === 'due-unheld') {
+    if (outcome.action === 'none') return 'none';
+    if (outcome.action === 'stopped') {
+      this.endTrack();
+      return 'stopped';
+    }
+    // The result is the tracker's own and the next `advance` refills it, so what is read of it is
+    // read here.
+    let action = outcome.action;
+    const landedFrame = outcome.frame;
+    if (action === 'due-unheld') {
       const record = this.varispeed.record;
-      if (record !== null && outcome.frame <= record.frames) {
-        this.lapOnRecord(outcome.frame);
-        return outcome.action;
+      if (record !== null && landedFrame <= record.frames) {
+        this.lapOnRecord(landedFrame);
+        return action;
       }
       // Nothing covers the start: the replay the tracker held back runs here, as it always has.
-      if (seekToFrame(machine, frame, this.ring, outcome.frame) === null) return 'none';
-      outcome = { action: 'looped', frame: outcome.frame };
+      if (seekToFrame(machine, frame, this.ring, landedFrame) === null) return 'none';
+      action = 'looped';
     }
-    if (outcome.action === 'looped') {
+    if (action === 'looped') {
       this.endVarispeed();
-      this.session.framesRendered = outcome.frame;
+      this.session.framesRendered = landedFrame;
       this.queueResync();
-      // The track's own loop may have just armed itself, which is a discrete change to the loop a
-      // consumer reads.
-      this.markDirty();
-    } else if (outcome.action === 'handed-off') {
+      // A lap that changes nothing a consumer reads builds nothing. What can change on one is the
+      // loop (the track's own loop arming, a named change landing) and the varispeed a lap ends.
+      if (this.publishedLoopStale()) this.markDirty();
+    } else if (action === 'handed-off') {
       // Every coordinator and tracker update comes before `markDirty`, whose listeners run
       // synchronously and may call straight back in: they must see a consistent snapshot, and what
       // they do must not be overwritten afterwards.
       this.endVarispeed();
-      this.session.framesRendered = outcome.frame;
+      this.session.framesRendered = landedFrame;
       this.queuedJump = null;
       this.handOffs++;
       if (this.activeLoop.get() === null) this.activeLoop.setEntryImage(this.trackLoopEntry);
@@ -1800,10 +1819,19 @@ class SidPlayerCoordinator implements SidPlayer {
       this.history?.restart();
       this.queueResync();
       this.markDirty();
-    } else if (outcome.action === 'stopped') {
-      this.endTrack();
     }
-    return outcome.action;
+    return action;
+  }
+
+  /** Whether the loop, the pending change or the varispeed flag differs from what the snapshot last
+   *  built published — the only published fields a lap can move. Reference compares, so a lap that
+   *  keeps its loop asks nothing of the snapshot. */
+  private publishedLoopStale(): boolean {
+    return (
+      this.activeLoop.get() !== this.publishedLoop ||
+      this.activeLoop.pendingChange() !== this.publishedChange ||
+      this.varispeedActive !== this.publishedVarispeed
+    );
   }
 
   /**
@@ -2030,8 +2058,8 @@ class SidPlayerCoordinator implements SidPlayer {
 
   /** A frame that gates every voice off — enough to release every note, and nothing else. */
   private gateOffFrame(): SidFrame {
-    for (const register of VOICE_CONTROL_REGISTERS) {
-      this.gateOff.onSidWrite(register, 0);
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      this.gateOff.onSidWrite(VOICE_CONTROL_REGISTERS[voice], 0);
     }
     return this.gateOff.takeSnapshot();
   }
@@ -2355,11 +2383,16 @@ class SidPlayerCoordinator implements SidPlayer {
    * routine once, so a 2x tune ticks twice per video frame at half the interval.
    */
   private effectiveIntervalUs(): Microseconds {
-    const callsPerFrame =
-      this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate;
     return microseconds(
-      playCallIntervalUsAt(this.nominalIntervalUs, callsPerFrame) / this.tempoMultiplier,
+      playCallIntervalUsAt(this.nominalIntervalUs, this.callsPerFrameInForce()) /
+        this.tempoMultiplier,
     );
+  }
+
+  /** The mirror's rate in the timing mode in force: a number, so the frame path reads the rate
+   *  without building the `PlayRate` that `playRate()` does for what is off the tick. */
+  private callsPerFrameInForce(): number {
+    return this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate;
   }
 
   /** The interval a consumer reads: what the clock is running while playing or in varispeed, and
@@ -2375,7 +2408,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  interval all read this rather than choosing between the two rates themselves. */
   private playRate(): PlayRate {
     return {
-      callsPerFrame: this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate,
+      callsPerFrame: this.callsPerFrameInForce(),
       exactCallsPerFrame: this.machineExactRate,
       roundedCallsPerFrame: this.machineRoundedRate,
       mode: this.timingMode,
@@ -2414,9 +2447,15 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   /** Derived from the tune's own rate, never the tempo multiplier — riding the tempo must not make
-   *  the ring's spacing breathe. */
+   *  the ring's spacing breathe. Runs on every tick, through the ring's spacing check, so it reads the
+   *  rate as a number. */
   private seekReachFrames(): Frames {
-    return frames(msToPlayCalls(SEEK_REACH_MS, this.nominalIntervalUs, this.playRate()));
+    return frames(
+      Math.round(
+        (SEEK_REACH_MS * MICROSECONDS_PER_MILLISECOND) /
+          playCallIntervalUsAt(this.nominalIntervalUs, this.callsPerFrameInForce()),
+      ),
+    );
   }
 
   /** What the chip actually does: latched XOR held. */
@@ -2450,6 +2489,9 @@ class SidPlayerCoordinator implements SidPlayer {
   private buildSnapshot(): PlayerSnapshot {
     const rate = this.playRate();
     const trackEndFrame = this.track.trackEndFrame();
+    this.publishedLoop = this.activeLoop.get();
+    this.publishedChange = this.activeLoop.pendingChange();
+    this.publishedVarispeed = this.varispeedActive;
     return {
       transport: this.transport,
       tune:

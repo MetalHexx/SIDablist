@@ -37,10 +37,11 @@ import type { JumpSettings, QueuedJump } from './snapshot.js';
  * `C64Machine.prototype` spying gave before the class became a factory-built, unexported internal.
  * Reset with `runFrameSpy.mockClear()` at the point a test wants to start counting from.
  */
-const { runFrameSpy, snapshotIntoSpy, seekToFrameSpy } = vi.hoisted(() => ({
+const { runFrameSpy, snapshotIntoSpy, seekToFrameSpy, ringRecording } = vi.hoisted(() => ({
   runFrameSpy: vi.fn(),
   snapshotIntoSpy: vi.fn(),
   seekToFrameSpy: vi.fn(),
+  ringRecording: { active: false },
 }));
 
 vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
@@ -61,13 +62,36 @@ vi.mock('../cpu/c64-machine.js', async (importOriginal) => {
           }
           if (prop === 'snapshotInto') {
             return (image: Parameters<typeof target.snapshotInto>[0]) => {
-              snapshotIntoSpy();
+              if (!ringRecording.active) snapshotIntoSpy();
               target.snapshotInto(image);
             };
           }
           return Reflect.get(target, prop, target);
         },
       });
+    },
+  };
+});
+
+/** The anchor ring copies the machine into its own images with `snapshotInto` too. `snapshotIntoSpy`
+ *  counts the copies a crossing makes, so what the ring records is left out of it. */
+vi.mock('../timeline/anchor-ring.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../timeline/anchor-ring.js')>();
+  return {
+    ...actual,
+    createAnchorRing: (...args: Parameters<typeof actual.createAnchorRing>) => {
+      const ring = actual.createAnchorRing(...args);
+      const unseen =
+        <Args extends unknown[]>(record: (...recordArgs: Args) => void) =>
+        (...recordArgs: Args): void => {
+          ringRecording.active = true;
+          try {
+            record(...recordArgs);
+          } finally {
+            ringRecording.active = false;
+          }
+        };
+      return { ...ring, record: unseen(ring.record), maybeRecord: unseen(ring.maybeRecord) };
     },
   };
 });

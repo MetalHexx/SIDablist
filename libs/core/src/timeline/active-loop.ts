@@ -113,7 +113,13 @@ export function isUsableLoopLength(startFrame: number, endFrame: number): boolea
  */
 export const REENTRY_GATE_OFF_FRAMES = 1;
 
-/** What `advance` did on a given frame. */
+/**
+ * What `advance` did on a given frame.
+ *
+ * `advance` allocates nothing, so what it returns is the tracker's own: a constant for `none` and
+ * `stopped`, and one object refilled by every call for the rest. Read it before the next `advance`
+ * and never keep it.
+ */
 export type AdvanceResult =
   | { readonly action: 'none' }
   | { readonly action: 'looped'; readonly frame: Frames }
@@ -313,8 +319,15 @@ export interface ActiveLoopTrackerOptions {
   readonly wrapLeadFrames?: number;
 }
 
+const NONE: AdvanceResult = Object.freeze({ action: 'none' });
+const STOPPED: AdvanceResult = Object.freeze({ action: 'stopped' });
+
 export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}): ActiveLoopTracker {
   const lead = options.wrapLeadFrames ?? 0;
+  const carried: {
+    action: 'looped' | 'due-unheld' | 'handed-off';
+    frame: Frames;
+  } = { action: 'looped', frame: frames(0) };
   let loop: ActiveLoop = null;
   let entryImage: PositionAnchor | null = null;
   let queued: QueuedNext | null = null;
@@ -402,6 +415,13 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
     const anchor = ring.select(startFrame);
     if (anchor !== null && anchor.frame < startFrame) return 'unheld';
     return seekToFrame(machine, frame, ring, startFrame) === null ? null : startFrame;
+  }
+
+  /** Fills the one result a frame-carrying action reports, and hands it back. */
+  function report(action: 'looped' | 'due-unheld' | 'handed-off', frame: Frames): AdvanceResult {
+    carried.action = action;
+    carried.frame = frame;
+    return carried;
   }
 
   const wrapDueAt = (startFrame: number, endFrame: number): number =>
@@ -498,7 +518,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
 
     advance(machine, frame, ring, track, framesRendered): AdvanceResult {
       if (loop !== null) {
-        if (framesRendered < wrapDueAt(loop.startFrame, lapEnd)) return { action: 'none' };
+        if (framesRendered < wrapDueAt(loop.startFrame, lapEnd)) return NONE;
         if (queued !== null && queuedImage !== null) {
           const image = queuedImage;
           const carried = phaseAfterWrap();
@@ -520,7 +540,7 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
           } else {
             rebase();
           }
-          return { action: 'handed-off', frame: image.frame };
+          return report('handed-off', image.frame);
         }
         if (change !== null && changeImage !== null) {
           const image = changeImage;
@@ -532,30 +552,30 @@ export function createActiveLoopTracker(options: ActiveLoopTrackerOptions = {}):
           change = null;
           changeImage = null;
           rebase();
-          return { action: 'looped', frame: image.frame };
+          return report('looped', image.frame);
         }
         const landed = enter(machine, frame, ring, loop.startFrame);
-        if (landed === null) return { action: 'none' };
+        if (landed === null) return NONE;
         nextLap(loop);
-        if (landed === 'unheld') return { action: 'due-unheld', frame: loop.startFrame };
-        return { action: 'looped', frame: landed };
+        if (landed === 'unheld') return report('due-unheld', loop.startFrame);
+        return report('looped', landed);
       }
 
       const trackEnd = track.trackEndFrame();
-      if (trackEnd === null) return { action: 'none' };
+      if (trackEnd === null) return NONE;
       if (!track.repeatEnabled()) {
-        return framesRendered < trackEnd ? { action: 'none' } : { action: 'stopped' };
+        return framesRendered < trackEnd ? NONE : STOPPED;
       }
 
       const start = track.loopStartFrame() ?? frames(0);
-      if (framesRendered < wrapDueAt(start, trackEnd)) return { action: 'none' };
+      if (framesRendered < wrapDueAt(start, trackEnd)) return NONE;
       const landed = enter(machine, frame, ring, start);
-      if (landed === null) return { action: 'none' };
+      if (landed === null) return NONE;
       loop = { startFrame: start, endFrame: trackEnd };
       trackOwn = true;
       rebase();
-      if (landed === 'unheld') return { action: 'due-unheld', frame: start };
-      return { action: 'looped', frame: landed };
+      if (landed === 'unheld') return report('due-unheld', start);
+      return report('looped', landed);
     },
   };
 }

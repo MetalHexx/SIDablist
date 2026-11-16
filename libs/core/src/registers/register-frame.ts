@@ -742,8 +742,9 @@ class RegisterFrameImpl implements RegisterFrame {
     this.writtenThisFrame.fill(0);
     this.forcedRegisters.fill(0);
     this.writeCount = 0;
-    for (const voice of this.mutedVoices) {
-      this.values[VOICE_CONTROL_REGISTERS[voice]] = 0;
+    // Not `for…of` over the set: its iterator is built on every restore, which a lap does.
+    for (let voice = 0; voice < VOICE_CONTROL_REGISTERS.length; voice++) {
+      if (this.mutedVoices.has(voice)) this.values[VOICE_CONTROL_REGISTERS[voice]] = 0;
     }
   }
 

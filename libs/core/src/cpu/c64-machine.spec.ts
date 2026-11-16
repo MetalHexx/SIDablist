@@ -1090,7 +1090,8 @@ describe('C64Machine VIC and CIA', () => {
       const machine = createC64Machine(chipTune(store(0x01, 0xdd0e), spinOnFirstCall), sink);
       machine.initSubtune(1);
 
-      const [first, second, third] = [machine.runFrame(), machine.runFrame(), machine.runFrame()];
+      // Copied: the machine refills one result on every call.
+      const [first, second, third] = [0, 1, 2].map(() => ({ ...machine.runFrame() }));
       const [atFirst, atSecond, atThird] = valuesFor(sink, 0);
 
       expect(first.cyclesUsed).toBeGreaterThan(PAL_CYCLES_PER_FRAME);

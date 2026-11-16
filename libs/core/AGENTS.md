@@ -89,8 +89,23 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The hot path does not allocate.** `RegisterFrame`'s per-frame state — `values`, `writeOrder`,
   the reused `SidFrame` buffers `takeSnapshot()` hands back — is mutated in place on purpose (see
   `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
-  of it in a fresh object or a getter for readability is a real regression, and it is audible, not
-  caught by a test.
+  of it in a fresh object or a getter for readability is a real regression, and it is audible.
+  `player/create-sid-player.allocation.spec.ts` and `timeline/anchor-ring.allocation.spec.ts` measure
+  plain play, laps, landings, the hand, a tune that changes its rate every call and the anchor ring
+  against a sink that holds nothing (they need `--expose-gc`, which `vitest.config.ts` gives the
+  workers). A new thing on the tick that allocates shows there: a result object, a `for…of` over a
+  `Set` or `Map`, a keyed read or store of a field the CPU holds as a double (`copyStateInto` and
+  `setState` name their fields for that reason), a snapshot built where nothing published changed.
+- **A result handed back on the tick is the owner's, and no caller keeps it.** `C64Machine.runFrame`
+  and `initSubtune` return one object the machine refills, `ActiveLoopTracker.advance` returns a
+  constant or one object the tracker refills, and `AnchorRing.select` returns the ring's own image,
+  which the next `record` overwrites. Read what you need before the next call: a caller holding two
+  at once, or one across a tick, reads the later call's numbers. `seekToFrame` restores from its
+  anchor before any record can run, which is why it is safe.
+- **A lap builds no snapshot unless something published moved.** `enforceLoop`'s `'looped'` branch calls
+  `markDirty` only when `publishedLoopStale()` says the loop, the pending change or the varispeed flag
+  differs from what the last `buildSnapshot` published; per-lap state is not on the snapshot. A new
+  published field a lap can change has to join that check, or a lap stops publishing it.
 - **The delivery history records inside frame delivery.** `DeliveryHistory.record` runs after every
   `sink.deliver` and `sink.deliverNow` — allocation-free, and after the sink call so the wire is
   never delayed by the append. A new place that hands a frame to the sink must record it too, through
@@ -227,8 +242,10 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The crossing pool is allocated off the tick.** `setCrossingCaptures` allocates every buffer
   (about 64 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
   `C64Machine.snapshotInto`, the CPU's `copyStateInto` and `RegisterFrame.snapshotValuesInto`. A
-  capture that builds an object, a `snapshot()` or an iterator on the tick is the regression, and no
-  test catches it. A new declaration holds memory for as long as it stays declared.
+  capture that builds an object, a `snapshot()` or an iterator on the tick is the regression. A new
+  declaration holds memory for as long as it stays declared. The anchor ring is the same: its
+  `ANCHOR_RING_SIZE` images are allocated with the ring, and a record copies into the oldest
+  non-seed one.
 - **At most one copy a tick.** A frame on several sets of lines is copied once and held by each; a
   loop's start is saved straight into the loop-entry buffer, and the lines skip that frame.
 - **A running loop's image lives in the loop-entry buffer, never in a slot that is still recycling.**
