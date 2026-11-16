@@ -190,7 +190,7 @@ export class IoChips {
     this.state[CALL_END] = this.state[CALL_START] + cyclesUsed;
   }
 
-  /** What CIA 1 timer A's latch holds: the tune's own or, for one that wrote none, the default. */
+  /** What CIA 1 timer A's latch holds: each byte the tune wrote, and the default's for each it did not. */
   timerALatch(): number {
     return this.state[CIA1 + TIMER_A + LATCH];
   }
@@ -278,12 +278,6 @@ export class IoChips {
       case CIA_TIMER_A_LOW:
       case CIA_TIMER_A_HIGH:
         if (cia === CIA1) {
-          if (s[LATCH_WRITTEN] === 0) {
-            // The play rate has always taken the half of this latch a tune never wrote as 0, not as
-            // the default's, and the fingerprint check holds the model to that. Hardware keeps the
-            // default's byte; changing this moves the rate of every tune that writes one half only.
-            s[cia + TIMER_A + LATCH] = 0;
-          }
           s[LATCH_WRITTEN] = 1;
         }
         this.writeLatchByte(cia + TIMER_A, register === CIA_TIMER_A_HIGH, value);

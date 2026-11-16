@@ -103,22 +103,28 @@ describe('IoChips', () => {
       expect(chips(1).read(CIA1_INTERRUPTS, 0x4025)).toBe(0x00);
     });
 
-    it("takes the half of CIA 1 timer A's latch the tune never wrote as 0, as the play rate always has", () => {
-      const high = chips(1);
-      high.write(CIA1_TIMER_A_HIGH, 0x20, 0);
-      const low = chips(1);
-      low.write(CIA1_TIMER_A_LOW, 0x20, 0);
-      const both = chips(1);
-      both.write(CIA1_TIMER_A_LOW, 0x20, 0);
-      both.write(CIA1_TIMER_A_HIGH, 0x30, 0);
-      both.write(CIA1_TIMER_A_LOW, 0x40, 0);
+    it.each([
+      ['PAL', 'pal' as const, 0x25, 0x40],
+      ['NTSC', 'ntsc' as const, 0x95, 0x42],
+    ])(
+      "keeps the default's byte of CIA 1 timer A's latch for a half the tune never wrote, on %s",
+      (_name, clock, defaultLow, defaultHigh) => {
+        const high = chips(1, clock);
+        high.write(CIA1_TIMER_A_HIGH, 0x20, 0);
+        const low = chips(1, clock);
+        low.write(CIA1_TIMER_A_LOW, 0x20, 0);
+        const both = chips(1, clock);
+        both.write(CIA1_TIMER_A_LOW, 0x20, 0);
+        both.write(CIA1_TIMER_A_HIGH, 0x30, 0);
+        both.write(CIA1_TIMER_A_LOW, 0x40, 0);
 
-      expect(high.timerALatch()).toBe(0x2000);
-      expect(low.timerALatch()).toBe(0x0020);
-      expect(both.timerALatch()).toBe(0x3040);
-      expect(chips(1).timerALatchWritten()).toBe(false);
-      expect(high.timerALatchWritten()).toBe(true);
-    });
+        expect(high.timerALatch()).toBe((0x20 << 8) | defaultLow);
+        expect(low.timerALatch()).toBe((defaultHigh << 8) | 0x20);
+        expect(both.timerALatch()).toBe(0x3040);
+        expect(chips(1, clock).timerALatchWritten()).toBe(false);
+        expect(high.timerALatchWritten()).toBe(true);
+      },
+    );
 
     it('leaves the addresses it has no register at to plain memory', () => {
       const chip = chips();

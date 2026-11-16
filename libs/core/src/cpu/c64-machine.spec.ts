@@ -1214,12 +1214,27 @@ describe('C64Machine VIC and CIA', () => {
   });
 
   describe('the play rate', () => {
-    it('reads a latch byte the tune never wrote as 0, so a tune writing one half plays at that half over zero', () => {
-      const highOnly = chipTune(store(0x20, 0xdc05), [], { speedFlags: 1 });
-      const lowOnly = chipTune(store(0x20, 0xdc04), [], { speedFlags: 1 });
+    it.each([
+      ['PAL', 'pal' as const, 0x4025],
+      ['NTSC', 'ntsc' as const, 0x4295],
+    ])(
+      "keeps the default's byte for a latch half the tune never wrote, so a tune writing one half plays at that half over the default's, on %s",
+      (_name, clock, defaultLatch) => {
+        const highOnly = chipTune(store(0x20, 0xdc05), [], { speedFlags: 1, clock });
+        const lowOnly = chipTune(store(0x20, 0xdc04), [], { speedFlags: 1, clock });
 
-      expect(run(highOnly, 0).machine.cyclesPerPlayCall).toBe(0x2000 + 1);
-      expect(run(lowOnly, 0).machine.cyclesPerPlayCall).toBe(0x0020 + 1);
+        expect(run(highOnly, 0).machine.cyclesPerPlayCall).toBe(0x2000 + (defaultLatch & 0xff) + 1);
+        expect(run(lowOnly, 0).machine.cyclesPerPlayCall).toBe((defaultLatch & 0xff00) + 0x20 + 1);
+      },
+    );
+
+    it('plays a tune that writes $00 to the low half only at the default high byte, not sixteen calls a frame', () => {
+      const lowZero = chipTune(store(0x00, 0xdc04), [], { speedFlags: 1 });
+
+      const machine = run(lowZero, 0).machine;
+
+      expect(machine.cyclesPerPlayCall).toBe(0x4000 + 1);
+      expect(machine.callsPerFrame).toBe(1);
     });
 
     it('spaces CIA-driven calls the latch plus one cycles apart', () => {
@@ -1258,6 +1273,12 @@ describe('C64Machine VIC and CIA', () => {
 
       expect(run(writesLatch, 0).machine.cyclesPerPlayCall).toBe(0x2663 + 1);
       expect(run(writesNone, 0).machine.cyclesPerPlayCall).toBeNull();
+    });
+
+    it("keeps the default's byte for a latch half it never wrote, as a PSID does", () => {
+      const highOnly = chipTune(store(0x20, 0xdc05), [], { format: 'RSID' });
+
+      expect(run(highOnly, 0).machine.cyclesPerPlayCall).toBe(0x2025 + 1);
     });
   });
 

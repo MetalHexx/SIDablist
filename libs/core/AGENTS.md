@@ -197,11 +197,19 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   plain number, never an `int32`: it passes 2³¹ in about 36 minutes. A new register, or a field on
   the state, goes in the layout and in `CHIP_STATE_LENGTH` so every capture carries it; one that
   steps per cycle, builds an object per read, or lives outside `state` is the regression.
-- **CIA 1 timer A's latch reads the half a tune never wrote as 0.** That is how the play rate has
-  always read a tune that writes only `$DC04` or only `$DC05`, and the fingerprint check ties every
-  tune to its rate, so the model keeps it. A real C64 keeps the PSID default's byte: a tune that
-  writes only `$DC04` plays near 60 Hz there and up to sixteen times faster here. Fixing it is a
-  deliberate rate change for every tune that writes one half, and `--change play-rate` is its class.
+- **CIA 1 timer A's latch keeps the default's byte for a half the tune never wrote.** A tune that
+  writes only `$DC04` or only `$DC05` plays at that byte over the other half of the PSID default
+  (`$4025` PAL, `$4295` NTSC), as on a real C64, and an RSID is read the same way. Zeroing the half it
+  did not write, as the play rate once did, runs a tune that writes `$00` to `$DC04` alone sixteen
+  calls a frame where the default's byte gives about one; `io-chips.spec.ts` and the `the play rate`
+  specs in `c64-machine.spec.ts` pin the rule. A change here moves the rate of every tune that
+  writes one half, and `--change play-rate` is its class.
+- **`$01` is ignored, so the RAM under the chips cannot be read.** The chip model answers `$D019`,
+  `$D01A` and the CIA timer registers whatever a tune banks in, so a tune that banks the I/O out to
+  copy the RAM under them reads live timers and not the memory it meant. `Snow_Strike` is the known
+  case (1519 SID writes in 300 calls while those reads returned memory, 5 since the chips went live).
+  Honouring `$01` for chip reads means honouring it for the SID write path too, which no change has
+  done yet.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.

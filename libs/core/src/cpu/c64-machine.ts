@@ -530,7 +530,9 @@ class C64MachineImpl implements C64Machine {
    *
    * The `$01` banking register is stored as ordinary RAM and ignored for decoding: the ranges below
    * always decode as I/O whatever a tune banks in. That is a deliberate simplification, not an
-   * oversight — no KERNAL or BASIC ROM image ships here, so there is nothing else to bank to.
+   * oversight — no KERNAL or BASIC ROM image ships here. It has a cost since the chips went live:
+   * a tune that banks the I/O out to read the RAM under `$D019`–`$DD0F` reads the chips instead.
+   * `Snow_Strike` is the known case.
    */
   private read(address: number): number {
     const fetchingOpcode = this.expectingOpcodeFetch;
