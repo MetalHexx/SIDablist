@@ -38,7 +38,8 @@ DOM type.
 - `deliver` allocates nothing. It packs into a preallocated ring slot with `writeSidDataPacket` and
   never builds a packet, a record or an array; `asid-sink.allocation.spec.ts` measures it. Anything
   that grows the ring runs off the tick (`setScheduleAhead`, `retime`). A full ring recycles its
-  oldest slot, so that send stops being tracked and a later `retime()` does not re-send it.
+  oldest slot, so that send stops being tracked and a later `retime()` does not re-send it; the
+  first time that happens after `begin()` or `reset()` the sink says so to the `EngineLog`.
 - A member `core`'s `SidSink` has no concept of (`showText`, `setScheduleAhead`, `stats`) goes on
   `AsidSink`, not smuggled onto the shared contract.
 

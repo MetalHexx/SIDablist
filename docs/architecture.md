@@ -228,7 +228,7 @@ all three: a `TimeSource` (milliseconds on the same timeline the frame clock's `
 optional `EngineLog` for the input the engine rejects and the failures it hits (absent means
 silent), and the worker factory `createWorkerReplayRunner` requires. A lint rule on `libs/core/src`
 and `libs/asid/src` bans `performance`, `console` and `new Worker(...)` outside specs, the testing
-fixtures, `web-midi/` and the worker entry.
+fixtures and `web-midi/`.
 
 ### The clock port is split the same way
 

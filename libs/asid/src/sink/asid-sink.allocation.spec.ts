@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { SidFrame, TimeSource } from '@sidablist/core';
+import type { EngineLog, SidFrame, TimeSource } from '@sidablist/core';
 import { frames, microseconds, milliseconds } from '@sidablist/core';
 import { buildSidDataPacket } from '../wire/encoder.js';
 import { createAsidSink, type AsidSink } from './asid-sink.js';
@@ -7,8 +7,8 @@ import { ALLOCATION_NOISE_BYTES, measureAllocation } from './measure-allocation.
 import type { MidiOutputPort } from './midi-output-port.js';
 
 const FRAME_INTERVAL_MS = 20;
-const STRETCH_LENGTH = 1_000;
-const STRETCHES = 10;
+const STRETCH_LENGTH = 10_000;
+const STRETCHES = 3;
 
 /** Takes the bytes and keeps nothing, so what a run allocates is the sink's own. */
 class CountingPort implements MidiOutputPort {
@@ -37,7 +37,7 @@ function makeFrame(): SidFrame {
 }
 
 describe('the ASID sink on the frame path', () => {
-  it('allocates nothing over ten thousand deliveries at the uncancellable ceiling, across retimes and reads between stretches', async () => {
+  it('allocates nothing over thirty thousand deliveries at the uncancellable ceiling, across retimes and reads between stretches', async () => {
     let nowMs = 0;
     const time: TimeSource = { now: () => milliseconds(nowMs) };
     const port = new CountingPort();
@@ -132,5 +132,32 @@ describe('a ring that overflows', () => {
     sink.retime(microseconds(FRAME_INTERVAL_MS * 1000));
 
     expect(resent).toEqual(sent.slice(total - tracked));
+  });
+
+  it('tells the log once that it dropped the oldest, and again after a reset', () => {
+    const nowMs = 1_000;
+    const time: TimeSource = { now: () => milliseconds(nowMs) };
+    const warnings: string[] = [];
+    const log: EngineLog = { warn: (message) => warnings.push(message), error: () => undefined };
+    const sink = createAsidSink(new CountingPort(), {
+      time,
+      scheduleAheadMs: milliseconds(40),
+      log,
+    });
+    const frame = makeFrame();
+    const fill = (): void => {
+      for (let tick = 0; tick < 2_000; tick++) {
+        sink.deliver(frame, frames(tick), milliseconds(nowMs + 5), false);
+      }
+    };
+
+    fill();
+    expect(warnings).toEqual([
+      expect.stringMatching(/^ASID sink: more sends are outstanding than/),
+    ]);
+
+    sink.reset();
+    fill();
+    expect(warnings).toHaveLength(2);
   });
 });

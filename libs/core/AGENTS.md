@@ -76,7 +76,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `TimeSource`, rejected input and failures go to the optional `EngineLog` (absent means silent),
   and `createWorkerReplayRunner` requires its worker factory. `eslint.config.mjs` enforces it:
   `performance` and `console` are restricted globals and `new Worker(...)` is banned under
-  `libs/core/src` (specs, `testing/` and `replay/replay.worker.ts` excepted).
+  `libs/core/src` (specs and `testing/` excepted).
 - A new field on `PlayerSnapshot` or `PlayerStats` lands inside an existing named group, never as
   a new flat top-level property — see either interface's own doc comment for why.
 - Whether new player state goes on `PlayerSnapshot` (pushed through `subscribe`) or `PlayerStats`

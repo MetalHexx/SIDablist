@@ -108,6 +108,8 @@ class AsidSinkImpl implements AsidSink {
    *  a later `retime()` does not re-send it. Nothing allocates on the tick. */
   private readonly slots: CommittedSlot[] = [];
   private committedCount = 0;
+  /** Whether the ring has recycled a live slot since `begin()` or `reset()`, so the host hears of it once. */
+  private ringOverflowReported = false;
   /** Where an untracked send — one already due when it arrives — is packed. */
   private readonly stagingSlot = createSlot();
   private shortestFrameIntervalMs = DEFAULT_SHORTEST_FRAME_INTERVAL_MS;
@@ -167,6 +169,7 @@ class AsidSinkImpl implements AsidSink {
     // The header already told us the model; this sink forwards it as its own packet, immediately
     // before the start packet — the order the engine used pre-extraction.
     this.deliveredCount = 0;
+    this.ringOverflowReported = false;
     this.sendControl(buildSidTypePacket(CHIP_INDEX, tune.chipModel === 'mos8580'));
     this.sendControl(buildStartPacket());
   }
@@ -285,6 +288,7 @@ class AsidSinkImpl implements AsidSink {
     }
     this.committedCount = 0;
     this.deliveredCount = 0;
+    this.ringOverflowReported = false;
   }
 
   /** Every frame went to the port as it arrived, stamped ahead, so all of them have passed. */
@@ -384,9 +388,16 @@ class AsidSinkImpl implements AsidSink {
   /** The slot the next tracked send is packed into, once the ring has been pruned. A full ring gives
    *  up its oldest live slot: that send stops being tracked, so a later `retime()` does not re-send
    *  it. It is the soonest due, so it is the one least worth keeping. The caller counts the slot in
-   *  with `committedCount++` after the send. */
+   *  with `committedCount++` after the send. The first recycle after `begin()` or `reset()` is
+   *  reported to the log, once: the one string built is off the steady state, which never recycles. */
   private acquireSlot(): CommittedSlot {
     if (this.committedCount === this.slots.length) {
+      if (!this.ringOverflowReported) {
+        this.ringOverflowReported = true;
+        this.log?.warn(
+          `ASID sink: more sends are outstanding than the ${this.slots.length}-slot ring holds; a tempo change will not re-send the oldest.`,
+        );
+      }
       const oldest = this.slots[0];
       this.slots.copyWithin(0, 1);
       this.slots[this.slots.length - 1] = oldest;

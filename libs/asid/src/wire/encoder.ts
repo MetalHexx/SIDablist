@@ -43,7 +43,9 @@ export function writeSidDataPacket(frame: SidFrame, into: Uint8Array): number {
   into[2] = ASID_MSG_SID_DATA;
   into.set(packScratch.presentMask, 3);
   into.set(packScratch.msbMask, 7);
-  into.set(packScratch.values.subarray(0, packScratch.valueCount), 11);
+  for (let i = 0; i < packScratch.valueCount; i++) {
+    into[11 + i] = packScratch.values[i];
+  }
   into[length - 1] = ASID_SYSEX_END;
   return length;
 }

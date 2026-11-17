@@ -47,12 +47,7 @@ export default tseslint.config(
     // (the factory's signature), so only its construction is banned. Flat config replaces a rule's
     // options in a later matching block, so the four browser names are repeated here.
     files: ['libs/core/src/**/*.ts', 'libs/asid/src/**/*.ts'],
-    ignores: [
-      '**/*.spec.ts',
-      'libs/core/src/testing/**',
-      'libs/asid/src/web-midi/**',
-      'libs/core/src/replay/replay.worker.ts',
-    ],
+    ignores: ['**/*.spec.ts', 'libs/core/src/testing/**', 'libs/asid/src/web-midi/**'],
     rules: {
       'no-restricted-globals': [
         'error',
