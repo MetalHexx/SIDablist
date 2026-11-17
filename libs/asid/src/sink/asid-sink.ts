@@ -64,9 +64,11 @@ const CHIP_INDEX = 0;
  *  the port's ordering of two near-equal timestamps never decides which of them lands first. */
 const UNSCHEDULED_SEND_SPACING_MS = 1;
 
-/** The shortest frame interval the ring is first sized for, in ms — a quadruple-speed PAL tune. A
- *  tempo command that asks for a shorter one grows the ring through `retime()`. */
-const DEFAULT_SHORTEST_FRAME_INTERVAL_MS = 5;
+/** The shortest frame interval the ring is first sized for, in ms. The engine plays at most 16 calls
+ *  a frame, so a frame is never shorter than about 1.25 ms (PAL) or 1.04 ms (NTSC). The sink is not
+ *  told a tune's own rate, so the ring is sized for that floor rather than for a typical tune. A
+ *  tempo command that asks for a shorter interval still grows the ring through `retime()`. */
+const DEFAULT_SHORTEST_FRAME_INTERVAL_MS = 1;
 /** The fewest slots the ring ever has, whatever the schedule-ahead. */
 const MIN_RING_SLOTS = 8;
 /** The most slots the ring grows to. Sizing follows a schedule-ahead and a tempo the host chooses, so

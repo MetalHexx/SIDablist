@@ -382,6 +382,38 @@ describe('createAsidSink', () => {
     });
   });
 
+  describe('a sixteen-times tune, frames 1.25 ms apart', () => {
+    const FRAME_MS = 1.25;
+    const FRAME_COUNT = 60;
+
+    it.each([15, 30])(
+      'tracks every outstanding send, warns of nothing, and re-sends all of them on a tempo change, with %i ms ahead',
+      (aheadMs) => {
+        port.supportsCancel = true;
+        port.cancelPendingReturns = true;
+        sink.setScheduleAhead(milliseconds(aheadMs));
+        sink.begin({ chipModel: 'mos6581' });
+        const startMs = nowMs;
+        for (let index = 0; index < FRAME_COUNT; index++) {
+          nowMs = startMs + index * FRAME_MS;
+          sink.deliver(frame([0], [index & 0xff]), frames(index), milliseconds(nowMs), false);
+        }
+        const outstanding = port.sent.filter(
+          (packet) => packet.timestampMs !== undefined && packet.timestampMs > nowMs,
+        ).length;
+        expect(outstanding).toBeGreaterThan(8);
+
+        expect(sink.stats.inFlight).toBe(outstanding);
+        expect(warnings).toEqual([]);
+
+        const before = port.sent.length;
+        sink.retime(microseconds(FRAME_MS * 1000));
+
+        expect(port.sent.length - before).toBe(outstanding);
+      },
+    );
+  });
+
   describe('reset', () => {
     it('cancels whatever the port still holds, without sending a stop packet or leaving anything for a later retime to catch', () => {
       port.supportsCancel = true;

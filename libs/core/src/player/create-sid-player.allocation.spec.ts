@@ -286,7 +286,7 @@ describe('saving and restoring a player', () => {
     });
   });
 
-  it('prints what a save costs', async () => {
+  it('saves in microseconds, not milliseconds', async () => {
     const { player, run, states } = await keeping();
     const samples: number[] = [];
     for (let index = 0; index < 2_000; index++) {
@@ -302,6 +302,10 @@ describe('saving and restoring a player', () => {
     console.info(
       `saveState: median ${micros(median)} µs, p95 ${micros(samples[Math.floor(samples.length * 0.95)])} µs over ${samples.length} saves`,
     );
+
+    // A save is about 2 µs here; the ceiling is several times that so a loaded CI machine passes and a
+    // save that has started copying more than a machine image does not.
+    expect(median).toBeLessThan(0.02);
   });
 });
 

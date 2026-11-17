@@ -37,9 +37,12 @@ DOM type.
   `eslint.config.mjs` restricts `performance` and `console` here, except under `web-midi/`.
 - `deliver` allocates nothing. It packs into a preallocated ring slot with `writeSidDataPacket` and
   never builds a packet, a record or an array; `asid-sink.allocation.spec.ts` measures it. Anything
-  that grows the ring runs off the tick (`setScheduleAhead`, `retime`). A full ring recycles its
-  oldest slot, so that send stops being tracked and a later `retime()` does not re-send it; the
-  first time that happens after `begin()` or `reset()` the sink says so to the `EngineLog`.
+  that grows the ring runs off the tick (`setScheduleAhead`, `retime`). The ring is sized for the
+  engine's floor of 1 ms between frames (16 calls a frame is about 1.25 ms), not for a typical
+  tune: the sink is never told a tune's rate, so a 16x tune must not overflow it. A full ring
+  recycles its oldest slot, so that send stops being tracked and a later `retime()` does not
+  re-send it; the first time that happens after `begin()` or `reset()` the sink says so to the
+  `EngineLog`.
 - A member `core`'s `SidSink` has no concept of (`showText`, `setScheduleAhead`, `stats`) goes on
   `AsidSink`, not smuggled onto the shared contract.
 

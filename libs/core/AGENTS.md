@@ -284,6 +284,14 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   case (1519 SID writes in 300 calls while those reads returned memory, 5 since the chips went live).
   Honouring `$01` for chip reads means honouring it for the SID write path too, which no change has
   done yet.
+- **A play-address-0 tune's interrupt vector is read once, after init.** `patchPlayTarget` resolves the
+  handler from `$0314` (or `$FFFE`) when init returns and never again, where a real C64 reads it at
+  every interrupt. A tune that re-points the vector after its first call keeps being entered at the
+  old one. Seven PSIDs in the test set do (_First Day Tune_, _Buon Natale_, _Mexico 86_, _Hoodoo
+  Voodoo_, _Toccata and Fugue_ parts 1 to 3): five still make sound, _First Day Tune_ writes only its
+  init registers, and _Hoodoo Voodoo_ writes nothing after init where it once wrote 7103 registers.
+  Re-reading the two words before each call would fix it, and is a change to every such tune's
+  output: `fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
