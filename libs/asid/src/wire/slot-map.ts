@@ -27,17 +27,40 @@ function buildSecondarySlotTable(): ReadonlyMap<number, number> {
   return table;
 }
 
-/** Maps one frame's ordered writes onto the 28 ASID slots.
+/** Working space for `packFrameInto`, and where it leaves its result: the two four-byte masks and the
+ *  seven-bit values of the slots a frame wrote, `valueCount` of them. Made once, off the frame path. */
+export interface PackScratch {
+  readonly presentMask: Uint8Array;
+  readonly msbMask: Uint8Array;
+  readonly values: Uint8Array;
+  valueCount: number;
+  readonly present: Uint8Array;
+  readonly slotValues: Uint8Array;
+  readonly writtenThisFrame: Uint8Array;
+}
+
+export function createPackScratch(): PackScratch {
+  return {
+    presentMask: new Uint8Array(4),
+    msbMask: new Uint8Array(4),
+    values: new Uint8Array(ASID_SLOT_COUNT),
+    valueCount: 0,
+    present: new Uint8Array(ASID_SLOT_COUNT),
+    slotValues: new Uint8Array(ASID_SLOT_COUNT),
+    writtenThisFrame: new Uint8Array(SID_REGISTER_COUNT),
+  };
+}
+
+/** Maps one frame's ordered writes onto the 28 ASID slots, into `scratch` and without allocating.
  *  The nth write to a gate register (4, 11 or 18) beyond the first takes that register's
  *  secondary slot; any other repeat write overwrites its primary slot. */
-export function packFrame(frame: SidFrame): {
-  readonly presentMask: number[];
-  readonly msbMask: number[];
-  readonly values: number[];
-} {
-  const present = new Uint8Array(ASID_SLOT_COUNT);
-  const slotValues = new Uint8Array(ASID_SLOT_COUNT);
-  const writtenThisFrame = new Uint8Array(SID_REGISTER_COUNT);
+export function packFrameInto(frame: SidFrame, scratch: PackScratch): void {
+  const { present, slotValues, writtenThisFrame, presentMask, msbMask, values } = scratch;
+  present.fill(0);
+  slotValues.fill(0);
+  writtenThisFrame.fill(0);
+  presentMask.fill(0);
+  msbMask.fill(0);
 
   for (let index = 0; index < frame.count; index++) {
     const register = frame.registers[index];
@@ -61,10 +84,7 @@ export function packFrame(frame: SidFrame): {
     slotValues[primarySlot] = value;
   }
 
-  const presentMask = [0, 0, 0, 0];
-  const msbMask = [0, 0, 0, 0];
-  const values: number[] = [];
-
+  let valueCount = 0;
   for (let slot = 0; slot < ASID_SLOT_COUNT; slot++) {
     if (!present[slot]) continue;
 
@@ -76,8 +96,22 @@ export function packFrame(frame: SidFrame): {
     if (value & 0x80) {
       msbMask[byteIndex] |= bit;
     }
-    values.push(value & 0x7f);
+    values[valueCount++] = value & 0x7f;
   }
+  scratch.valueCount = valueCount;
+}
 
-  return { presentMask, msbMask, values };
+/** The allocating form of `packFrameInto`, for callers off the frame path. */
+export function packFrame(frame: SidFrame): {
+  readonly presentMask: number[];
+  readonly msbMask: number[];
+  readonly values: number[];
+} {
+  const scratch = createPackScratch();
+  packFrameInto(frame, scratch);
+  return {
+    presentMask: Array.from(scratch.presentMask),
+    msbMask: Array.from(scratch.msbMask),
+    values: Array.from(scratch.values.subarray(0, scratch.valueCount)),
+  };
 }

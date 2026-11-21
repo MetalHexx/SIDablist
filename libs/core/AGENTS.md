@@ -15,9 +15,10 @@ holds no notion of where bytes physically go or what a person wants.
 The public surface is `src/index.ts`; nothing outside it is meant to be imported directly.
 
 - `sid/` — parses a `.sid` file into the model the rest of this library runs.
-- `cpu/` — `C64Machine`, the faked 64 KB address space and CIA/VIC stubs a tune's `init`/`play`
-  routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in
-  `vendor/mos6502/` implements.
+- `cpu/` — `C64Machine`, the faked 64 KB address space (68 KB with the RAM under I/O) a tune's
+  `init`/`play` routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in `vendor/mos6502/` implements.
+  `io-chips.ts` is its VIC raster flag and both CIAs' timers, with the cycle count that places each
+  play call in time.
 - `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
   stage — multiplier, offset, hold — that builds one), `sid-fields.ts` (the table of chip fields an
   application can drive), `register-record.ts` (`RegisterRecord`, a tune's register stream as data,
@@ -50,6 +51,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   delivered (`delivery-history.ts`, whose `DeliveryBatch` and `createDeliveryBatch` are public and
   whose `DeliveryHistory` is not), for a host that samples slower than frames are built.
   `getLapPhase()` reads the running loop's lap in progress, pulled like `getPosition()`.
+  `createSavedState`, `saveState` and `restoreState` keep a restore point of everything that decides
+  the next frames, every frame if a host likes, and come back to it exactly (`saved-state.ts` is
+  its layout; `SavedPlayerState` is opaque).
   `setCrossingCaptures` declares lines the live machine is saved at as the playhead crosses them,
   and `holdsImageAt` says whether an entry image exists for a frame (prepared, cached or saved at a
   crossing); a loop set at such a frame re-enters from the saved image with no replay.
@@ -60,14 +64,19 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   a frame the register record covers, playing from the record while the machine is rebuilt ahead.
 - `replay/` — runs frames ahead of the playhead for analysis, on the main thread or a worker.
 - `conformance/` — `SINK_CONFORMANCE_CASES`, the suite any `SidSink` implementation runs against
-  itself.
-- `ports/` — `Clock`, `SidSink`, `Transport`: the interfaces a host injects; this library depends
-  on none of their implementations.
+  itself, and `SINK_REPLACE_CASES`, the part of it a sink with no clock can run alone.
+- `ports/` — `FrameClock`, `SidSink`, `Transport`, `TimeSource`, `EngineLog`: the interfaces a host
+  injects; this library depends on none of their implementations.
 - `testing/` — `FakeClock`, `FakeSink`, `FakeTransport`: fixtures for a consumer's own specs.
 - `vendor/mos6502/` — the vendored 6502 core. See Hazards below before touching it.
 
 ## Conventions
 
+- **Core reads no clock, writes no console and builds no worker.** Time comes from the injected
+  `TimeSource`, rejected input and failures go to the optional `EngineLog` (absent means silent),
+  and `createWorkerReplayRunner` requires its worker factory. `eslint.config.mjs` enforces it:
+  `performance` and `console` are restricted globals and `new Worker(...)` is banned under
+  `libs/core/src` (specs and `testing/` excepted).
 - A new field on `PlayerSnapshot` or `PlayerStats` lands inside an existing named group, never as
   a new flat top-level property — see either interface's own doc comment for why.
 - Whether new player state goes on `PlayerSnapshot` (pushed through `subscribe`) or `PlayerStats`
@@ -79,6 +88,17 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - A host that needs every delivery between its reads — a one-frame gate, a doubled control write —
   uses `keepDeliveries`/`drainDeliveries`, never `readRegisters`: that is the chip at one instant,
   and anything that came and went between two reads is gone from it.
+- A stateful part the player is built from (`ActiveLoopTracker`, `TrackStructure`, `ShadowPosition`,
+  `Varispeed`, `RegisterFrame`, `CrossingCaptures`) is `Saveable` (`common/saveable.ts`):
+  `createState` allocates off the tick, `saveInto` and `restoreFrom` allocate nothing and run no
+  setter, hook or notification. A new field on one of them joins its state type, or its doc comment
+  says why it is out — a field left out restores almost exactly, which only a round-trip spec in the
+  part's own spec file catches. The tracker's three images are held by reference, not copied, so
+  whoever owns them must keep them valid between a save and its restore: the player's save copies
+  the loop-entry buffer, the one mutable image among them, itself.
+- A new field on the player (`SidPlayerCoordinator`) joins the saved state — `player/saved-state.ts`,
+  `saveState`, `restoreState` — or the list under "A saved state holds everything…" below says why it
+  is left out.
 - A capability a sink cannot honour is a new field on `SinkCapabilities` (`ports/sink.ts`),
   reported and worked around by core — never a thrown error, and never a method core assumes
   every sink implements.
@@ -88,8 +108,66 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
 - **The hot path does not allocate.** `RegisterFrame`'s per-frame state — `values`, `writeOrder`,
   the reused `SidFrame` buffers `takeSnapshot()` hands back — is mutated in place on purpose (see
   `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
-  of it in a fresh object or a getter for readability is a real regression, and it is audible, not
-  caught by a test.
+  of it in a fresh object or a getter for readability is a real regression, and it is audible.
+  `player/create-sid-player.allocation.spec.ts` and `timeline/anchor-ring.allocation.spec.ts` measure
+  plain play, laps, landings, the hand, a save every frame with a restore every fifty, alternating
+  restores, a restore while playing and the anchor ring against a sink that holds nothing;
+  `player/create-sid-player.allocation-rate.spec.ts` measures a tune that changes its rate every call,
+  whole and fractional, in a file of its own (they need `--expose-gc`, which `vitest.config.ts` gives
+  the workers). A new thing on the tick that allocates shows there: a result object, a `for…of` over a
+  `Set` or `Map`, a keyed read or store of a field the CPU holds as a double (`copyStateInto` and
+  `setState` name their fields for that reason), a snapshot built where nothing published changed.
+- **A saved state holds everything that decides the next frames, and a field left out restores
+  almost exactly.** It passes most specs and breaks one playing state, which is why
+  `player/create-sid-player.save-restore.spec.ts` plays two players on one tune — one straight
+  through, one saving, playing on with other commands, restoring — and compares every delivered
+  frame register for register, frame number and due time included, across each playing state. In: the
+  machine, the register frame's output stage, the position, tempo and the rate mirror, mutes, the
+  output settings the next load carries (gain, scales, target clock, pitches), field holds and
+  offsets, the running loop with its queued jump, its settings, a pending change and the images they
+  hold, the track structure and the track loop's entry image, the hand-offs landed, the crossing
+  pool, the shadow, and the hand (varispeed, rate source, the handback, the gate-off owed). Out:
+  what only reports (stats, the delivery history, snapshots), what the host owns (its clock, sink,
+  the rate source's own state, the transport), what the tune alone determines (prepared images,
+  declared frames, the entry-image cache), and the tokens that tell a late answer from a current one
+  (`handbackGeneration`, `varispeedRun`, `clockStarts`, `imageVersions`, the pool's stamps), which
+  only rise: put back, an answer in flight would pass for the next request's. A save is made
+  between ticks, never from a sink or a listener a tick reaches.
+- **A save copies a mutable image only when a fill has replaced the one it holds.** `loopEntry` is
+  numbered by `markLoopEntryFilled` and each crossing slot by the pool's stamp, and a state keeps
+  the number of the copy it holds, so a save every frame costs one machine image (about 3 µs) plus a
+  copy per fill, and a restore copies back only a slot a later fill replaced. A new place that
+  refills either without going through them hands a state an image that is stale and looks
+  current. The prepared and cached images are never refilled, so a state holds them by reference.
+- **A restore is the same player, not a landing.** It owes no gate-off and queues no resync — the sink
+  is handed the deltas an undisturbed player would send, and the history is left alone — keeps the
+  transport, drops a jump still replaying, and re-times the clock (never the sink) when the restored
+  rate or tempo moves it; the sink is retimed only for the tempo, a host command's effect. It
+  notifies once, after everything is back, and only through `restoreMovedPublished`, which compares
+  the published snapshot field against the live ones because `markDirty` builds the snapshot before it
+  compares: a published field a restore can change has to join that check, or a restore stops
+  publishing it.
+- **A restore resets the anchor ring to its seed.** An anchor recorded after the save may have been
+  taken with a voice muted, which leaves that voice's control register zeroed in the image, and a
+  loop re-entering along the ring would carry the zero into a player that is not muted. The ring
+  refills within a few anchors' spacing, so a seek or a lap with no entry image in the first
+  moments after a restore replays from frame 0, which is slower and exact.
+- **A restore across varispeed leaves the clock as the exit or entry requires.** Into varispeed it
+  needs the transport playing, since nothing from here can start the clock a non-playing varispeed
+  owns, and is refused otherwise. Out of one, `endVarispeed` returns the rate pitch to home, and a
+  non-playing varispeed's clock stops and its sink ends as for any other exit. A handback saved
+  before its image arrived asks for it again. A player that is `stopped` or `ended` refuses every
+  state, with a warning and no change: nothing from here starts the transport it left.
+- **A result handed back on the tick is the owner's, and no caller keeps it.** `C64Machine.runFrame`
+  and `initSubtune` return one object the machine refills, `ActiveLoopTracker.advance` returns a
+  constant or one object the tracker refills, and `AnchorRing.select` returns the ring's own image,
+  which the next `record` overwrites. Read what you need before the next call: a caller holding two
+  at once, or one across a tick, reads the later call's numbers. `seekToFrame` restores from its
+  anchor before any record can run, which is why it is safe.
+- **A lap builds no snapshot unless something published moved.** `enforceLoop`'s `'looped'` branch calls
+  `markDirty` only when `publishedLoopStale()` says the loop, the pending change or the varispeed flag
+  differs from what the last `buildSnapshot` published; per-lap state is not on the snapshot. A new
+  published field a lap can change has to join that check, or a lap stops publishing it.
 - **The delivery history records inside frame delivery.** `DeliveryHistory.record` runs after every
   `sink.deliver` and `sink.deliverNow` — allocation-free, and after the sink call so the wire is
   never delayed by the append. A new place that hands a frame to the sink must record it too, through
@@ -157,9 +235,105 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   continuously the moment that stops holding, so a new snapshot producer must go through
   `markDirty` rather than hand back a fresh object on every read.
 - **The vendored emulator is modified, and lives behind a port.** `vendor/mos6502/` is
-  third-party source with one deliberate behavioural change (`cpu/vendor-cpu.ts`'s
-  `QuietMos6502`), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
+  third-party source reworked in place for speed and an allocation-free step (its README lists what
+  changed), consumed only through the `Cpu6502` port — nothing above `cpu/` reaches into it
   directly. See the co-change edge below before touching a field it exposes.
+- **The CPU's step path is shared and allocation-free, and so is its bus.** The vendored core's
+  addressing modes and instructions are prototype methods, dispatched by name through tables built
+  once for the class, and `emulate` returns nothing and builds nothing. `C64MachineImpl.Bus` is a
+  class for the same reason. A per-instance closure on the path — a handler written as an arrow
+  function, or a bus built from a literal of arrows — hands the CPU's call sites a second target once
+  a second machine exists, and every machine in the process stays slower; a value returned or created
+  per cycle costs every machine too. Both pass every functional spec.
+  `cpu/vendor-cpu.allocation.spec.ts` catches an allocation in any legal opcode's handler (it runs
+  a program holding every one, and needs `--expose-gc`, which `vitest.config.ts` gives the workers), `cpu/vendor-cpu.instances.spec.ts` catches state kept off
+  the instance, and only the bench's `instances.mjs` catches a closure. The bus looks `read` and
+  `write` up on the machine instance at every access, and the machine sets `expectingOpcodeFetch`
+  before each `emulate()`: the fingerprint bench wraps both on the instance, so binding or capturing
+  them blinds its probe.
+- **A PSID with play address 0 is entered as an interrupt, and the stack is the seam.** The
+  trampoline in `cpu/c64-machine.ts` pushes a hardware frame (plus A, X, Y on the `$0314` path), and
+  the handler leaves through the KERNAL's own exits at `$EA31`, `$EA7E` and `$EA81`, or through an
+  `RTI` or `RTS` of its own. All of them must end on a `JMP idle`; a frame a byte off sends the
+  handler into zeroed memory and the call never completes. The entry's extra cycles over a `JSR` are
+  left out of the call's cycle count so the handler sees the same raster and budget
+  (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`, which its `BRK` shares; a
+  PSID's `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
+  default `$FFFE`.
+- **A PSID's trampoline lives where a PSID driver would, because a tune's init may overwrite any RAM
+  it is not asked to keep.** `chooseTrampolineBase` takes the header's free range (`relocStartPage` and
+  `relocPages`, read from `+$78`/`+$79` when the header reaches them) when it is one libsidplayfp's
+  `checkRelocInfo` accepts, else for a tune that names none the first page from `$04` to `$CF` outside
+  `$A0`–`$BF` that `fits()`, and only then falls back to `$EA00` and the first page from `$02`. Seven
+  tunes copy their player under the KERNAL to `$E000` and up, over the old trampoline, and one clears
+  page 2 (_Piracy_): the call then never reaches the idle address, or reaches it by running tune data as
+  code, and either way the header's play routine never runs. An RSID keeps `$EA00`: moving it changed 35
+  of 69 sampled, all unloadable either way. A call ends only on an opcode fetch of the idle address,
+  never on a read of it as data, which a tune sharing the trampoline's page can make; a `JSR`-entry call
+  also ends on an opcode fetch of the play `JSR`'s last byte (`base+$0A`), where a play routine that
+  returns with `RTI` lands once it has pulled the `JSR`'s frame (_Blood n' Guts_: its IRQ routine, called
+  by `JSR`, ends `PLA/TAY/PLA/TAX/PLA/RTI`), and an `RTS` never does. Without it that tune's call ran on
+  into junk and only "completed" when a data read of the idle address counted. Everything else
+  a tune writes over, the KERNAL's `$EA31`/`$EA7E`/`$EA81` and `$FE66` stubs among it, is still plain
+  RAM here, and a tune that fills the RAM under `$E000` takes those with it.
+- **A read of a chip register can change the chip, so a read is made once and nowhere else.** A PSID's
+  `$D019`, `$D01A` and CIA `$x4`–`$xF` come from `IoChips`, and a read of `$xD` returns the flags and
+  clears them. `C64MachineImpl.read` is the only caller and calls once per bus access: a classifier, a
+  snapshot, a debug dump or a "peek" that goes through `read` or `readBus` takes the flag the CPU was
+  about to see. The fingerprint bench wraps `read` and delegates once for the same reason. An RSID
+  keeps plain memory and a constant `$DC0D`/`$DD0D`.
+- **The chip model counts lazily and holds one cycle count.** Timers are not stepped: an access counts
+  a timer on to the cycle it happens at, from `IoChips.state`, one `Float64Array` of fixed layout
+  (`io-chips.ts` documents it) that a snapshot copies whole. A play call starts one period after the
+  last one started — `latch + 1` when CIA 1 timer A drove it, `cyclesPerFrame` otherwise — or when the
+  last one ended if it ran past that, and the timers count on through the gap. The cycle count is a
+  plain number, never an `int32`: it passes 2³¹ in about 36 minutes, which is why every play call
+  rebases it to zero at the last call's end (`IoChips.rebase`), and a slot that holds a cycle count
+  must be shifted there. A new register, or a field on
+  the state, goes in the layout and in `CHIP_STATE_LENGTH` so every capture carries it; one that
+  steps per cycle, builds an object per read, or lives outside `state` is the regression.
+- **CIA 1 timer A's latch keeps the default's byte for a half the tune never wrote.** A tune that
+  writes only `$DC04` or only `$DC05` plays at that byte over the other half of the PSID default
+  (`$4025` PAL, `$4295` NTSC), as on a real C64, and an RSID is read the same way. Zeroing the half it
+  did not write, as the play rate once did, runs a tune that writes `$00` to `$DC04` alone sixteen
+  calls a frame where the default's byte gives about one; `io-chips.spec.ts` and the `the play rate`
+  specs in `c64-machine.spec.ts` pin the rule. A change here moves the rate of every tune that
+  writes one half, and `--change play-rate` is its class.
+- **The 6510 port at `$00`/`$01` decides what `$D000`–`$DFFF` is, and that is all it decides.** `initSubtune`
+  sets `$00` to `$2F` and a PSID's `$01` to `psidBankFor(initAddress)` (`cpu-constants.ts`), after the
+  payload and the trampoline are in; an RSID starts at `$2F`/`$37`. `runFrame` writes `psidBankFor(play)`
+  before every call of a PSID with a play address, as a PSID driver does, so a call that left `$30` there
+  does not carry it into the next; a play-address-0 tune keeps what its own code leaves, as a real IRQ
+  does. The pins are `(data | ~ddr) & 7`, an input line being pulled up, and a read of `$01` is
+  `(data & ddr) | ($17 & ~ddr)`. The chips answer only while CHAREN and one of LORAM or HIRAM are high
+  (`ioVisible`); otherwise a read or write of `$D000`–`$DFFF` is the RAM under them, kept in the 4 KB past
+  `$FFFF` (`MACHINE_MEMORY_SIZE`, so every image, saved state and crossing slot carries it), and reaches
+  no chip and no sink. `memory[$D000-$DFFF]` stays the I/O view, so a tune that never banks I/O out runs
+  byte for byte as before; `loadTune` seeds the RAM under it from the payload. The decode sits on every
+  bus access of the frame path: one compare for an ordinary RAM access, and it allocates nothing.
+  `Snow_Strike` banks I/O out to copy the RAM under the CIA registers and `RGB` keeps the `$01` its init
+  reads as a "playing" flag; each is silent without the port.
+- **The ROM overlays are held back on purpose.** `$A000`–`$BFFF` and `$E000`–`$FFFF` read RAM whatever the
+  port selects, and every write lands in RAM. No ROM image ships, and reading an overlay of zeros in its
+  place changed two loadable tunes for the worse (_Razorberries_, _Sleipner/Techno_), where hardware
+  reads BASIC. The character ROM, which pins 1–3 bring over `$D000`–`$DFFF`, reads the RAM under I/O for
+  now. A change to the port or its decode is `fingerprint.mjs check --change banking`.
+- **Init gets 200 frames (`INIT_BUDGET_FRAMES`), because a real driver lets it run until it returns.** The budget only stops an
+  init that never returns, and a tune cut off by it plays on tables init never filled. Five PSIDs in HVSC #85,
+  Julian Jaymz's _Simulcra_, _Slanted_, _Slanted 2SID_, _Square Two_ and _Square Two 2SID_, need 101 to 168 frames;
+  cut at 100, _Simulcra_ and _Square Two_ played through a null pointer into `$00`/`$01`, which read 0 until the port
+  had values and then hung their player. 93 never return by 3,000 frames, and each costs its whole budget once
+  per load. A change to the budget moves every tune whose init runs past the old one:
+  `fingerprint.mjs check --change init-budget`.
+- **A play-address-0 tune's interrupt vector is read before every call.** `followInterruptVector`
+  re-reads `$0314` (else `$FFFE`), as a real C64 does at every interrupt, and re-points the trampoline
+  (`playAddress`, the play-target word and the handler word) only when it moved, so a tune that installs
+  a bootstrap handler and then re-points the vector plays past its first call. Both vectors back at
+  their defaults enters `$EA31` through the `$0314` entry, which balances `$EA81`'s three pulls
+  against the pushes; keeping the last handler would run _Mexico 86_ past its end, and the `$FFFE`
+  entry unbalances the stack. Nothing there may throw `UnplayableTuneError` mid-tune. A change to
+  this moves every such tune's output: `fingerprint.mjs check --change vector-reread`, in the shared
+  SIDABLIST-ROOT bench. An RSID's vector is still read once.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
@@ -175,10 +349,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   — and a loop re-entered from that image has the voice silent after it is unmuted until the tune
   writes the register again.
 - **The crossing pool is allocated off the tick.** `setCrossingCaptures` allocates every buffer
-  (about 64 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
+  (about 68 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
   `C64Machine.snapshotInto`, the CPU's `copyStateInto` and `RegisterFrame.snapshotValuesInto`. A
-  capture that builds an object, a `snapshot()` or an iterator on the tick is the regression, and no
-  test catches it. A new declaration holds memory for as long as it stays declared.
+  capture that builds an object, a `snapshot()` or an iterator on the tick is the regression. A new
+  declaration holds memory for as long as it stays declared. The anchor ring is the same: its
+  `ANCHOR_RING_SIZE` images are allocated with the ring, and a record copies into the oldest
+  non-seed one.
 - **At most one copy a tick.** A frame on several sets of lines is copied once and held by each; a
   loop's start is saved straight into the loop-entry buffer, and the lines skip that frame.
 - **A running loop's image lives in the loop-entry buffer, never in a slot that is still recycling.**
@@ -200,7 +376,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   the named frame at once and holds the new bounds in the tracker, which `set` clears and a subtune
   change cancels; the wrap there is a lap (`looped`), with no history restart. Setting the end through
   `ActiveLoopTracker.set` would drop the queued jump and the entry image with it.
-- **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
+- **Every declared jump frame holds about 68 KB** (the machine image plus a register shadow), for as
   long as it stays declared. The four-image cache for undeclared captures does not bound them; the
   host's declaration does.
 - **A queued jump never lands without a held image.** A target that is not yet built waits whole
@@ -241,6 +417,41 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `ended`, nothing in the transport rules stops the clock varispeed started, so every exit from it
   must — `loadTune`, `selectSubtune`, `stop`, `dispose` and the paused landing each do. A new exit
   that forgets leaves a clock ticking a player that reads stopped.
+- **The play rate is the header's speed bit and the tune's own interrupt enables, and the player's
+  mirror must never lag the machine.** A PSID with a play address plays at CIA 1 timer A's rate when
+  its song's speed bit is 1 (the latch the tune wrote, else the PSID default) and once per frame when
+  it is 0, whatever the latch says; one with play address 0 ignores the bits and follows the interrupt
+  `$DC0D` and `$D01A` have left enabled; an RSID keeps "a written latch means CIA". The rate's inputs
+  are read from the chip model — CIA 1 timer A's latch and interrupt enable — and the speed bit, and
+  ride in `MachineSnapshot` as `chips` and `speedBit`, in all five places together — the interface,
+  `WritableMachineSnapshot`, `createMachineImage`, `copyMachineImage` and `snapshot`/`snapshotInto`/
+  `restore` — as numbers and a typed array, so a snapshot still structured-clones to the replay
+  worker. The player
+  mirrors the two rates and `followPlayRate` compares them after every tick and every place the live
+  machine is restored: `TuneSession.adoptState` (which `restoreState`, a jump landing and a handback
+  all go through) and the lap and hand-off in `enforceLoop`. A new restore that skips it runs the
+  clock at the old rate until the tune next changes it; only the `a tune that changes its own play
+rate` specs in `player/create-sid-player.spec.ts` catch it.
+- **A rate the tune changes re-times the clock and nothing else.** `followPlayRate` calls
+  `clock.setIntervalUs` and keeps `runningIntervalUs` in step; it never calls `sink.retime`, because
+  the frames the sink already holds were played at the rate they had, and that stays with a tempo
+  command through `applyIntervalChange`. It builds no snapshot either: `PlayerSnapshot.tempo.rate` and
+  `effectiveIntervalUs` catch up at the player's next notification for any other reason, a deliberate
+  lag, while `getStats().rate` reads live. It is two number compares and allocates nothing, even for a
+  tune that swings its latch every call — which is why `effectiveIntervalUs` divides through
+  `playCallIntervalUsAt` and not a `PlayRate`.
+- **Varispeed sees a rate change only where an image lands.** No machine runs there, so the rate moves
+  only when a handback adopts an image or a lap or hand-off restores one, and each of those ends the
+  varispeed: the clock re-times as it ends, through the same `followPlayRate`, and nothing applies
+  sooner. The rate source still issues no command.
+- **`exactCallsPerFrame` is below 1 for a timer slower than a frame, and every reader of it has to
+  stand that.** `callsPerFrame` and `roundedCallsPerFrame` stay at 1 or above, so `'rounded'` timing
+  plays such a tune at one call a frame, as it always did. In exact timing `playCallIntervalUs` is
+  longer than the nominal interval, `msToPlayCalls` and `playCallsPerSecond` give fewer calls to a
+  second of music, `seekReachFrames` shrinks (about 15 frames at the slowest timer a latch can
+  program) and the anchor ring re-spaces to it, and a varispeed tick is the longer running interval.
+  The handback lead and the ring spacing floor at one frame, which is what keeps a slow tune from
+  dividing them to nothing. `libs/analysis` reads the same rate; its guide says what it does there.
 - **Every exit from varispeed returns the rate pitch to home through `endVarispeed`.** The rate pitch
   lives on the `RegisterFrame`, which `stop()` and a subtune change keep, so one left at 0 silences
   the next play. A new exit calls the one routine rather than setting the pitch itself.
@@ -280,7 +491,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (`ports/sink.ts`)?** `libs/asid`'s slot packing (`wire/slot-map.ts`, `wire/encoder.ts`) and its
   sink (`sink/asid-sink.ts`) both implement what these types promise. A change that stays
   type-compatible but shifts what a field means still reaches the wire wrong — a wrong packet, not
-  a compiler error. Update asid's packing/sink to match and run its specs. Detail:
+  a compiler error. A new member (`passedCount`, `replaceFrom`) is also one every implementation
+  must have, `FakeSink` and the specs' own sinks among them. Update asid's packing/sink to match and
+  run its specs. Detail:
   [`libs/asid/AGENTS.md`](../asid/AGENTS.md).
 - **Added or changed a case in `SINK_CONFORMANCE_CASES` (`conformance/cases.ts`)?**
   `libs/asid`'s `sink/conformance.spec.ts` runs every case in the suite against the real ASID
@@ -292,12 +505,43 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `assertCpuStateKeys` is the only thing standing between a renamed field and a cue that restores
   incomplete CPU state silently, since `MachineSnapshot.cpu` is an opaque `CpuState` record. Keep
   the key list in sync and run `cpu/vendor-cpu.spec.ts`; `copyStateInto`, which the crossing captures
-  copy through, reads the same list. Detail:
+  copy through, reads the same list. A handler or bus method that allocates or keeps state off the
+  instance only shows in `cpu/vendor-cpu.allocation.spec.ts` and
+  `cpu/vendor-cpu.instances.spec.ts`, and a per-instance closure on the step path only in the
+  shared bench's `instances.mjs` (`SIDABLIST_DIR=… node instances.mjs`, in SIDABLIST-ROOT's
+  `bench/`). Detail:
   [`cpu/vendor-cpu.ts`](./src/cpu/vendor-cpu.ts).
-- **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`)
-  or `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?** `libs/analysis`'s `scan-tune.ts` records both per frame — a
-  shifted meaning is a wrong index record, not a compile error. Run analysis's
-  `scan-tune.spec.ts`. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
+- **Changed the interrupt entry or the KERNAL exit stubs (`writeTrampoline`, `writeInterruptEntry`,
+  `installRomStubs` in `cpu/c64-machine.ts`; `TRAMPOLINE_*`, `INTERRUPT_*`, `IRQ_*_STUB`,
+  `BRK_HANDLER_STUB` in `cpu/cpu-constants.ts`)?** `INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL` and
+  `_HARDWARE` are the entry's cycle counts past a `JSR`, and nothing derives them from the bytes: a
+  stale one shifts the raster and the budget every handler sees, with no compile error. A moved
+  trampoline byte must also stay inside `TRAMPOLINE_INTERRUPT_LENGTH` and the continuation, or a tune
+  covering it is overwritten rather than relocated around. Update the constants, then run
+  `cpu/c64-machine.spec.ts` (the `entering a handler as an interrupt` specs) and the HVSC fingerprint
+  check (`fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench), since
+  every tune's writes ride on this entry. A change to where a PSID's trampoline goes
+  (`chooseTrampolineBase`) is `--change trampoline`. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
+- **Changed the VIC or CIA model (`cpu/io-chips.ts`; the register addresses in `cpu/cpu-constants.ts`;
+  `readBus`, `readChipRegister`, `ioVisible` and `write` in `cpu/c64-machine.ts`)?** What a tune reads from
+  `$D019`, `$D01A` and the CIA timers decides which branch a player takes, so a shifted flag, period
+  or read side effect changes what a tune writes, or hangs it, with no compile error. A new slot in
+  `IoChips.state` is a new `chips` length that a snapshot carries as it is. Run `cpu/io-chips.spec.ts`
+  and `cpu/c64-machine.spec.ts`, and the HVSC fingerprint check
+  (`fingerprint.mjs check --change vic-cia`, in the shared SIDABLIST-ROOT bench), which says which
+  tunes moved and which of those it cannot explain. `TUNE_INDEX_FORMAT_VERSION` already says the
+  engine's VIC and CIA changed what tunes play. Changes landing before a release ship under the
+  version that release first carries; a later change bumps it again. Detail:
+  [`cpu/io-chips.ts`](./src/cpu/io-chips.ts).
+- **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`),
+  what decides the rate (`speedFlags`, `psidSpecific`, the `$DC0D` and `$D01A` handling) or
+  `RegisterFrame`'s snapshot API (`snapshotInto` and `snapshotValuesInto` among it)?**
+  `libs/analysis`'s `scan-tune.ts` reads both rates once, when it builds its output, not per frame — a
+  shifted meaning is a wrong index record, not a compile error, and a change to what a tune plays
+  needs `TUNE_INDEX_FORMAT_VERSION` bumped so every stored scan is redone. Run analysis's
+  `scan-tune.spec.ts`, and the HVSC fingerprint check
+  (`fingerprint.mjs check --change <name>`, in the shared SIDABLIST-ROOT bench) to see which tunes
+  moved. Detail: [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md).
 - **Changed `RegisterRecord` (`registers/register-record.ts`), or how `RegisterFrame` snapshots a
   doubled voice control write?** `libs/analysis`'s `toRegisterRecord` and `TuneScan.recordControls`
   build the record from that shape, and `feed` (`player/varispeed.ts`) plays it back. A shifted
@@ -311,6 +555,12 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   history, and a shifted meaning of a control write records the wrong byte, with no compile error.
   Record at the new call and run `player/delivery-history.spec.ts` and the `delivery history` specs
   in `player/create-sid-player.spec.ts`.
+- **Added a field to the player, to `TuneSession`, or to a part's state?** It joins the saved state or
+  this guide says why not: `player/saved-state.ts`, `saveState`, `restoreState`, and a spec in
+  `player/create-sid-player.save-restore.spec.ts` that plays it through a rewind. One a snapshot
+  publishes also joins `restoreMovedPublished`. Left out, it restores almost exactly, which is a
+  state that sounds right until the one playing state it is wrong in; the reference test only
+  catches the fields it drives. Detail: [`src/player/saved-state.ts`](./src/player/saved-state.ts).
 - **Changed how a lap's end rounds (`lapLength`, `lapSpan`, `lapsWithin` in `timeline/active-loop.ts`)?**
   They round with `Math.round`, as `gridLine` and `isOnLine` do, and `libs/analysis`'s
   `grid-lines.ts` imports them for `shrinkLanding`, `foldIntoLoop`, `lapPhaseAt` and

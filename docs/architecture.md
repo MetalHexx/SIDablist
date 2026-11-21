@@ -122,6 +122,35 @@ the shadow stays the tune's own, which is what lets a saved position be re-enter
 setting without applying it twice. All three are standing conditions the player carries into every
 tune loaded after, until the application hands them back.
 
+## Restore points
+
+A tune is a program, and a program's next frames are decided by its state: so the player can keep that
+state and come back to it. `saveState` copies into storage `createSavedState` sized ahead of time, so
+a host can keep a restore point every frame for about the cost of one 68 KB machine image;
+`restoreState` puts every part back from it. A restored player plays exactly the frames, with the same
+frame numbers and due times, as one that never left: a restore owes the stream no gate-off and queues
+no resync, because the far end is handed the same deltas it would have been.
+
+What is in a state is whatever decides those frames: the machine, the register frame's output stage,
+the position, the tempo, the mutes, the output settings, the field holds and offsets, the running loop
+with its queued jump and pending change, the track structure, the crossing pool, the shadow and the
+varispeed hand. What is out is what only reports (stats, the delivery history, notifications), what
+the host owns (its clock, sink, rate source and the transport, which a restore keeps, so a host
+rewinding while playing keeps playing), and what the tune alone determines and stays valid (the
+prepared jump images and the declared set).
+
+Two images are mutable and could be recycled between a save and its restore, the loop-entry buffer and
+the crossing slots. Each fill is numbered, and a state copies an image only when its own copy is a
+different fill, so saving every frame costs a copy per fill rather than per frame, and a restore
+finds the image it was saved with. The anchor ring is reset to its frame-0 seed rather than kept: an
+anchor recorded after the save may have been taken with a voice muted, and a seek from it would carry
+the muted voice's zeroed control register into a player that is not muted.
+
+A state is bound to the load it was saved from. Another file, subtune or load, other crossing
+lines, a state another player made, and a state taken in varispeed while the player is not playing
+(nothing can start the clock a varispeed runs on) are refused with a warning and change nothing; a
+restore never applies half a state.
+
 ## The two seams
 
 A register write leaves the tune's own code and ends up on a chip. Two independent seams sit in
@@ -191,6 +220,15 @@ ASID cancels its outstanding packets and re-sends them at the new spacing, while
 one new timer value and flushes nothing, because nothing needs re-declaring.
 
 Core's half is only ever _this frame is due at T_.
+
+### Time, log and worker come from the host
+
+Core and the ASID sink read no clock, write to no console and construct no worker. The host injects
+all three: a `TimeSource` (milliseconds on the same timeline the frame clock's `dueAtMs` uses), an
+optional `EngineLog` for the input the engine rejects and the failures it hits (absent means
+silent), and the worker factory `createWorkerReplayRunner` requires. A lint rule on `libs/core/src`
+and `libs/asid/src` bans `performance`, `console` and `new Worker(...)` outside specs, the testing
+fixtures and `web-midi/`.
 
 ### The clock port is split the same way
 

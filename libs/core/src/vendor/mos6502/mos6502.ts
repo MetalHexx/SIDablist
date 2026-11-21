@@ -11,143 +11,151 @@ import type { AddressingModesMap } from './addressing.js';
 import type { Instruction, InstructionsMap } from './instructions.js';
 import { decode } from './decoder.js';
 
+/** The memory the CPU reads and writes through. Called directly, once per access. */
+export interface Mos6502Bus {
+  read(address: number): number;
+  write(address: number, value: number): void;
+}
+
+export interface ProcessorStatus {
+  info: Array<DebugInfo>;
+  registers: RegistersInfo;
+}
+
 export class mos6502 {
+  /**
+   * The dispatch tables. Built once for the class: the handlers are prototype methods, called with
+   * the instance as `this`, so an instance carries no handler closures and stepping a cycle
+   * allocates nothing.
+   */
+  private static readonly addressingModes: AddressingModesMap = {
+    IMP: mos6502.prototype.IMP,
+    IMM: mos6502.prototype.IMM,
+    ABS: mos6502.prototype.ABS,
+    ABX: mos6502.prototype.ABX,
+    ABY: mos6502.prototype.ABY,
+    IND: mos6502.prototype.IND,
+    INX: mos6502.prototype.IX,
+    INY: mos6502.prototype.IY,
+    REL: mos6502.prototype.REL,
+    ZPI: mos6502.prototype.ZP,
+    ZPX: mos6502.prototype.ZPX,
+    ZPY: mos6502.prototype.ZPY,
+    ACC: mos6502.prototype.IMP,
+  };
+  private static readonly instructionsMap: InstructionsMap = {
+    ADC: mos6502.prototype.ADC,
+    AND: mos6502.prototype.AND,
+    ASL: mos6502.prototype.ASL,
+    BCC: mos6502.prototype.BCC,
+    BCS: mos6502.prototype.BCS,
+    BEQ: mos6502.prototype.BEQ,
+    BIT: mos6502.prototype.BIT,
+    BMI: mos6502.prototype.BMI,
+    BNE: mos6502.prototype.BNE,
+    BPL: mos6502.prototype.BPL,
+    BRK: mos6502.prototype.BRK,
+    BVC: mos6502.prototype.BVC,
+    BVS: mos6502.prototype.BVS,
+    CLC: mos6502.prototype.CLC,
+    CLD: mos6502.prototype.CLD,
+    CLI: mos6502.prototype.CLI,
+    CLV: mos6502.prototype.CLV,
+    CMP: mos6502.prototype.CMP,
+    CPX: mos6502.prototype.CPX,
+    CPY: mos6502.prototype.CPY,
+    DEC: mos6502.prototype.DEC,
+    DEX: mos6502.prototype.DEX,
+    DEY: mos6502.prototype.DEY,
+    EOR: mos6502.prototype.EOR,
+    INC: mos6502.prototype.INC,
+    INX: mos6502.prototype.INX,
+    INY: mos6502.prototype.INY,
+    JMP: mos6502.prototype.JMP,
+    JSR: mos6502.prototype.JSR,
+    LDA: mos6502.prototype.LDA,
+    LDX: mos6502.prototype.LDX,
+    LDY: mos6502.prototype.LDY,
+    LSR: mos6502.prototype.LSR,
+    NOP: mos6502.prototype.NOP,
+    ORA: mos6502.prototype.ORA,
+    PHA: mos6502.prototype.PHA,
+    PHP: mos6502.prototype.PHP,
+    PLA: mos6502.prototype.PLA,
+    PLP: mos6502.prototype.PLP,
+    ROL: mos6502.prototype.ROL,
+    ROR: mos6502.prototype.ROR,
+    RTI: mos6502.prototype.RTI,
+    RTS: mos6502.prototype.RTS,
+    SBC: mos6502.prototype.SBC,
+    SEC: mos6502.prototype.SEC,
+    SED: mos6502.prototype.SED,
+    SEI: mos6502.prototype.SEI,
+    STA: mos6502.prototype.STA,
+    STX: mos6502.prototype.STX,
+    STY: mos6502.prototype.STY,
+    TAX: mos6502.prototype.TAX,
+    TAY: mos6502.prototype.TAY,
+    TSX: mos6502.prototype.TSX,
+    TXA: mos6502.prototype.TXA,
+    TXS: mos6502.prototype.TXS,
+    TYA: mos6502.prototype.TYA,
+    '???': mos6502.prototype.ILL,
+  };
+
   private a: number = 0x00;
   private x: number = 0x00;
   private y: number = 0x00;
   private pc: number = 0x00;
   private stkp: number = 0x00;
   private status: number = 0x00;
-  private addressingModes: AddressingModesMap;
-  private instructionsMap: InstructionsMap;
   private addr: number = 0x00;
   private currentInstruction: Instruction = { instruction: '???', addressing: 'IMP', cycles: 2 };
   private cycle: number = 0;
-  private read: (address: number) => number;
-  private write: (address: number, value: number) => void;
+  private bus: Mos6502Bus;
 
   /** Debug Only */
   private debug: boolean;
 
-  constructor(
-    read: (address: number) => number,
-    write: (address: number, value: number) => void,
-    debug: boolean = false,
-  ) {
-    this.addressingModes = {
-      IMP: this.IMP,
-      IMM: this.IMM,
-      ABS: this.ABS,
-      ABX: this.ABX,
-      ABY: this.ABY,
-      IND: this.IND,
-      INX: this.IX,
-      INY: this.IY,
-      REL: this.REL,
-      ZPI: this.ZP,
-      ZPX: this.ZPX,
-      ZPY: this.ZPY,
-      ACC: this.IMP,
-    };
-    this.instructionsMap = {
-      ADC: this.ADC,
-      AND: this.AND,
-      ASL: this.ASL,
-      BCC: this.BCC,
-      BCS: this.BCS,
-      BEQ: this.BEQ,
-      BIT: this.BIT,
-      BMI: this.BMI,
-      BNE: this.BNE,
-      BPL: this.BPL,
-      BRK: this.BRK,
-      BVC: this.BVC,
-      BVS: this.BVS,
-      CLC: this.CLC,
-      CLD: this.CLD,
-      CLI: this.CLI,
-      CLV: this.CLV,
-      CMP: this.CMP,
-      CPX: this.CPX,
-      CPY: this.CPY,
-      DEC: this.DEC,
-      DEX: this.DEX,
-      DEY: this.DEY,
-      EOR: this.EOR,
-      INC: this.INC,
-      INX: this.INX,
-      INY: this.INY,
-      JMP: this.JMP,
-      JSR: this.JSR,
-      LDA: this.LDA,
-      LDX: this.LDX,
-      LDY: this.LDY,
-      LSR: this.LSR,
-      NOP: this.NOP,
-      ORA: this.ORA,
-      PHA: this.PHA,
-      PHP: this.PHP,
-      PLA: this.PLA,
-      PLP: this.PLP,
-      ROL: this.ROL,
-      ROR: this.ROR,
-      RTI: this.RTI,
-      RTS: this.RTS,
-      SBC: this.SBC,
-      SEC: this.SEC,
-      SED: this.SED,
-      SEI: this.SEI,
-      STA: this.STA,
-      STX: this.STX,
-      STY: this.STY,
-      TAX: this.TAX,
-      TAY: this.TAY,
-      TSX: this.TSX,
-      TXA: this.TXA,
-      TXS: this.TXS,
-      TYA: this.TYA,
-      '???': this.ILL,
-    };
-    this.read = read;
-    this.write = write;
+  /** Debug only: the status after the last instruction started; stays null unless `debug` is on. */
+  public processorStatus: ProcessorStatus | null = null;
+
+  constructor(bus: Mos6502Bus, debug: boolean = false) {
+    this.bus = bus;
 
     this.reset();
     this.cycle = 0;
     this.debug = debug;
   }
 
-  public emulate = (): {
-    cycle: number;
-    processorStatus: { info: Array<DebugInfo>; registers: RegistersInfo } | null;
-  } => {
-    let processorStatus = null;
-
+  /** Advances one cycle. An instruction's work all happens on its first cycle; the rest count down. */
+  public emulate(): void {
     if (this.cycle === 0) {
       this.setFlag(Flags.A, true);
       const pc = this.pc;
 
-      this.currentInstruction = decode(this.read(this.pc) & 0xff);
+      this.currentInstruction = decode(this.bus.read(this.pc) & 0xff);
       this.pc = this.pc + 1;
       this.cycle = this.currentInstruction.cycles;
-      this.cycle = this.cycle + this.addressingModes[this.currentInstruction.addressing]();
-      this.cycle = this.cycle + this.instructionsMap[this.currentInstruction.instruction]();
-      processorStatus = this.getProcessorStatus(pc);
+      this.cycle =
+        this.cycle + mos6502.addressingModes[this.currentInstruction.addressing].call(this);
+      this.cycle =
+        this.cycle + mos6502.instructionsMap[this.currentInstruction.instruction].call(this);
+      if (this.debug) {
+        this.processorStatus = this.getProcessorStatus(pc);
+      }
       this.setFlag(Flags.A, true);
     }
     this.cycle = this.cycle - 1;
-    return {
-      cycle: this.cycle,
-      processorStatus,
-    };
-  };
+  }
 
-  public getFlag = (flag: Flags) => {
+  public getFlag(flag: Flags): number {
     const mask = (1 << flag) & 0xff;
 
     return (this.status & mask) !== 0 ? 1 : 0;
-  };
+  }
 
-  public setFlag = (flag: Flags, value: boolean) => {
+  public setFlag(flag: Flags, value: boolean): void {
     const mask = 1 << flag;
 
     if (value) {
@@ -156,7 +164,7 @@ export class mos6502 {
       this.status &= ~mask;
     }
     return;
-  };
+  }
 
   /**
    * Trigger a Non-Maskable Interrupt (NMI).
@@ -166,15 +174,15 @@ export class mos6502 {
    * @returns {void}
    */
   public nmi(): void {
-    const lo = this.read(0xfffa);
-    const hi = this.read(0xfffb);
+    const lo = this.bus.read(0xfffa);
+    const hi = this.bus.read(0xfffb);
 
     this.setFlag(Flags.B, false);
     this.setFlag(Flags.A, true);
     this.setFlag(Flags.I, true);
-    this.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
-    this.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
-    this.write(0x100 + this.stkp - 2, this.status);
+    this.bus.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 2, this.status);
     this.stkp = (this.stkp - 3) & 0xff;
     this.pc = (hi << 8) | lo;
     this.cycle = 7;
@@ -188,8 +196,8 @@ export class mos6502 {
    * @returns {void}
    */
   public reset(): void {
-    const lo = this.read(0xfffc);
-    const hi = this.read(0xfffd);
+    const lo = this.bus.read(0xfffc);
+    const hi = this.bus.read(0xfffd);
 
     this.pc = (hi << 8) | lo;
     this.a = 0;
@@ -215,15 +223,15 @@ export class mos6502 {
     if (this.getFlag(Flags.I) === 1) {
       return;
     }
-    const lo = this.read(0xfffe);
-    const hi = this.read(0xffff);
+    const lo = this.bus.read(0xfffe);
+    const hi = this.bus.read(0xffff);
 
     this.setFlag(Flags.B, false);
     this.setFlag(Flags.A, true);
     this.setFlag(Flags.I, true);
-    this.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
-    this.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
-    this.write(0x100 + this.stkp - 2, this.status);
+    this.bus.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 2, this.status);
     this.stkp = (this.stkp - 3) & 0xff;
     this.pc = (hi << 8) | lo;
     this.cycle = 7;
@@ -264,9 +272,9 @@ export class mos6502 {
    * No address operand, we do nothing
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private IMP = (): number => {
+  private IMP(): number {
     return 0;
-  };
+  }
 
   /**
    * Immediate Addressing mode.
@@ -274,11 +282,11 @@ export class mos6502 {
    * Use the next byte as a value
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private IMM = (): number => {
+  private IMM(): number {
     this.addr = this.pc;
     this.pc = (this.pc + 1) & 0xffff;
     return 0;
-  };
+  }
 
   /**
    * Absolute Addressing mode.
@@ -286,14 +294,14 @@ export class mos6502 {
    * The address of the value that the instruction will use is located in the next to bytes.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private ABS = (): number => {
-    const low = this.read(this.pc);
-    const high = this.read((this.pc + 1) & 0xffff);
+  private ABS(): number {
+    const low = this.bus.read(this.pc);
+    const high = this.bus.read((this.pc + 1) & 0xffff);
 
     this.pc = (this.pc + 2) & 0xffff;
     this.addr = (high << 8) | low;
     return 0;
-  };
+  }
 
   /**
    * Absolute with X index Addressing mode.
@@ -301,9 +309,9 @@ export class mos6502 {
    * The address of the value that the instruction will use is located in the next to bytes.
    * @returns {number} 1 if a page is crossed, else 0.
    */
-  private ABX = (): number => {
-    const low = this.read(this.pc);
-    const high = this.read((this.pc + 1) & 0xffff);
+  private ABX(): number {
+    const low = this.bus.read(this.pc);
+    const high = this.bus.read((this.pc + 1) & 0xffff);
 
     this.pc = (this.pc + 2) & 0xffff;
     this.addr = (((high << 8) | low) + this.x) & 0xffff;
@@ -311,7 +319,7 @@ export class mos6502 {
       return 0;
     }
     return (this.addr & 0xff00) === ((high << 8) & 0xff00) ? 0 : 1;
-  };
+  }
 
   /**
    * Absolute with Y index Addressing mode.
@@ -319,9 +327,9 @@ export class mos6502 {
    * The address of the value that the instruction will use is located in the next to bytes.
    * @returns {number} 1 if a page is crossed, else 0.
    */
-  private ABY = (): number => {
-    const low = this.read(this.pc);
-    const high = this.read((this.pc + 1) & 0xffff);
+  private ABY(): number {
+    const low = this.bus.read(this.pc);
+    const high = this.bus.read((this.pc + 1) & 0xffff);
 
     this.pc = (this.pc + 2) & 0xffff;
     this.addr = (((high << 8) | low) + this.y) & 0xffff;
@@ -329,7 +337,7 @@ export class mos6502 {
       return 0;
     }
     return (this.addr & 0xff00) === high << 8 ? 0 : 1;
-  };
+  }
 
   /**
    * Indirect Addressing mode.
@@ -338,20 +346,20 @@ export class mos6502 {
    * at the address that we get after reading the next two bytes.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private IND = (): number => {
-    const low = this.read(this.pc);
-    const high = this.read((this.pc + 1) & 0xffff);
+  private IND(): number {
+    const low = this.bus.read(this.pc);
+    const high = this.bus.read((this.pc + 1) & 0xffff);
     const address = (high << 8) | low;
 
     this.pc = (this.pc + 2) & 0xffff;
 
     // Handle the page boundary bug
-    const indirectLow = this.read(address);
-    const indirectHigh = this.read((address & 0xff00) | ((address + 1) & 0x00ff));
+    const indirectLow = this.bus.read(address);
+    const indirectHigh = this.bus.read((address & 0xff00) | ((address + 1) & 0x00ff));
 
     this.addr = (indirectHigh << 8) | indirectLow;
     return 0;
-  };
+  }
 
   /**
    * Indirect with X index Addressing mode.
@@ -359,13 +367,14 @@ export class mos6502 {
    * Indirect with an offset equal to X.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private IX = (): number => {
-    const loc = this.read(this.pc);
+  private IX(): number {
+    const loc = this.bus.read(this.pc);
 
     this.pc = (this.pc + 1) & 0xffff;
-    this.addr = (this.read((loc + this.x + 1) & 0xff) << 8) | this.read((loc + this.x) & 0xff);
+    this.addr =
+      (this.bus.read((loc + this.x + 1) & 0xff) << 8) | this.bus.read((loc + this.x) & 0xff);
     return 0;
-  };
+  }
 
   /**
    * Indirect with Y index Addressing mode.
@@ -373,10 +382,10 @@ export class mos6502 {
    * Indirect with an offset equal to Y.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private IY = (): number => {
-    const loc = this.read(this.pc);
-    const baseLo = this.read(loc & 0xff);
-    const baseHi = this.read((loc + 1) & 0xff);
+  private IY(): number {
+    const loc = this.bus.read(this.pc);
+    const baseLo = this.bus.read(loc & 0xff);
+    const baseHi = this.bus.read((loc + 1) & 0xff);
     const baseAddr = (baseHi << 8) | baseLo;
     this.addr = (baseAddr + this.y) & 0xffff;
     this.pc = (this.pc + 1) & 0xffff;
@@ -385,7 +394,7 @@ export class mos6502 {
       return 0;
     }
     return (this.addr & 0xff00) === (baseAddr & 0xff00) ? 0 : 1;
-  };
+  }
 
   /**
    * Relative Addressing mode.
@@ -393,15 +402,15 @@ export class mos6502 {
    * Used by branching instruction. A signed one byte offset is used to indicate the jump location.
    * @returns
    */
-  private REL = (): number => {
-    this.addr = this.read(this.pc) & 0xff;
+  private REL(): number {
+    this.addr = this.bus.read(this.pc) & 0xff;
     this.pc = this.pc + 1;
 
     if (this.addr & 0x80) {
       this.addr = this.addr | 0xff00;
     }
     return 0;
-  };
+  }
 
   /**
    * Zero Page Addressing mode.
@@ -409,13 +418,13 @@ export class mos6502 {
    * We assume that the value is located on page 0, at the offset indicated by the next byte.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private ZP = (): number => {
-    const low = this.read(this.pc);
+  private ZP(): number {
+    const low = this.bus.read(this.pc);
 
     this.addr = low & 0xff;
     this.pc = (this.pc + 1) & 0xffff;
     return 0;
-  };
+  }
 
   /**
    * Zero Page with X index Addressing mode.
@@ -423,12 +432,12 @@ export class mos6502 {
    * We assume that the value is located on page 0, at the offset indicated by the next + x byte.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private ZPX = (): number => {
-    const base = this.read(this.pc) & 0x00ff;
+  private ZPX(): number {
+    const base = this.bus.read(this.pc) & 0x00ff;
     this.addr = (base + this.x) & 0x00ff;
     this.pc = (this.pc + 1) & 0xffff;
     return 0;
-  };
+  }
 
   /**
    * Zero Page with X index Addressing mode.
@@ -436,20 +445,20 @@ export class mos6502 {
    * We assume that the value is located on page 0, at the offset indicated by the next + y byte.
    * @returns {number} 0, this addressing mode does not require additionnal clock cycles.
    */
-  private ZPY = (): number => {
-    const base = this.read(this.pc) & 0x00ff;
+  private ZPY(): number {
+    const base = this.bus.read(this.pc) & 0x00ff;
     this.addr = (base + this.y) & 0x00ff;
     this.pc = (this.pc + 1) & 0xffff;
     return 0;
-  };
+  }
 
   /**
    * Instructions
    * reference: https://www.nesdev.org/obelisk-6502-guide/reference.html
    */
 
-  private ADC = (): number => {
-    const m = this.read(this.addr);
+  private ADC(): number {
+    const m = this.bus.read(this.addr);
 
     if (this.getFlag(Flags.D)) {
       let lowerNibble = (this.a & 0x0f) + (m & 0x0f) + this.getFlag(Flags.C);
@@ -477,20 +486,20 @@ export class mos6502 {
     this.setFlag(Flags.Z, this.a === 0);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private AND = (): number => {
-    const m = this.read(this.addr);
+  private AND(): number {
+    const m = this.bus.read(this.addr);
 
     this.a = this.a & m;
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private ASL = (): number => {
+  private ASL(): number {
     const implied: boolean = this.currentInstruction.addressing === 'ACC';
-    const data: number = implied ? this.a : this.read(this.addr);
+    const data: number = implied ? this.a : this.bus.read(this.addr);
     const result: number = (data << 1) & 0x00ff;
 
     this.setFlag(Flags.C, (data & 0x80) !== 0);
@@ -500,12 +509,12 @@ export class mos6502 {
     if (implied === true) {
       this.a = result;
     } else {
-      this.write(this.addr, result);
+      this.bus.write(this.addr, result);
     }
     return 0;
-  };
+  }
 
-  private BCC = (): number => {
+  private BCC(): number {
     if (this.getFlag(Flags.C) === 1) {
       return 0;
     }
@@ -513,9 +522,9 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BCS = (): number => {
+  private BCS(): number {
     if (this.getFlag(Flags.C) === 0) {
       return 0;
     }
@@ -523,9 +532,9 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BEQ = (): number => {
+  private BEQ(): number {
     if (this.getFlag(Flags.Z) === 0) {
       return 0;
     }
@@ -533,19 +542,19 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BIT = (): number => {
-    const m = this.read(this.addr);
+  private BIT(): number {
+    const m = this.bus.read(this.addr);
     const result = this.a & m;
 
     this.setFlag(Flags.Z, result === 0x00);
     this.setFlag(Flags.V, (m & 0x40) !== 0);
     this.setFlag(Flags.N, (m & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private BMI = (): number => {
+  private BMI(): number {
     if (this.getFlag(Flags.N) === 0) {
       return 0;
     }
@@ -553,9 +562,9 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BNE = (): number => {
+  private BNE(): number {
     if (this.getFlag(Flags.Z) === 1) {
       return 0;
     }
@@ -563,9 +572,9 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BPL = (): number => {
+  private BPL(): number {
     if (this.getFlag(Flags.N) === 1) {
       return 0;
     }
@@ -573,25 +582,25 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BRK = (): number => {
+  private BRK(): number {
     //todo: find offset of stack
-    const low = this.read(0xfffe);
-    const high = this.read(0xffff);
+    const low = this.bus.read(0xfffe);
+    const high = this.bus.read(0xffff);
 
     this.setFlag(Flags.B, true);
     this.pc = this.pc + 1;
-    this.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
-    this.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
-    this.write(0x100 + this.stkp - 2, this.status);
+    this.bus.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 2, this.status);
     this.setFlag(Flags.I, true);
     this.stkp = this.stkp - 3;
     this.pc = ((high << 8) | low) & 0xffff;
     return 0;
-  };
+  }
 
-  private BVC = (): number => {
+  private BVC(): number {
     if (this.getFlag(Flags.V) === 1) {
       return 0;
     }
@@ -600,9 +609,9 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private BVS = (): number => {
+  private BVS(): number {
     if (this.getFlag(Flags.V) === 0) {
       return 0;
     }
@@ -610,154 +619,154 @@ export class mos6502 {
 
     this.pc = (oldAddress + this.addr) & 0xffff;
     return (this.pc & 0xff00) !== (oldAddress & 0xff00) ? 2 : 1;
-  };
+  }
 
-  private CLC = (): number => {
+  private CLC(): number {
     this.setFlag(Flags.C, false);
     return 0;
-  };
+  }
 
-  private CLD = (): number => {
+  private CLD(): number {
     this.setFlag(Flags.D, false);
     return 0;
-  };
+  }
 
-  private CLI = (): number => {
+  private CLI(): number {
     this.setFlag(Flags.I, false);
     return 0;
-  };
+  }
 
-  private CLV = (): number => {
+  private CLV(): number {
     this.setFlag(Flags.V, false);
     return 0;
-  };
+  }
 
-  private CMP = (): number => {
-    const m = this.read(this.addr);
+  private CMP(): number {
+    const m = this.bus.read(this.addr);
 
     this.setFlag(Flags.Z, this.a === m);
     this.setFlag(Flags.C, this.a >= m);
     this.setFlag(Flags.N, ((this.a - m) & 0xff & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private CPX = (): number => {
-    const m = this.read(this.addr);
+  private CPX(): number {
+    const m = this.bus.read(this.addr);
 
     this.setFlag(Flags.Z, this.x === m);
     this.setFlag(Flags.C, this.x >= m);
     this.setFlag(Flags.N, ((this.x - m) & 0xff & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private CPY = (): number => {
-    const m = this.read(this.addr);
+  private CPY(): number {
+    const m = this.bus.read(this.addr);
 
     this.setFlag(Flags.Z, this.y === m);
     this.setFlag(Flags.C, this.y >= m);
     this.setFlag(Flags.N, ((this.y - m) & 0xff & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private DEC = (): number => {
-    const m = this.read(this.addr);
+  private DEC(): number {
+    const m = this.bus.read(this.addr);
     const result = (m - 1) & 0x00ff;
 
-    this.write(this.addr, result);
+    this.bus.write(this.addr, result);
     this.setFlag(Flags.Z, result === 0);
     this.setFlag(Flags.N, (result & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private DEX = (): number => {
+  private DEX(): number {
     this.x = (this.x - 1) & 0x00ff;
 
     this.setFlag(Flags.Z, this.x === 0x00);
     this.setFlag(Flags.N, (this.x & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private DEY = (): number => {
+  private DEY(): number {
     this.y = (this.y - 1) & 0x00ff;
 
     this.setFlag(Flags.Z, this.y === 0x00);
     this.setFlag(Flags.N, (this.y & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private EOR = (): number => {
-    const m = this.read(this.addr);
+  private EOR(): number {
+    const m = this.bus.read(this.addr);
 
     this.a = this.a ^ m;
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private INC = (): number => {
-    const m = this.read(this.addr);
+  private INC(): number {
+    const m = this.bus.read(this.addr);
     const result = (m + 1) & 0xff;
 
-    this.write(this.addr, result);
+    this.bus.write(this.addr, result);
     this.setFlag(Flags.Z, result == 0x00);
     this.setFlag(Flags.N, (result & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private INX = (): number => {
+  private INX(): number {
     this.x = (this.x + 1) & 0xff;
 
     this.setFlag(Flags.Z, this.x == 0x00);
     this.setFlag(Flags.N, (this.x & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private INY = (): number => {
+  private INY(): number {
     this.y = (this.y + 1) & 0xff;
 
     this.setFlag(Flags.Z, this.y == 0x00);
     this.setFlag(Flags.N, (this.y & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private JMP = (): number => {
+  private JMP(): number {
     this.pc = this.addr;
     return 0;
-  };
+  }
 
-  private JSR = (): number => {
+  private JSR(): number {
     this.pc = this.pc - 1;
-    this.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
-    this.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
+    this.bus.write(0x100 + this.stkp, (this.pc >> 8) & 0x00ff);
+    this.bus.write(0x100 + this.stkp - 1, this.pc & 0x00ff);
     this.stkp = this.stkp - 2;
     this.pc = this.addr;
     return 0;
-  };
+  }
 
-  private LDA = (): number => {
-    this.a = this.read(this.addr);
+  private LDA(): number {
+    this.a = this.bus.read(this.addr);
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private LDX = (): number => {
-    this.x = this.read(this.addr);
+  private LDX(): number {
+    this.x = this.bus.read(this.addr);
     this.setFlag(Flags.Z, this.x === 0x00);
     this.setFlag(Flags.N, (this.x & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private LDY = (): number => {
-    this.y = this.read(this.addr);
+  private LDY(): number {
+    this.y = this.bus.read(this.addr);
     this.setFlag(Flags.Z, this.y === 0x00);
     this.setFlag(Flags.N, (this.y & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private LSR = (): number => {
+  private LSR(): number {
     const implied: boolean = this.currentInstruction.addressing === 'ACC';
-    const data: number = (implied ? this.a : this.read(this.addr)) & 0xff;
+    const data: number = (implied ? this.a : this.bus.read(this.addr)) & 0xff;
     const result: number = (data >> 1) & 0xff;
 
     this.setFlag(Flags.C, (data & 0x01) !== 0);
@@ -766,56 +775,56 @@ export class mos6502 {
     if (implied === true) {
       this.a = result;
     } else {
-      this.write(this.addr, result);
+      this.bus.write(this.addr, result);
     }
     return 0;
-  };
+  }
 
-  private NOP = (): number => {
+  private NOP(): number {
     return 0;
-  };
+  }
 
-  private ORA = (): number => {
-    const m = this.read(this.addr);
+  private ORA(): number {
+    const m = this.bus.read(this.addr);
 
     this.a = this.a | m;
 
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private PHA = (): number => {
-    this.write(0x100 + this.stkp, this.a);
+  private PHA(): number {
+    this.bus.write(0x100 + this.stkp, this.a);
     this.stkp = (this.stkp - 1) & 0xff;
     return 0;
-  };
+  }
 
-  private PHP = (): number => {
-    this.write(0x100 + this.stkp, this.status | 0x30);
+  private PHP(): number {
+    this.bus.write(0x100 + this.stkp, this.status | 0x30);
     this.stkp = (this.stkp - 1) & 0xff;
     return 0;
-  };
+  }
 
-  private PLA = (): number => {
+  private PLA(): number {
     this.stkp = this.stkp + 1;
-    this.a = this.read(0x100 + this.stkp);
+    this.a = this.bus.read(0x100 + this.stkp);
     this.setFlag(Flags.Z, this.a === 0);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private PLP = (): number => {
+  private PLP(): number {
     // break flag set and unused flag set
     this.stkp = (this.stkp + 1) & 0xff;
-    this.status = this.read(0x100 + this.stkp);
+    this.status = this.bus.read(0x100 + this.stkp);
     this.setFlag(Flags.B, false);
     this.setFlag(Flags.A, true);
     return 0;
-  };
+  }
 
-  private ROL = (): number => {
-    const m = this.currentInstruction.addressing === 'ACC' ? this.a : this.read(this.addr);
+  private ROL(): number {
+    const m = this.currentInstruction.addressing === 'ACC' ? this.a : this.bus.read(this.addr);
     const result = (m << 1) | this.getFlag(Flags.C);
 
     this.setFlag(Flags.C, (result & 0x0100) != 0);
@@ -824,13 +833,13 @@ export class mos6502 {
     if (this.currentInstruction.addressing === 'ACC') {
       this.a = result & 0x00ff;
     } else {
-      this.write(this.addr, result & 0x00ff);
+      this.bus.write(this.addr, result & 0x00ff);
     }
     return 0;
-  };
+  }
 
-  private ROR = (): number => {
-    const m = this.currentInstruction.addressing === 'ACC' ? this.a : this.read(this.addr);
+  private ROR(): number {
+    const m = this.currentInstruction.addressing === 'ACC' ? this.a : this.bus.read(this.addr);
     const result = (m >> 1) | (this.getFlag(Flags.C) << 7);
 
     this.setFlag(Flags.C, (m & 0x01) !== 0);
@@ -839,34 +848,34 @@ export class mos6502 {
     if (this.currentInstruction.addressing === 'ACC') {
       this.a = result & 0x00ff;
     } else {
-      this.write(this.addr, result & 0x00ff);
+      this.bus.write(this.addr, result & 0x00ff);
     }
     return 0;
-  };
+  }
 
-  private RTI = (): number => {
+  private RTI(): number {
     // to check back
-    const lo = this.read(0x100 + this.stkp + 2);
-    const hi = this.read(0x100 + this.stkp + 3);
+    const lo = this.bus.read(0x100 + this.stkp + 2);
+    const hi = this.bus.read(0x100 + this.stkp + 3);
 
-    this.status = this.read(0x100 + this.stkp + 1);
+    this.status = this.bus.read(0x100 + this.stkp + 1);
     this.setFlag(Flags.B, true);
     this.pc = (hi << 8) | lo;
     this.stkp = this.stkp + 3;
     return 0;
-  };
+  }
 
-  private RTS = (): number => {
-    const lo = this.read(0x100 + this.stkp + 1);
-    const hi = this.read(0x100 + this.stkp + 2);
+  private RTS(): number {
+    const lo = this.bus.read(0x100 + this.stkp + 1);
+    const hi = this.bus.read(0x100 + this.stkp + 2);
 
     this.pc = ((hi << 8) | lo) + 1;
     this.stkp = (this.stkp + 2) & 0xff;
     return 0;
-  };
+  }
 
-  private SBC = (): number => {
-    const m = this.read(this.addr);
+  private SBC(): number {
+    const m = this.bus.read(this.addr);
     const carry = this.getFlag(Flags.C) ? 1 : 0;
     const decimalMode = this.getFlag(Flags.D);
     let result: number;
@@ -903,87 +912,87 @@ export class mos6502 {
 
     this.a = result & 0xff;
     return 0;
-  };
+  }
 
-  private SEC = (): number => {
+  private SEC(): number {
     this.setFlag(Flags.C, true);
     return 0;
-  };
+  }
 
-  private SED = (): number => {
+  private SED(): number {
     this.setFlag(Flags.D, true);
     return 0;
-  };
+  }
 
-  private SEI = (): number => {
+  private SEI(): number {
     this.setFlag(Flags.I, true);
     return 0;
-  };
+  }
 
-  private STA = (): number => {
-    this.write(this.addr, this.a);
+  private STA(): number {
+    this.bus.write(this.addr, this.a);
     return 0;
-  };
+  }
 
-  private STX = (): number => {
-    this.write(this.addr, this.x);
+  private STX(): number {
+    this.bus.write(this.addr, this.x);
     return 0;
-  };
+  }
 
-  private STY = (): number => {
-    this.write(this.addr, this.y);
+  private STY(): number {
+    this.bus.write(this.addr, this.y);
     return 0;
-  };
+  }
 
-  private TAX = (): number => {
+  private TAX(): number {
     this.x = this.a;
     this.setFlag(Flags.Z, this.x === 0x00);
     this.setFlag(Flags.N, (this.x & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private TAY = (): number => {
+  private TAY(): number {
     this.y = this.a;
     this.setFlag(Flags.Z, this.y === 0x00);
     this.setFlag(Flags.N, (this.y & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private TSX = (): number => {
+  private TSX(): number {
     this.x = this.stkp;
     this.setFlag(Flags.Z, this.x === 0x00);
     this.setFlag(Flags.N, (this.x & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private TXA = (): number => {
+  private TXA(): number {
     this.a = this.x;
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private TXS = (): number => {
+  private TXS(): number {
     this.stkp = this.x;
     return 0;
-  };
+  }
 
-  private TYA = (): number => {
+  private TYA(): number {
     this.a = this.y;
     this.setFlag(Flags.Z, this.a === 0x00);
     this.setFlag(Flags.N, (this.a & 0x80) !== 0);
     return 0;
-  };
+  }
 
-  private ILL = (): number => {
+  private ILL(): number {
     return 0;
-  };
+  }
 
   /**
    * Debug functions
    */
 
-  private getProcessorStatus(start: number) {
+  private getProcessorStatus(start: number): ProcessorStatus {
     const info: Array<DebugInfo> = [];
     let pc = start;
 
@@ -1021,7 +1030,7 @@ export class mos6502 {
       instruction: [],
       disassembly: { operand: 0, addressingMode: 'IMP', instruction: '???' },
     };
-    const opcode = this.read(pc);
+    const opcode = this.bus.read(pc);
     const op = decode(opcode);
 
     info.instruction.push(opcode & 0xff);
@@ -1029,10 +1038,10 @@ export class mos6502 {
     info.disassembly.addressingMode = op.addressing;
     pc++;
     if (info.disassembly.instruction === 'BRK') {
-      info.disassembly.operand = (this.read(0xffff) << 8) | this.read(0xfffe);
+      info.disassembly.operand = (this.bus.read(0xffff) << 8) | this.bus.read(0xfffe);
     }
     if (info.disassembly.addressingMode === 'IMM') {
-      info.instruction.push(this.read(pc));
+      info.instruction.push(this.bus.read(pc));
       info.disassembly.operand = info.instruction[1];
       pc++;
     } else if (
@@ -1041,9 +1050,9 @@ export class mos6502 {
       info.disassembly.addressingMode === 'ABY' ||
       info.disassembly.addressingMode === 'IND'
     ) {
-      info.instruction.push(this.read(pc));
+      info.instruction.push(this.bus.read(pc));
       pc++;
-      info.instruction.push(this.read(pc));
+      info.instruction.push(this.bus.read(pc));
       pc++;
       info.disassembly.operand = ((info.instruction[2] << 8) | info.instruction[1]) & 0xffff;
     } else if (
@@ -1053,11 +1062,11 @@ export class mos6502 {
       info.disassembly.addressingMode === 'ZPX' ||
       info.disassembly.addressingMode === 'ZPY'
     ) {
-      info.instruction.push(this.read(pc));
+      info.instruction.push(this.bus.read(pc));
       pc++;
       info.disassembly.operand = info.instruction[1];
     } else if (info.disassembly.addressingMode === 'REL') {
-      info.instruction.push(this.read(pc));
+      info.instruction.push(this.bus.read(pc));
       pc++;
       const offset = info.instruction[1] > 127 ? info.instruction[1] - 256 : info.instruction[1];
       info.disassembly.operand = pc + offset;

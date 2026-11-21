@@ -3,24 +3,6 @@ import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 
 const ILLEGAL_OPCODE_MNEMONIC = '???';
 
-const IDLE_PROCESSOR_STATUS = { info: [], registers: null };
-
-/**
- * `mos6502` with its per-instruction debug work removed.
- *
- * The base class disassembles the current instruction and snapshots the registers on every
- * instruction boundary even with debug output unused — several objects and extra bus reads, purely
- * to fill a return value nothing here reads. `emulate` dispatches on `this`, so shadowing the method
- * on the subclass prototype removes the whole path. It is shadowed rather than declared as an
- * `override` because the base class types it `private`, so TypeScript will not let a subclass
- * redeclare it. This is the one behavioural adjustment the vendoring makes, and it belongs here in
- * the adapter rather than in the vendored files, which the conversion task keeps to a pure port.
- */
-class QuietMos6502 extends mos6502 {}
-Object.defineProperty(QuietMos6502.prototype, 'getProcessorStatus', {
-  value: () => IDLE_PROCESSOR_STATUS,
-});
-
 /** The instance shape `mos6502` describes. */
 type Mos6502Instance = InstanceType<typeof mos6502>;
 
@@ -65,12 +47,11 @@ class VendorCpu implements Cpu6502 {
   private readonly cpu: Mos6502Instance;
 
   constructor(bus: Cpu6502Bus) {
-    // The core resets inside its own constructor, reading $FFFC/$FFFD back through this callback,
-    // so the bus has to be ready before this runs.
-    this.cpu = new QuietMos6502(
-      (address: number): number => bus.read(address),
-      (address: number, value: number): void => bus.write(address, value),
-    );
+    // The core resets inside its own constructor, reading $FFFC/$FFFD back through the bus, so the
+    // bus has to be ready before this runs. It is handed over as it is: the core calls it directly
+    // at every access, with no wrapper between. Built without `debug`, so a step does none of the
+    // core's disassembly or register snapshotting.
+    this.cpu = new mos6502(bus);
     assertCpuStateKeys(this.cpu as unknown as Record<string, unknown>);
   }
 
@@ -88,22 +69,45 @@ class VendorCpu implements Cpu6502 {
 
   getState(): CpuState {
     const state: Record<string, unknown> = {};
-    this.copyStateInto(state);
+    const record = this.cpu as unknown as Record<string, unknown>;
+    for (const key of CPU_STATE_KEYS) {
+      state[key] = record[key];
+    }
     return state;
   }
 
+  /**
+   * Written out field by field rather than looped over `CPU_STATE_KEYS`: a keyed load of a field the
+   * core holds as a double (`addr`, `cycle`) boxes a fresh number on every call, and a capture on the
+   * frame path copies this every few frames. Keep it in step with `CPU_STATE_KEYS`;
+   * `vendor-cpu.spec.ts` compares the two.
+   */
   copyStateInto(target: Record<string, unknown>): void {
-    const record = this.cpu as unknown as Record<string, unknown>;
-    for (const key of CPU_STATE_KEYS) {
-      target[key] = record[key];
-    }
+    const cpu = this.cpu as unknown as Record<string, unknown>;
+    target.a = cpu.a;
+    target.x = cpu.x;
+    target.y = cpu.y;
+    target.pc = cpu.pc;
+    target.stkp = cpu.stkp;
+    target.status = cpu.status;
+    target.addr = cpu.addr;
+    target.currentInstruction = cpu.currentInstruction;
+    target.cycle = cpu.cycle;
   }
 
+  /** Field by field for the reason `copyStateInto` is: a lap and a hand-off restore on the frame
+   *  path. Keep it in step with `CPU_STATE_KEYS`. */
   setState(state: CpuState): void {
-    const record = this.cpu as unknown as Record<string, unknown>;
-    for (const key of CPU_STATE_KEYS) {
-      record[key] = state[key];
-    }
+    const cpu = this.cpu as unknown as Record<string, unknown>;
+    cpu.a = state.a;
+    cpu.x = state.x;
+    cpu.y = state.y;
+    cpu.pc = state.pc;
+    cpu.stkp = state.stkp;
+    cpu.status = state.status;
+    cpu.addr = state.addr;
+    cpu.currentInstruction = state.currentInstruction;
+    cpu.cycle = state.cycle;
   }
 }
 

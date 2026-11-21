@@ -56,7 +56,7 @@ export interface SidSink {
   end(): void;
 
   /** Hands one frame over with the host time it is due, on the same timeline the clock
-   *  reports (`performance.now()` milliseconds). `frameNumber` is the timeline position this
+   *  reports (the host's `TimeSource` timeline). `frameNumber` is the timeline position this
    *  frame represents — it is what lets a sink that can read its far end say *what* was
    *  consumed rather than only how much is outstanding. `catchUpClamped` marks a frame whose
    *  due time is later than the truth because its clock advance hit the catch-up ceiling —
@@ -86,4 +86,21 @@ export interface SidSink {
    *  far end — that is `end()`, and the two are separate because a seek resets without stopping. */
   reset(): void;
   readAt(): FarEndConsumption;
+
+  /** How many of the frames handed to `deliver` since the last `begin` or `reset` this sink has passed to
+   *  a port that cannot take them back. Never more than it was given; never decreases until `begin`/`reset`.
+   *
+   *  A sink that holds nothing — it sends every frame on to its port as it arrives — has passed all of
+   *  them, so it returns the number of `deliver` calls. That is why this is on the contract rather than
+   *  behind a capability: every sink can honour it, trivially if need be. */
+  passedCount(): number;
+  /** Drops every frame this sink still holds from the `fromCount`-th `deliver` since the last `begin` or
+   *  `reset` (counting from 0) on, so the host can deliver replacements. Frames already passed are not
+   *  touched. Returns where the replacements begin: `r = min(max(fromCount, passedCount()), delivered)`.
+   *  The delivery count rewinds to `r`, so the next `deliver` is counted as delivery `r`.
+   *
+   *  Counts are per `deliver` call, not frame numbers: frame numbers are positions, which go back at
+   *  every loop wrap. `deliverNow` frames go out at once, so they are neither counted nor replaceable.
+   *  A sink that holds nothing drops nothing and returns the number of `deliver` calls. */
+  replaceFrom(fromCount: number): number;
 }

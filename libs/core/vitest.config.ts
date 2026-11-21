@@ -5,5 +5,9 @@ export default defineConfig({
     environment: 'node',
     include: ['src/**/*.spec.ts'],
     passWithNoTests: true,
+    // Forked workers, started with --expose-gc so a spec can force a collection and read the heap
+    // (testing/measure-allocation.ts). The worker_threads pool cannot take V8 flags per worker.
+    pool: 'forks',
+    execArgv: ['--expose-gc'],
   },
 });

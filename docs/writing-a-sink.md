@@ -41,6 +41,22 @@ almost nothing unused, while narrowing a shipped one means rewriting both ends.
 - **`readAt()`** — what the far end has consumed, as a `FarEndConsumption`. `{ kind: 'unknown',
 inFlight }` is a legitimate answer, not a failure — but a sink that knows its own queue depth must
   report it even when it cannot report what actually played.
+- **`passedCount()`** — how many of the frames handed to `deliver` since the last `begin` or `reset`
+  the sink has passed to a port that cannot take them back. Never more than it was given, and never
+  decreasing until the next `begin`/`reset`.
+- **`replaceFrom(fromCount)`** — drops every frame the sink still holds from the `fromCount`-th
+  `deliver` since the last `begin`/`reset` (counting from 0) on, so the host can deliver replacements.
+  It returns where the replacements begin, `min(max(fromCount, passedCount()), delivered)`, and the
+  delivery count rewinds to that, so the next `deliver` is counted as delivery `r`. Frames already
+  passed are not touched.
+
+  Counts are per `deliver` call, not frame numbers — frame numbers are positions, which go back at
+  every loop wrap. `deliverNow` frames go out at once, so they are neither counted nor replaceable.
+
+  These two are not behind a capability, though the rule below says a capability a sink cannot honour
+  is a flag rather than a throw: every sink can honour them. A sink that holds nothing — ASID sends
+  each frame to its port at once, stamped ahead — has passed every frame, so `passedCount()` is the
+  number of `deliver` calls and `replaceFrom` drops nothing and returns that number.
 
 ## What a capability flag means
 
@@ -96,7 +112,12 @@ that never needs it never pulls it in) is the suite every `SidSink` implementati
 itself. It exercises exactly the behaviours the contract above states in words: write ordering,
 gate-off draining ahead of a resync, clean recovery from underrun, honouring `cancellation` and
 `perWriteOffsets` correctly whichever way a sink answers them, `reset` actually dropping what is
-outstanding, and `readAt().inFlight` staying accurate regardless of `FarEndConsumption`'s `kind`.
+outstanding, `readAt().inFlight` staying accurate regardless of `FarEndConsumption`'s `kind`, and the
+two counts above: `passedCount` bounded by the deliveries and never decreasing, `replaceFrom` returning
+where replacements begin, a dropped frame never reaching the wire, and `begin`/`reset` restarting both.
+
+`SINK_REPLACE_CASES`, the last five, are also exported alone. A recorder with no notion of time, such as
+core's `FakeSink`, cannot pass the schedule cases but can be held to those.
 
 A consumer hands the suite one thing: a `ConformanceHarness` — a fresh `sink`, an `emitted()` reader
 and an `advanceMs()` that drives whatever notion of time the sink schedules against. Once that harness
@@ -112,7 +133,7 @@ The harness is where the real work is, and it is necessarily sink-specific — `
 decode the sink's own wire format back into `{ register, value }` pairs, because a sink that cannot
 show what it actually sent cannot be conformance-tested at all. `libs/asid`'s
 `sink/conformance.spec.ts` is the worked example: its `makeHarness()` wraps a fake `MidiOutputPort`,
-decodes ASID's present/MSB masks back into register writes, and advances a mocked `performance.now()`
+decodes ASID's present/MSB masks back into register writes, and advances the `TimeSource` it hands the sink
 so `advanceMs` releases whatever is due. A case a new sink fails is the suite doing its job — the sink
 needs to change, not the case.
 

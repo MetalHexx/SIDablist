@@ -31,8 +31,9 @@ moving the boundary is a decision rather than an import.
 
 ### `libs/core` touches no browser global
 
-No `window`, `document`, `navigator`, `localStorage`. Everything environmental arrives through an
-injected port. Lint enforces it; the no-dependency CI build catches what lint misses. A library
+No `window`, `document`, `navigator`, `localStorage`, and no `performance`, `console` or
+`new Worker(...)` in `libs/core/src` or `libs/asid/src` outside specs: time, the log and the worker
+come from the host. Everything environmental arrives through an injected port. Lint enforces it; the no-dependency CI build catches what lint misses. A library
 that quietly assumes a browser cannot run under Node, under Electron, or in a test without one.
 
 ### Dependencies point inward, and the package manager enforces it
@@ -46,7 +47,7 @@ dependency the package manager rejects, not a convention someone has to remember
 Frame delivery runs fifty times a second. Code on that path reuses typed arrays
 deliberately and says so in comments. Do not wrap it in value objects, getters, or immutable
 structures for readability. Speed is the acceptance bar there, and a regression is audible rather
-than visible — no test will catch it for you.
+than visible; core's allocation specs measure the engine's tick path (see `libs/core/AGENTS.md`).
 
 ### Ear-validated constants are not tunable settings
 

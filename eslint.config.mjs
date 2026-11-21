@@ -42,6 +42,35 @@ export default tseslint.config(
     },
   },
   {
+    // Core and the ASID sink read no clock, write to no console and build no worker: the host
+    // supplies a `TimeSource`, an `EngineLog` and a worker factory. `Worker` the type stays usable
+    // (the factory's signature), so only its construction is banned. Flat config replaces a rule's
+    // options in a later matching block, so the four browser names are repeated here.
+    files: ['libs/core/src/**/*.ts', 'libs/asid/src/**/*.ts'],
+    ignores: ['**/*.spec.ts', 'libs/core/src/testing/**', 'libs/asid/src/web-midi/**'],
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        { name: 'window', message: 'core takes environment through an injected port' },
+        { name: 'document', message: 'core takes environment through an injected port' },
+        { name: 'navigator', message: 'core takes environment through an injected port' },
+        {
+          name: 'localStorage',
+          message: 'core holds values; the application decides what persists',
+        },
+        { name: 'console', message: 'report through the injected EngineLog' },
+        { name: 'performance', message: 'read time through the injected TimeSource' },
+      ],
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector: "NewExpression[callee.name='Worker']",
+          message: 'the host makes the worker and passes a factory',
+        },
+      ],
+    },
+  },
+  {
     files: ['libs/core/src/vendor/**/*.ts'],
     rules: stylisticRulesOff,
   },

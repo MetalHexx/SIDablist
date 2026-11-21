@@ -1,15 +1,12 @@
 import { describeError } from '../common/errors.js';
 import { clamp } from '../common/math.js';
-import {
-  DEFAULT_TIMING_MODE,
-  msToPlayCalls,
-  playCallIntervalUs,
-  playRateFor,
-} from '../clock/play-rate.js';
+import { DEFAULT_TIMING_MODE, msToPlayCalls, playCallIntervalUsAt } from '../clock/play-rate.js';
 import type { PlayRate, TimingMode } from '../clock/play-rate.js';
 import type { C64Machine, FrameResult } from '../cpu/c64-machine.js';
 import type { FrameClock } from '../ports/clock.js';
+import type { EngineLog } from '../ports/log.js';
 import type { SidSink } from '../ports/sink.js';
+import type { TimeSource } from '../ports/time.js';
 import { clockRatio, NTSC_PHI2_HZ, PAL_PHI2_HZ } from '../registers/clock-ratio.js';
 import { FILTER_MODE_BITS, createRegisterFrame } from '../registers/register-frame.js';
 import type {
@@ -20,7 +17,12 @@ import type {
 import { isUsableRegisterRecord } from '../registers/register-record.js';
 import type { RegisterRecord } from '../registers/register-record.js';
 import type { SidFrame } from '../registers/sid-frame.js';
-import { isUsableHold, isUsableOffset, resolveSidField } from '../registers/sid-fields.js';
+import {
+  SID_FIELD_TABLE,
+  isUsableHold,
+  isUsableOffset,
+  resolveSidField,
+} from '../registers/sid-fields.js';
 import type { SidField } from '../registers/sid-fields.js';
 import {
   NTSC_FRAME_INTERVAL_US,
@@ -37,7 +39,12 @@ import {
   createActiveLoopTracker,
   isUsableLoopLength,
 } from '../timeline/active-loop.js';
-import type { ActiveLoop, ActiveLoopTracker, AdvanceResult } from '../timeline/active-loop.js';
+import type {
+  ActiveLoop,
+  ActiveLoopTracker,
+  AdvanceResult,
+  LoopChange,
+} from '../timeline/active-loop.js';
 import { createAnchorRing } from '../timeline/anchor-ring.js';
 import type { AnchorRing, PositionAnchor } from '../timeline/anchor-ring.js';
 import {
@@ -59,7 +66,15 @@ import { cycles, frames, microseconds, milliseconds } from '../units.js';
 import type { Cycles, Frames, Microseconds, Milliseconds } from '../units.js';
 import { DeliveryHistory } from './delivery-history.js';
 import type { DeliveryBatch } from './delivery-history.js';
-import type { SidPlayer, VarispeedRateSource } from './sid-player.js';
+import {
+  SCALED_GROUPS,
+  SavedState,
+  asSavedPlayerState,
+  readSavedState,
+  scaleSlot,
+} from './saved-state.js';
+import type { FieldHoldRecord, FieldOffsetRecord, PreparedSettings } from './saved-state.js';
+import type { SavedPlayerState, SidPlayer, VarispeedRateSource } from './sid-player.js';
 import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './snapshot.js';
 import { createPlayerSnapshotStore } from './store.js';
 import type { PlayerSnapshotStore } from './store.js';
@@ -93,7 +108,7 @@ const SEEK_REACH_MS = milliseconds(1000);
 const MICROSECONDS_PER_MILLISECOND = 1000;
 
 /**
- * Loop entry images kept at once. Each is a 64 KB machine image plus a register shadow, so this is
+ * Loop entry images kept at once. Each is a 68 KB machine image plus a register shadow, so this is
  * the same memory-against-replay-distance trade `AnchorRing`'s own size is, and it is held at the
  * same number for the same reason.
  *
@@ -136,37 +151,6 @@ function isRunnableLoop(
   );
 }
 
-/** A field hold as the coordinator carries it into every tune loaded after. */
-interface FieldHoldRecord {
-  readonly field: SidField;
-  readonly value: number;
-  readonly amount: number;
-}
-
-/** A field offset as the coordinator carries it into every tune loaded after. */
-interface FieldOffsetRecord {
-  readonly field: SidField;
-  readonly amount: number;
-}
-
-/**
- * `JumpSettings` resolved at the call that carried them: every entry validated, every field
- * resolved to its table index, and every record the coordinator carries built once. Landing them is
- * then only assignment, which is what keeps it off the allocation budget of the frame it lands on.
- */
-interface PreparedSettings {
-  readonly pitches: readonly { readonly voice: number; readonly coefficient: number }[];
-  /** An amount of 0 hands the field back. */
-  readonly offsets: readonly { readonly index: number; readonly record: FieldOffsetRecord }[];
-  /** A null record releases the field. */
-  readonly holds: readonly {
-    readonly index: number;
-    readonly field: SidField;
-    readonly record: FieldHoldRecord | null;
-  }[];
-  readonly mutes: readonly { readonly voice: number; readonly muted: boolean }[];
-}
-
 /** What a player is built around: the far end it streams to, the cadence it rides, and the thread a
  *  jump replays on. Every one of them is injected — core constructs none of them. */
 export interface SidPlayerCollaborators {
@@ -176,6 +160,10 @@ export interface SidPlayerCollaborators {
   /** Runs prepared-snapshot builds. Supply a second runner (its own worker) so a scrub never
    *  waits behind a batch of builds; when absent, builds share `replayRunner`'s queue. */
   readonly prepareRunner?: ReplayRunner;
+  /** The host's time, on the timeline the clock's `dueAtMs` uses. */
+  readonly time: TimeSource;
+  /** Where rejected input and failures are reported; absent means silent. */
+  readonly log?: EngineLog;
 }
 
 /** An entry image and what is known about how it was taken. */
@@ -222,6 +210,8 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly clock: FrameClock;
   private readonly replayRunner: ReplayRunner;
   private readonly prepareRunner: ReplayRunner | undefined;
+  private readonly time: TimeSource;
+  private readonly log: EngineLog | undefined;
   private readonly session: TuneSession;
   private readonly store: PlayerSnapshotStore;
 
@@ -244,14 +234,18 @@ class SidPlayerCoordinator implements SidPlayer {
   private nominalIntervalUs: Microseconds = microseconds(PAL_FRAME_INTERVAL_US);
   private timingMode: TimingMode = DEFAULT_TIMING_MODE;
   /** The machine's two rates, mirrored on every subtune init — the CIA latch is only meaningful once
-   *  init has run, so this cannot be read at load time. */
-  private machineRates: { readonly exact: number; readonly rounded: number } = {
-    exact: 1,
-    rounded: 1,
-  };
-  /** What the clock was last handed, or null before it has ever started — the rate diagnostics
-   *  report, rather than one derived from a tempo that may have changed while stopped. */
-  private runningIntervalUs: Microseconds | null = null;
+   *  init has run, so this cannot be read at load time — and kept in step by `followPlayRate` after
+   *  every tick and every restore, since the tune can change its own rate and an image carries the one
+   *  it was taken at. Two numbers rather than an object, so a sync builds nothing. */
+  private machineExactRate = 1;
+  private machineRoundedRate = 1;
+  /** Where `mirrorMachineRates` has the machine write its two rates. */
+  private readonly machineRates = new Float64Array(2);
+  /** What the clock was last handed, or NaN before it has ever started — the rate diagnostics
+   *  report, rather than one derived from a tempo that may have changed while stopped. A number
+   *  rather than a nullable one: V8 boxes every fractional store into a field that can also hold
+   *  null, and this is stored on every tick of a tune that keeps changing its rate. */
+  private runningIntervalUs = microseconds(Number.NaN);
 
   private readonly mutedVoices = [false, false, false];
   private readonly heldVoices = [false, false, false];
@@ -259,12 +253,20 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Held so a fresh `RegisterFrame` built by `loadTune` inherits them — otherwise every tune load
    *  would silently reset the output to full, at home, with no field held or offset. */
   private outputGain = 1;
-  private readonly registerScales = new Map<ScaledRegisterGroup, number>();
-  /** Keyed by the field's table index, so the same field named by two different objects is one
-   *  hold. The filter-type override is a hold of `filterType` here and has no state of its own. */
-  private readonly fieldHolds = new Map<number, FieldHoldRecord>();
-  /** Keyed like `fieldHolds`; an amount of 0 is never stored. */
-  private readonly fieldOffsets = new Map<number, FieldOffsetRecord>();
+  /** Each group's coefficient at its `scaleSlot`, NaN for a group never scaled. A fixed array, not a
+   *  `Map`, so a saved state copies it without allocating. */
+  private readonly registerScales = new Float64Array(SCALED_GROUPS.length).fill(Number.NaN);
+  /** Indexed by the field's table index, so the same field named by two different objects is one
+   *  hold; null for a field not held. The records are never mutated, so a saved state holds them by
+   *  reference. The filter-type override is a hold of `filterType` here and has no state of its
+   *  own. */
+  private readonly fieldHolds = new Array<FieldHoldRecord | null>(SID_FIELD_TABLE.length).fill(
+    null,
+  );
+  /** Indexed like `fieldHolds`; an amount of 0 is never stored. */
+  private readonly fieldOffsets = new Array<FieldOffsetRecord | null>(SID_FIELD_TABLE.length).fill(
+    null,
+  );
 
   /** The φ2 of the machine on the far end. Null until the application — the only thing that knows
    *  what machine that is — names one, and null again once it no longer knows; null plays the tune's
@@ -273,7 +275,7 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The φ2 the loaded tune was written for, read from its header on every load — never carried from
    *  the tune before, and never the application's to supply. */
   private tuneClockHz = PAL_PHI2_HZ;
-  private readonly voicePitch = [1, 1, 1];
+  private readonly voicePitch = new Float64Array(VOICE_COUNT).fill(1);
 
   /** What the host asked to keep of the deliveries, or null while it has not. Held here rather than
    *  on the session or the register frame: `session.load` builds a new frame, and the request must
@@ -300,6 +302,11 @@ class SidPlayerCoordinator implements SidPlayer {
   /** True from `enterVarispeed` until live playback or the paused landing takes over. The clock's
    *  ticks go to `varispeedTick` meanwhile, whatever the transport reads. */
   private varispeedActive = false;
+  /** The loop, pending change and varispeed flag the snapshot last built published, so a lap can tell
+   *  whether it moved any of them without building one to compare. */
+  private publishedLoop: ActiveLoop = null;
+  private publishedChange: LoopChange | null = null;
+  private publishedVarispeed = false;
   /** Asked for the rate once a tick; null outside varispeed and while handing back. */
   private rateSource: VarispeedRateSource | null = null;
   /** The host has left varispeed while playing: the record plays at rate 1 until the machine's
@@ -340,6 +347,12 @@ class SidPlayerCoordinator implements SidPlayer {
   private readonly loopEntry: ImageBuffer = createImageBuffer();
   /** Whether `loopEntry` holds an image of the machine now loaded. */
   private loopEntryFilled = false;
+  /** Which fill `loopEntry` holds: every fill takes the next number of `imageVersions`, and a restore
+   *  puts back the number of the content it copies in. A saved state copies the buffer only when
+   *  its own copy is another fill, so saving every frame costs a copy per fill, not per frame. */
+  private loopEntryVersion = 0;
+  /** Only rises, and is never put back by a restore, so a version names one fill for good. */
+  private imageVersions = 0;
 
   /** The frames the host asked to be able to jump to instantly, normalised the way `seek` is. */
   private readonly declared = new Set<number>();
@@ -370,6 +383,14 @@ class SidPlayerCoordinator implements SidPlayer {
    *  what an in-flight capture checks it is still answering for. */
   private queuedJump: QueuedJump | null = null;
 
+  /** The settings the queued jump lands with, prepared when it was queued — what the tracker's
+   *  `beforeLanding` hook applies. Held here, not in a closure, so a saved state can reference
+   *  them. Null when none were given, and whenever `queuedJump` is. */
+  private queuedSettings: PreparedSettings | null = null;
+  private readonly landQueuedSettings = (): void => {
+    if (this.queuedSettings !== null) this.applyPreparedSettings(this.queuedSettings);
+  };
+
   /** Queued jumps handed off to since the tune and subtune loaded. Incremented on a landing only. */
   private handOffs = 0;
 
@@ -391,21 +412,21 @@ class SidPlayerCoordinator implements SidPlayer {
     this.clock = collaborators.clock;
     this.replayRunner = collaborators.replayRunner;
     this.prepareRunner = collaborators.prepareRunner;
+    this.time = collaborators.time;
+    this.log = collaborators.log;
     this.session = createTuneSession(collaborators.replayRunner, {
       nominalIntervalUs: () => this.nominalIntervalUs,
       playRate: () => this.playRate(),
       syncPlayRate: (machine) => {
-        const rate = playRateFor(machine, this.timingMode);
-        this.machineRates = {
-          exact: rate.exactCallsPerFrame,
-          rounded: rate.roundedCallsPerFrame,
-        };
+        this.mirrorMachineRates(machine);
       },
+      followPlayRate: () => this.followPlayRate(),
       effectiveMutes: () => this.effectiveMutes(),
       clearError: () => {
         this.error = null;
       },
       fail: (reason) => this.fail(reason),
+      warn: (message) => this.log?.warn(message),
       // A restore (seek, scrub, jump landing) moves the playhead, so the stream is discontinuous
       // here. Restarting before the resync means a paused landing's immediate frame is recorded into
       // the fresh history.
@@ -458,8 +479,8 @@ class SidPlayerCoordinator implements SidPlayer {
       emitted: frame?.emittedValues() ?? EMPTY_EMITTED,
       resync: { inFlightDepth: this.gateOffOwed ? 1 : 0 },
       rate: {
-        exactCallsPerFrame: this.machineRates.exact,
-        roundedCallsPerFrame: this.machineRates.rounded,
+        exactCallsPerFrame: this.machineExactRate,
+        roundedCallsPerFrame: this.machineRoundedRate,
       },
     };
   }
@@ -498,7 +519,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.discardOutstandingJump();
     this.declared.clear();
     this.dropPreparedImages();
-    this.queuedJump = null;
+    this.forgetQueuedJump();
     this.activeLoop.queue(null);
     this.session.load(file);
     this.history?.restart();
@@ -514,14 +535,15 @@ class SidPlayerCoordinator implements SidPlayer {
     // emit a packet at the wrong setting.
     const frame = this.session.frame;
     frame?.setOutputGain(this.outputGain);
-    for (const [group, coefficient] of this.registerScales) {
-      frame?.setRegisterScale(group, coefficient);
+    for (let slot = 0; slot < SCALED_GROUPS.length; slot++) {
+      const coefficient = this.registerScales[slot];
+      if (!Number.isNaN(coefficient)) frame?.setRegisterScale(SCALED_GROUPS[slot], coefficient);
     }
-    for (const hold of this.fieldHolds.values()) {
-      frame?.holdField(hold.field, hold.value, hold.amount);
+    for (const hold of this.fieldHolds) {
+      if (hold !== null) frame?.holdField(hold.field, hold.value, hold.amount);
     }
-    for (const offset of this.fieldOffsets.values()) {
-      frame?.setFieldOffset(offset.field, offset.amount);
+    for (const offset of this.fieldOffsets) {
+      if (offset !== null) frame?.setFieldOffset(offset.field, offset.amount);
     }
     this.applyPitch();
 
@@ -735,7 +757,7 @@ class SidPlayerCoordinator implements SidPlayer {
     // declarations go before the recaptures below, which skip a declared frame.
     this.dropEntryImages();
     this.declared.clear();
-    this.queuedJump = null;
+    this.forgetQueuedJump();
     this.activeLoop.queue(null);
     this.activeLoop.cancelChange();
     this.handOffs = 0;
@@ -759,12 +781,12 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setActiveLoop(loop: ActiveLoop): void {
     if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a loop of ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
       );
       return;
     }
-    this.queuedJump = null;
+    this.forgetQueuedJump();
     this.activeLoop.set(loop);
     // A loop already captured for this machine is armed with its image straight away, so the seek a
     // trigger, an audition or a queued hand-off makes right after this one lands instantly rather
@@ -790,7 +812,7 @@ class SidPlayerCoordinator implements SidPlayer {
       !(loop.endFrame > loop.startFrame) ||
       !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)
     ) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a loop change at ${frame} to ${loop.startFrame}-${loop.endFrame}.`,
       );
       return false;
@@ -813,7 +835,7 @@ class SidPlayerCoordinator implements SidPlayer {
         !Number.isFinite(line.keep) ||
         line.keep < 1
       ) {
-        console.warn(
+        this.log?.warn(
           `SID player: ignoring crossing lines from ${line.originFrame} every ${line.periodFrames} keeping ${line.keep}.`,
         );
         continue;
@@ -833,13 +855,13 @@ class SidPlayerCoordinator implements SidPlayer {
 
   queueJump(target: (QueuedJump & { readonly settings?: JumpSettings }) | null): void {
     if (target === null) {
-      this.queuedJump = null;
+      this.forgetQueuedJump();
       this.activeLoop.queue(null);
       this.markDirty();
       return;
     }
     if (!Number.isFinite(target.startFrame)) {
-      console.warn(`SID player: ignoring a queued jump to ${target.startFrame}.`);
+      this.log?.warn(`SID player: ignoring a queued jump to ${target.startFrame}.`);
       return;
     }
     const startFrame = frames(Math.max(0, Math.round(target.startFrame)));
@@ -851,18 +873,18 @@ class SidPlayerCoordinator implements SidPlayer {
       endFrame !== null &&
       (!(endFrame > startFrame) || !isRunnableLoop(startFrame, endFrame, lapPhase))
     ) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a queued jump to ${startFrame} ending at ${target.endFrame} at lap phase ${lapPhase}.`,
       );
       return;
     }
     if (this.activeLoop.get() === null) {
-      console.warn(`SID player: ignoring a queued jump to ${startFrame} with no loop running.`);
+      this.log?.warn(`SID player: ignoring a queued jump to ${startFrame} with no loop running.`);
       return;
     }
 
-    // The published record never carries settings: they live only on the tracker's queued object,
-    // and go when it does.
+    // The published record never carries settings: they are held apart in `queuedSettings`, which
+    // the tracker's hook reads when the jump lands, and go when the queue does.
     const prepared = target.settings === undefined ? null : this.prepareSettings(target.settings);
     const varispeedStart = endFrame === null ? undefined : target.varispeedStart;
     const record: QueuedJump = {
@@ -872,6 +894,7 @@ class SidPlayerCoordinator implements SidPlayer {
       ...(lapPhase === undefined ? {} : { lapPhase }),
     };
     this.queuedJump = record;
+    this.queuedSettings = prepared;
     this.activeLoop.queue({
       startFrame,
       loop:
@@ -883,17 +906,24 @@ class SidPlayerCoordinator implements SidPlayer {
               ...(varispeedStart === undefined ? {} : { varispeedStart }),
               ...(lapPhase === undefined ? {} : { lapPhase }),
             },
-      ...(prepared === null ? {} : { beforeLanding: () => this.applyPreparedSettings(prepared) }),
+      ...(prepared === null ? {} : { beforeLanding: this.landQueuedSettings }),
     });
     this.armQueuedImage(record);
     this.markDirty();
+  }
+
+  /** Drops the queued jump's published record and the settings it would have landed with. The
+   *  tracker's own queue is the caller's to drop: some callers' tracker call already does. */
+  private forgetQueuedJump(): void {
+    this.queuedJump = null;
+    this.queuedSettings = null;
   }
 
   setJumpTargets(requested: readonly Frames[]): void {
     this.declared.clear();
     for (const requestedFrame of requested) {
       if (!Number.isFinite(requestedFrame)) {
-        console.warn(`SID player: ignoring a jump target of ${requestedFrame}.`);
+        this.log?.warn(`SID player: ignoring a jump target of ${requestedFrame}.`);
         continue;
       }
       this.declared.add(Math.max(0, Math.round(requestedFrame)));
@@ -990,11 +1020,11 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setRegisterRecord(record: RegisterRecord | null): void {
     if (this.varispeedActive) {
-      console.warn('SID player: ignoring a register record while in varispeed.');
+      this.log?.warn('SID player: ignoring a register record while in varispeed.');
       return;
     }
     if (record !== null && !isUsableRegisterRecord(record)) {
-      console.warn('SID player: ignoring a register record of an unusable shape.');
+      this.log?.warn('SID player: ignoring a register record of an unusable shape.');
       return;
     }
     this.varispeed.setRecord(record);
@@ -1086,7 +1116,7 @@ class SidPlayerCoordinator implements SidPlayer {
       return false;
     }
     if (!Number.isFinite(target) || (lapPhase !== undefined && !Number.isFinite(lapPhase))) {
-      console.warn(`SID player: ignoring a landing on ${target} at lap phase ${lapPhase}.`);
+      this.log?.warn(`SID player: ignoring a landing on ${target} at lap phase ${lapPhase}.`);
       return false;
     }
     const landing = frames(Math.max(0, Math.round(target)));
@@ -1152,11 +1182,11 @@ class SidPlayerCoordinator implements SidPlayer {
       (lapPhase !== undefined && !Number.isFinite(lapPhase)) ||
       (loop !== null && (!Number.isFinite(loop.startFrame) || !Number.isFinite(loop.endFrame)))
     ) {
-      console.warn('SID player: ignoring a shadow started on a frame that is not a number.');
+      this.log?.warn('SID player: ignoring a shadow started on a frame that is not a number.');
       return false;
     }
     if (loop !== null && !isRunnableLoop(loop.startFrame, loop.endFrame, loop.lapPhase)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a shadow lapping ${loop.startFrame}-${loop.endFrame} at lap phase ${loop.lapPhase}.`,
       );
       return false;
@@ -1216,7 +1246,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  by. */
   setTempo(multiplier: number): void {
     if (!Number.isFinite(multiplier) || multiplier <= 0) {
-      console.warn(`SID player: ignoring a tempo multiplier of ${multiplier}.`);
+      this.log?.warn(`SID player: ignoring a tempo multiplier of ${multiplier}.`);
       return;
     }
     this.tempoMultiplier = multiplier;
@@ -1225,7 +1255,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   setNominalIntervalUs(us: Microseconds): void {
     if (!Number.isFinite(us) || us <= 0) {
-      console.warn(`SID player: ignoring a nominal interval of ${us} µs.`);
+      this.log?.warn(`SID player: ignoring a nominal interval of ${us} µs.`);
       return;
     }
     this.nominalIntervalUs = us;
@@ -1270,7 +1300,7 @@ class SidPlayerCoordinator implements SidPlayer {
    *  which a typed-array write silently coerces to 0 and mutes the channel instead of erroring. */
   setOutputGain(gain: number): void {
     if (!Number.isFinite(gain) || gain < 0 || gain > 1) {
-      console.warn(`SID player: ignoring an output gain of ${gain} (must be 0…1).`);
+      this.log?.warn(`SID player: ignoring an output gain of ${gain} (must be 0…1).`);
       return;
     }
     this.outputGain = gain;
@@ -1278,7 +1308,7 @@ class SidPlayerCoordinator implements SidPlayer {
   }
 
   setRegisterScale(group: ScaledRegisterGroup, coefficient: number): void {
-    this.registerScales.set(group, coefficient);
+    this.registerScales[scaleSlot(group)] = coefficient;
     this.session.frame?.setRegisterScale(group, coefficient);
   }
 
@@ -1289,22 +1319,22 @@ class SidPlayerCoordinator implements SidPlayer {
   holdField(field: SidField, value: number, amount = 1): void {
     const index = resolveSidField(field);
     if (!isUsableHold(index, value, amount)) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a hold of ${value} (amount ${amount}) on ${describeField(field)}.`,
       );
       return;
     }
-    this.fieldHolds.set(index, { field: { ...field }, value, amount });
+    this.fieldHolds[index] = { field: { ...field }, value, amount };
     this.session.frame?.holdField(field, value, amount);
   }
 
   releaseField(field: SidField): void {
     const index = resolveSidField(field);
     if (index < 0) {
-      console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring a release of ${describeField(field)}.`);
       return;
     }
-    this.fieldHolds.delete(index);
+    this.fieldHolds[index] = null;
     this.session.frame?.releaseField(field);
   }
 
@@ -1316,24 +1346,20 @@ class SidPlayerCoordinator implements SidPlayer {
   setFieldOffset(field: SidField, amount: number): void {
     const index = resolveSidField(field);
     if (!isUsableOffset(index, amount)) {
-      console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
       return;
     }
-    if (amount === 0) {
-      this.fieldOffsets.delete(index);
-    } else {
-      this.fieldOffsets.set(index, { field: { ...field }, amount });
-    }
+    this.fieldOffsets[index] = amount === 0 ? null : { field: { ...field }, amount };
     this.session.frame?.setFieldOffset(field, amount);
   }
 
   clearFieldOffset(field: SidField): void {
     const index = resolveSidField(field);
     if (index < 0) {
-      console.warn(`SID player: ignoring an offset release of ${describeField(field)}.`);
+      this.log?.warn(`SID player: ignoring an offset release of ${describeField(field)}.`);
       return;
     }
-    this.fieldOffsets.delete(index);
+    this.fieldOffsets[index] = null;
     this.session.frame?.clearFieldOffset(field);
   }
 
@@ -1348,7 +1374,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (let voice = 0; voice < Math.min(voicePitch.length, VOICE_COUNT); voice++) {
       const coefficient = voicePitch[voice];
       if (!Number.isFinite(coefficient) || coefficient <= 0) {
-        console.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
+        this.log?.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
         continue;
       }
       pitches.push({ voice, coefficient });
@@ -1358,7 +1384,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (const { field, amount } of settings.fieldOffsets ?? []) {
       const index = resolveSidField(field);
       if (!isUsableOffset(index, amount)) {
-        console.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
+        this.log?.warn(`SID player: ignoring an offset of ${amount} on ${describeField(field)}.`);
         continue;
       }
       offsets.push({ index, record: { field: { ...field }, amount } });
@@ -1370,7 +1396,7 @@ class SidPlayerCoordinator implements SidPlayer {
       const carried = { ...field };
       if (value === null) {
         if (index < 0) {
-          console.warn(`SID player: ignoring a release of ${describeField(field)}.`);
+          this.log?.warn(`SID player: ignoring a release of ${describeField(field)}.`);
           continue;
         }
         holds.push({ index, field: carried, record: null });
@@ -1378,7 +1404,7 @@ class SidPlayerCoordinator implements SidPlayer {
       }
       const blend = amount ?? 1;
       if (!isUsableHold(index, value, blend)) {
-        console.warn(
+        this.log?.warn(
           `SID player: ignoring a hold of ${value} (amount ${blend}) on ${describeField(field)}.`,
         );
         continue;
@@ -1391,7 +1417,7 @@ class SidPlayerCoordinator implements SidPlayer {
     for (let voice = 0; voice < Math.min(voiceMutes.length, VOICE_COUNT); voice++) {
       const muted = voiceMutes[voice];
       if (typeof muted !== 'boolean') {
-        console.warn(`SID player: ignoring a mute of ${String(muted)} on voice ${voice}.`);
+        this.log?.warn(`SID player: ignoring a mute of ${String(muted)} on voice ${voice}.`);
         continue;
       }
       mutes.push({ voice, muted });
@@ -1417,19 +1443,19 @@ class SidPlayerCoordinator implements SidPlayer {
     }
     for (const { index, record } of offsets) {
       if (record.amount === 0) {
-        this.fieldOffsets.delete(index);
+        this.fieldOffsets[index] = null;
         frame?.clearFieldOffset(record.field);
       } else {
-        this.fieldOffsets.set(index, record);
+        this.fieldOffsets[index] = record;
         frame?.setFieldOffset(record.field, record.amount);
       }
     }
     for (const { index, field, record } of holds) {
       if (record === null) {
-        this.fieldHolds.delete(index);
+        this.fieldHolds[index] = null;
         frame?.releaseField(field);
       } else {
-        this.fieldHolds.set(index, record);
+        this.fieldHolds[index] = record;
         frame?.holdField(field, record.value, record.amount);
       }
     }
@@ -1469,7 +1495,7 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   keepDeliveries(capacity: number): void {
     if (!Number.isFinite(capacity) || capacity < 0 || capacity > MAX_KEPT_DELIVERIES) {
-      console.warn(
+      this.log?.warn(
         `SID player: ignoring a delivery history of ${capacity} (must be 0…${MAX_KEPT_DELIVERIES}).`,
       );
       return;
@@ -1521,7 +1547,7 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   setTargetClock(targetHz: number | null): void {
     if (targetHz !== null && clockRatio(this.tuneClockHz, targetHz) === null) {
-      console.warn(`SID player: ignoring a target clock of ${targetHz} Hz.`);
+      this.log?.warn(`SID player: ignoring a target clock of ${targetHz} Hz.`);
       return;
     }
     this.targetClockHz = targetHz;
@@ -1535,11 +1561,281 @@ class SidPlayerCoordinator implements SidPlayer {
   setVoicePitch(voice: number, coefficient: number): void {
     if (voice < 0 || voice >= VOICE_COUNT) return;
     if (!Number.isFinite(coefficient) || coefficient <= 0) {
-      console.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
+      this.log?.warn(`SID player: ignoring a pitch coefficient of ${coefficient}.`);
       return;
     }
     this.voicePitch[voice] = coefficient;
     this.session.frame?.setVoicePitch(voice, coefficient);
+  }
+
+  createSavedState(): SavedPlayerState {
+    return asSavedPlayerState(
+      new SavedState(this, {
+        // Every register frame's state has one shape, so a player with no tune makes it on its scratch
+        // frame.
+        registers: (this.session.frame ?? this.gateOff).createState(),
+        loop: this.activeLoop.createState(),
+        track: this.track.createState(),
+        shadow: this.shadow.createState(),
+        varispeed: this.varispeed.createState(),
+        crossing: this.crossing.createState(),
+      }),
+    );
+  }
+
+  /**
+   * Copies everything that decides the next frames into `into` and allocates nothing: one machine
+   * image, a few small typed arrays, and references to what never changes once made. The two
+   * mutable images a state would otherwise copy every time, the loop-entry buffer and the crossing
+   * slots, are copied only when a fill has replaced the one the state holds, so a save a frame
+   * costs about the machine image.
+   */
+  saveState(into: SavedPlayerState): void {
+    const state = readSavedState(into);
+    if (state === null || state.owner !== this) {
+      this.log?.warn('SID player: ignoring a save into a state this player did not make.');
+      return;
+    }
+    const machine = this.session.machine;
+    const frame = this.session.frame;
+    const file = this.session.file;
+    if (machine === null || frame === null || file === null) {
+      this.log?.warn('SID player: ignoring a save with no tune loaded.');
+      return;
+    }
+    if (!this.crossing.fits(state.crossing)) {
+      this.log?.warn('SID player: ignoring a save into a state made for other crossing lines.');
+      return;
+    }
+
+    state.file = file;
+    state.subtune = this.session.currentSubtune;
+    state.loadGeneration = this.session.loadGeneration;
+    state.framesRendered = this.session.framesRendered;
+    machine.snapshotInto(state.machine);
+    frame.saveInto(state.registers);
+    this.activeLoop.saveInto(state.loop);
+    this.track.saveInto(state.track);
+    this.shadow.saveInto(state.shadow);
+    this.varispeed.saveInto(state.varispeed);
+    this.crossing.saveInto(state.crossing);
+
+    if (state.loopEntryVersion !== this.loopEntryVersion) {
+      copyImageBuffer(this.loopEntry, state.loopEntry);
+      state.loopEntryVersion = this.loopEntryVersion;
+    }
+    state.loopEntryFilled = this.loopEntryFilled;
+    state.trackLoopEntry = this.trackLoopEntry;
+    state.queuedJump = this.queuedJump;
+    state.queuedSettings = this.queuedSettings;
+    state.handOffs = this.handOffs;
+
+    state.tempoMultiplier = this.tempoMultiplier;
+    state.nominalIntervalUs = this.nominalIntervalUs;
+    state.timingMode = this.timingMode;
+    state.machineExactRate = this.machineExactRate;
+    state.machineRoundedRate = this.machineRoundedRate;
+
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      state.mutedVoices[voice] = this.mutedVoices[voice];
+      state.heldVoices[voice] = this.heldVoices[voice];
+    }
+    state.voicePitch.set(this.voicePitch);
+    state.outputGain = this.outputGain;
+    state.registerScales.set(this.registerScales);
+    state.targetClockHz = this.targetClockHz ?? Number.NaN;
+    for (let index = 0; index < SID_FIELD_TABLE.length; index++) {
+      state.fieldHolds[index] = this.fieldHolds[index];
+      state.fieldOffsets[index] = this.fieldOffsets[index];
+    }
+
+    state.varispeedActive = this.varispeedActive;
+    state.rateSource = this.rateSource;
+    state.handingBack = this.handingBack;
+    state.handbackLeadFrames = this.handbackLeadFrames;
+    state.handbackImage = this.handbackImage;
+    state.gateOffOwed = this.gateOffOwed;
+    state.gateOffAdvances = this.gateOffAdvances;
+  }
+
+  /**
+   * Puts every part back from `from`, or none of them: everything that can refuse is checked before
+   * anything changes.
+   *
+   * The stream is left alone. A restore owes it no gate-off and queues no resync, since the frames
+   * played on are the ones an undisturbed player sends; the transport is the host's, and stays.
+   * The clock is re-timed when the restored rate or tempo moves it, the sink only when the tempo
+   * does (a rate change, as everywhere, never retimes it).
+   *
+   * Crossing varispeed: restored into the hand, the running clock is the transport's already; out of
+   * it, a non-playing varispeed's clock and sink end as they do for any exit, and the rate pitch
+   * returns home through `endVarispeed`. A handback whose image had not yet arrived asks for it again.
+   *
+   * The anchor ring is reset to its seed, not kept: an anchor recorded after the save may have
+   * been taken with a voice muted, which leaves that voice's control register zeroed in the image,
+   * and a seek from it after the restore would carry the zero into a player that is not muted.
+   */
+  restoreState(from: SavedPlayerState): void {
+    const state = readSavedState(from);
+    const refusal = this.refusalFor(state);
+    if (state === null || refusal !== null) {
+      this.log?.warn(`SID player: ignoring a saved state ${refusal}.`);
+      return;
+    }
+    const machine = this.session.machine;
+    const frame = this.session.frame;
+    if (machine === null || frame === null) return;
+
+    const playing = this.transport === 'playing';
+    const priorIntervalUs = this.runningIntervalUs;
+    const tempoMoved =
+      this.tempoMultiplier !== state.tempoMultiplier ||
+      this.nominalIntervalUs !== state.nominalIntervalUs ||
+      this.timingMode !== state.timingMode;
+    const rateMoved =
+      this.machineExactRate !== state.machineExactRate ||
+      this.machineRoundedRate !== state.machineRoundedRate;
+
+    // A replay on its way would land on the position this puts back, and so would a handback's
+    // image request, which the new generation strands.
+    this.session.discardOutstandingJump();
+    this.handbackGeneration++;
+    if (this.varispeedActive && !state.varispeedActive) {
+      this.leaveVarispeedForRebuild();
+    } else if (!this.varispeedActive && state.varispeedActive) {
+      this.varispeedRun++;
+    }
+
+    machine.restore(state.machine);
+    frame.restoreFrom(state.registers);
+    this.session.framesRendered = frames(state.framesRendered);
+    this.activeLoop.restoreFrom(state.loop);
+    this.track.restoreFrom(state.track);
+    this.session.adoptIndexedLengthFrames(this.track.trackEndFrame());
+    this.shadow.restoreFrom(state.shadow);
+    this.varispeed.restoreFrom(state.varispeed);
+    this.crossing.restoreFrom(state.crossing);
+    this.ring.keepSeedOnly();
+
+    if (this.loopEntryVersion !== state.loopEntryVersion) {
+      copyImageBuffer(state.loopEntry, this.loopEntry);
+      this.loopEntryVersion = state.loopEntryVersion;
+    }
+    this.loopEntryFilled = state.loopEntryFilled;
+    this.trackLoopEntry = state.trackLoopEntry;
+    this.queuedJump = state.queuedJump;
+    this.queuedSettings = state.queuedSettings;
+    this.handOffs = state.handOffs;
+
+    // Assigned only where they differ: a number stored again into a field the engine keeps boxed
+    // is a new box, and a restore that moves nothing here is the common one.
+    if (tempoMoved || rateMoved) {
+      this.tempoMultiplier = state.tempoMultiplier;
+      this.nominalIntervalUs = microseconds(state.nominalIntervalUs);
+      this.timingMode = state.timingMode;
+      this.machineExactRate = state.machineExactRate;
+      this.machineRoundedRate = state.machineRoundedRate;
+    }
+
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      this.mutedVoices[voice] = state.mutedVoices[voice];
+      this.heldVoices[voice] = state.heldVoices[voice];
+    }
+    this.voicePitch.set(state.voicePitch);
+    if (this.outputGain !== state.outputGain) this.outputGain = state.outputGain;
+    this.registerScales.set(state.registerScales);
+    const targetClockHz = Number.isNaN(state.targetClockHz) ? null : state.targetClockHz;
+    if (this.targetClockHz !== targetClockHz) this.targetClockHz = targetClockHz;
+    for (let index = 0; index < SID_FIELD_TABLE.length; index++) {
+      this.fieldHolds[index] = state.fieldHolds[index];
+      this.fieldOffsets[index] = state.fieldOffsets[index];
+    }
+
+    this.varispeedActive = state.varispeedActive;
+    this.rateSource = state.rateSource;
+    this.handingBack = state.handingBack;
+    this.handbackLeadFrames = state.handbackLeadFrames;
+    this.handbackImage = state.handbackImage;
+    // Nothing ticks to take a gate-off when neither the transport nor a varispeed runs the clock.
+    const ticking = playing || this.varispeedActive;
+    this.gateOffOwed = ticking && state.gateOffOwed;
+    this.gateOffAdvances = ticking && state.gateOffAdvances;
+
+    if (ticking && (tempoMoved || rateMoved)) {
+      const intervalUs = this.effectiveIntervalUs();
+      if (intervalUs !== priorIntervalUs) {
+        this.clock.setIntervalUs(intervalUs);
+        this.runningIntervalUs = intervalUs;
+      }
+      if (tempoMoved) this.sink.retime(intervalUs);
+    }
+    if (this.handingBack && this.handbackImage === null) void this.requestHandbackImage();
+
+    // Last, for the reason `enforceLoop` gives: a listener may call straight back in. And only when
+    // a published field moved, since the store builds the snapshot before it compares.
+    if (this.restoreMovedPublished()) this.markDirty();
+  }
+
+  /** Why `state` cannot be restored into this player now, as the end of "ignoring a saved state …",
+   *  or null when it can. Allocates nothing for a state that can. */
+  private refusalFor(state: SavedState | null): string | null {
+    if (state === null || state.owner !== this) return 'that this player did not make';
+    if (state.file === null) return 'that was never saved into';
+    if (
+      this.session.machine === null ||
+      state.file !== this.session.file ||
+      state.loadGeneration !== this.session.loadGeneration
+    ) {
+      return 'taken on another load';
+    }
+    if (state.subtune !== this.session.currentSubtune) return 'taken on another subtune';
+    if (!this.crossing.fits(state.crossing)) return 'made for other crossing lines';
+    // Nothing here can start the clock a varispeed runs on, and no clock means no tick to play it.
+    if (state.varispeedActive && !this.varispeedActive && this.transport !== 'playing') {
+      return 'taken in varispeed while the player is not playing';
+    }
+    if (this.transport === 'stopped' || this.transport === 'ended') {
+      return 'into a player that has not started';
+    }
+    return null;
+  }
+
+  /**
+   * Whether anything a restore can move differs from what the published snapshot holds, compared
+   * field against field so that a restore which changes nothing a consumer reads builds nothing. A
+   * lap-style gate: a published field a restore can change has to join it, or a restore stops
+   * publishing it. Out, because a restore cannot move them: the transport, the error, the subtune
+   * and its count, and the prepared frames.
+   */
+  private restoreMovedPublished(): boolean {
+    const published = this.store.getSnapshot();
+    const tune = published.tune;
+    if (tune === null || this.publishedLoopStale()) return true;
+    const tempo = published.tempo;
+    // Off the clock the interval is a function of what is compared below, so only a running one can
+    // differ on its own.
+    const clocked = this.transport === 'playing' || this.varispeedActive;
+    if (
+      tune.lengthFrames !== this.track.trackEndFrame() ||
+      !sameQueuedJump(tune.queuedJump, this.queuedJump) ||
+      tune.handOffs !== this.handOffs ||
+      tune.recordedFrames !== this.recordedFrames() ||
+      tune.shadowRunning !== this.shadow.isRunning() ||
+      published.repeatTrack !== this.track.repeatEnabled() ||
+      tempo.multiplier !== this.tempoMultiplier ||
+      tempo.nominalIntervalUs !== this.nominalIntervalUs ||
+      tempo.timingMode !== this.timingMode ||
+      tempo.rate.exactCallsPerFrame !== this.machineExactRate ||
+      tempo.rate.roundedCallsPerFrame !== this.machineRoundedRate ||
+      (clocked && tempo.effectiveIntervalUs !== this.runningIntervalUs)
+    ) {
+      return true;
+    }
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      const { muted, held } = published.voices[voice];
+      if (muted !== this.mutedVoices[voice] || held !== this.heldVoices[voice]) return true;
+    }
+    return false;
   }
 
   /**
@@ -1555,8 +1851,8 @@ class SidPlayerCoordinator implements SidPlayer {
     if (this.prepareRunner !== undefined && this.prepareRunner !== this.replayRunner) {
       this.prepareRunner.dispose();
     }
-    this.fieldHolds.clear();
-    this.fieldOffsets.clear();
+    this.fieldHolds.fill(null);
+    this.fieldOffsets.fill(null);
     this.history = null;
     if (this.varispeedActive || this.transport === 'playing' || this.transport === 'paused') {
       this.sink.end();
@@ -1619,6 +1915,9 @@ class SidPlayerCoordinator implements SidPlayer {
     this.captureAtCrossing(machine, frame, this.session.framesRendered);
     this.ring.maybeRecord(machine, frame, this.session.framesRendered);
     this.enforceLoop(machine, frame);
+    // Last, so one comparison sees both what the play call did to the rate and what a lap's or a
+    // hand-off's restore put in its place.
+    this.followPlayRate();
   };
 
   /**
@@ -1643,7 +1942,7 @@ class SidPlayerCoordinator implements SidPlayer {
       this.activeLoop.pendingChange() === null
     ) {
       this.saveLive(this.loopEntry, machine, frame, position);
-      this.loopEntryFilled = true;
+      this.markLoopEntryFilled();
       this.activeLoop.setEntryImage(this.loopEntry);
       return;
     }
@@ -1663,10 +1962,16 @@ class SidPlayerCoordinator implements SidPlayer {
     target.frame = position;
   }
 
+  /** `loopEntry` has just been filled: it holds a fill no state has copied yet. */
+  private markLoopEntryFilled(): void {
+    this.loopEntryFilled = true;
+    this.loopEntryVersion = ++this.imageVersions;
+  }
+
   /** Hands one frame to the sink and measures the hand-off. The reading is taken before the call so
    *  it measures core's own lag against the frame grid, not the sink's work. */
   private deliver(frame: SidFrame, dueAtMs: Milliseconds, catchUpClamped: boolean): void {
-    const handOffMs = performance.now();
+    const handOffMs = this.time.now();
     this.sink.deliver(frame, this.session.framesRendered, dueAtMs, catchUpClamped);
     // After the sink call, so the append never delays the wire.
     this.history?.record(frame, dueAtMs);
@@ -1746,7 +2051,11 @@ class SidPlayerCoordinator implements SidPlayer {
     this.session.framesRendered = frames(Math.floor(varispeed.position));
 
     if (!this.handingBack) return;
-    if (this.enforceLoop(machine, frame) !== 'none') return;
+    const action = this.enforceLoop(machine, frame);
+    // A lap or a hand-off restored the machine, and either one ended this varispeed: the clock
+    // re-times here, on the last tick of the varispeed that owned it.
+    this.followPlayRate();
+    if (action !== 'none') return;
     const image = this.handbackImage;
     if (image !== null && this.session.framesRendered === image.frame) this.adoptHandback(image);
   }
@@ -1754,7 +2063,7 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The interval the running clock paces at — what a varispeed tick is handed as its own. Read
    *  from the value the clock was last given, since recomputing it builds a rate object. */
   private tickUs(): number {
-    return this.runningIntervalUs ?? 0;
+    return Number.isNaN(this.runningIntervalUs) ? 0 : this.runningIntervalUs;
   }
 
   /** Runs whatever loop is in force against the frame just rendered: a lap re-enters and owes the
@@ -1763,37 +2072,46 @@ class SidPlayerCoordinator implements SidPlayer {
    *  varispeed, except a lap with no entry image held whose start the record covers: that one goes
    *  on the record and the handback carries on. Reports what it did. */
   private enforceLoop(machine: C64Machine, frame: RegisterFrame): AdvanceResult['action'] {
-    let outcome = this.activeLoop.advance(
+    const outcome = this.activeLoop.advance(
       machine,
       frame,
       this.ring,
       this.track,
       this.session.framesRendered,
     );
-    if (outcome.action === 'due-unheld') {
+    if (outcome.action === 'none') return 'none';
+    if (outcome.action === 'stopped') {
+      this.endTrack();
+      return 'stopped';
+    }
+    // The result is the tracker's own and the next `advance` refills it, so what is read of it is
+    // read here.
+    let action = outcome.action;
+    const landedFrame = outcome.frame;
+    if (action === 'due-unheld') {
       const record = this.varispeed.record;
-      if (record !== null && outcome.frame <= record.frames) {
-        this.lapOnRecord(outcome.frame);
-        return outcome.action;
+      if (record !== null && landedFrame <= record.frames) {
+        this.lapOnRecord(landedFrame);
+        return action;
       }
       // Nothing covers the start: the replay the tracker held back runs here, as it always has.
-      if (seekToFrame(machine, frame, this.ring, outcome.frame) === null) return 'none';
-      outcome = { action: 'looped', frame: outcome.frame };
+      if (seekToFrame(machine, frame, this.ring, landedFrame) === null) return 'none';
+      action = 'looped';
     }
-    if (outcome.action === 'looped') {
+    if (action === 'looped') {
       this.endVarispeed();
-      this.session.framesRendered = outcome.frame;
+      this.session.framesRendered = landedFrame;
       this.queueResync();
-      // The track's own loop may have just armed itself, which is a discrete change to the loop a
-      // consumer reads.
-      this.markDirty();
-    } else if (outcome.action === 'handed-off') {
+      // A lap that changes nothing a consumer reads builds nothing. What can change on one is the
+      // loop (the track's own loop arming, a named change landing) and the varispeed a lap ends.
+      if (this.publishedLoopStale()) this.markDirty();
+    } else if (action === 'handed-off') {
       // Every coordinator and tracker update comes before `markDirty`, whose listeners run
       // synchronously and may call straight back in: they must see a consistent snapshot, and what
       // they do must not be overwritten afterwards.
       this.endVarispeed();
-      this.session.framesRendered = outcome.frame;
-      this.queuedJump = null;
+      this.session.framesRendered = landedFrame;
+      this.forgetQueuedJump();
       this.handOffs++;
       if (this.activeLoop.get() === null) this.activeLoop.setEntryImage(this.trackLoopEntry);
       // A hand-off lands the playhead somewhere else; a lap, above, does not, and is recorded like
@@ -1801,10 +2119,19 @@ class SidPlayerCoordinator implements SidPlayer {
       this.history?.restart();
       this.queueResync();
       this.markDirty();
-    } else if (outcome.action === 'stopped') {
-      this.endTrack();
     }
-    return outcome.action;
+    return action;
+  }
+
+  /** Whether the loop, the pending change or the varispeed flag differs from what the snapshot last
+   *  built published — the only published fields a lap can move. Reference compares, so a lap that
+   *  keeps its loop asks nothing of the snapshot. */
+  private publishedLoopStale(): boolean {
+    return (
+      this.activeLoop.get() !== this.publishedLoop ||
+      this.activeLoop.pendingChange() !== this.publishedChange ||
+      this.varispeedActive !== this.publishedVarispeed
+    );
   }
 
   /**
@@ -1934,7 +2261,7 @@ class SidPlayerCoordinator implements SidPlayer {
 
   private seekVarispeed(target: Frames, settings?: JumpSettings): Promise<void> {
     if (Number.isNaN(target)) {
-      console.warn(`SID player: ignoring a seek to ${target}.`);
+      this.log?.warn(`SID player: ignoring a seek to ${target}.`);
       return Promise.resolve();
     }
     const prepared = settings === undefined ? null : this.prepareSettings(settings);
@@ -2026,13 +2353,13 @@ class SidPlayerCoordinator implements SidPlayer {
    *  went out, not a due time. */
   private deliverNow(frame: SidFrame): void {
     this.sink.deliverNow(frame);
-    this.history?.record(frame, performance.now());
+    this.history?.record(frame, this.time.now());
   }
 
   /** A frame that gates every voice off — enough to release every note, and nothing else. */
   private gateOffFrame(): SidFrame {
-    for (const register of VOICE_CONTROL_REGISTERS) {
-      this.gateOff.onSidWrite(register, 0);
+    for (let voice = 0; voice < VOICE_COUNT; voice++) {
+      this.gateOff.onSidWrite(VOICE_CONTROL_REGISTERS[voice], 0);
     }
     return this.gateOff.takeSnapshot();
   }
@@ -2163,7 +2490,7 @@ class SidPlayerCoordinator implements SidPlayer {
     const slot = this.crossing.imageAt(loop.startFrame);
     if (image === null || slot === null || image !== slot) return image;
     copyImageBuffer(slot, this.loopEntry);
-    this.loopEntryFilled = true;
+    this.markLoopEntryFilled();
     return this.loopEntry;
   }
 
@@ -2318,7 +2645,7 @@ class SidPlayerCoordinator implements SidPlayer {
     this.transport = 'error';
     this.endVarispeed();
     this.markDirty();
-    console.error(`SID player: ${reason}`);
+    this.log?.error(`SID player: ${reason}`);
   }
 
   private resetCounters(): void {
@@ -2357,15 +2684,23 @@ class SidPlayerCoordinator implements SidPlayer {
    */
   private effectiveIntervalUs(): Microseconds {
     return microseconds(
-      playCallIntervalUs(this.nominalIntervalUs, this.playRate()) / this.tempoMultiplier,
+      playCallIntervalUsAt(this.nominalIntervalUs, this.callsPerFrameInForce()) /
+        this.tempoMultiplier,
     );
+  }
+
+  /** The mirror's rate in the timing mode in force: a number, so the frame path reads the rate
+   *  without building the `PlayRate` that `playRate()` does for what is off the tick. */
+  private callsPerFrameInForce(): number {
+    return this.timingMode === 'exact' ? this.machineExactRate : this.machineRoundedRate;
   }
 
   /** The interval a consumer reads: what the clock is running while playing or in varispeed, and
    *  the rate the next `play()` would start at otherwise. */
   private reportedIntervalUs(): Microseconds {
     if (this.session.file === null) return microseconds(0);
-    return (this.transport === 'playing' || this.varispeedActive) && this.runningIntervalUs !== null
+    return (this.transport === 'playing' || this.varispeedActive) &&
+      !Number.isNaN(this.runningIntervalUs)
       ? this.runningIntervalUs
       : this.effectiveIntervalUs();
   }
@@ -2373,19 +2708,61 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The rate in force for every duration in the player — the seek reach, the ceiling and the clock
    *  interval all read this rather than choosing between the two rates themselves. */
   private playRate(): PlayRate {
-    const { exact, rounded } = this.machineRates;
     return {
-      callsPerFrame: this.timingMode === 'exact' ? exact : rounded,
-      exactCallsPerFrame: exact,
-      roundedCallsPerFrame: rounded,
+      callsPerFrame: this.callsPerFrameInForce(),
+      exactCallsPerFrame: this.machineExactRate,
+      roundedCallsPerFrame: this.machineRoundedRate,
       mode: this.timingMode,
     };
   }
 
+  /** Copies `machine`'s two rates into the mirror — 1 and 1 with no machine — and says whether
+   *  either moved. Two number compares, and nothing built. */
+  private mirrorMachineRates(machine: C64Machine | null): boolean {
+    if (machine === null) {
+      this.machineRates[0] = 1;
+      this.machineRates[1] = 1;
+    } else {
+      machine.readRatesInto(this.machineRates);
+    }
+    const exact = this.machineRates[0];
+    const rounded = this.machineRates[1];
+    if (exact === this.machineExactRate && rounded === this.machineRoundedRate) return false;
+    this.machineExactRate = exact;
+    this.machineRoundedRate = rounded;
+    return true;
+  }
+
+  /**
+   * Brings the mirror up to the machine's rate, and the running clock with it. The tune changes its
+   * own rate when it writes the timer, and an image restored onto the machine carries the rate it was
+   * taken at, so this runs after every tick and after every restore.
+   *
+   * It re-times the clock only. The frames the sink already holds were played at the rate they had,
+   * so `sink.retime` stays with a tempo command (`applyIntervalChange`). It builds no snapshot
+   * either: `PlayerSnapshot`'s published rate catches up at the next notification for any other
+   * reason, a lag that is deliberate, and `getStats().rate` reads the mirror as it stands.
+   */
+  private followPlayRate(): void {
+    if (!this.mirrorMachineRates(this.session.machine)) return;
+    // Stopped, paused and ended read the interval fresh when the clock next starts.
+    if (this.transport === 'playing' || this.varispeedActive) {
+      const intervalUs = this.effectiveIntervalUs();
+      this.clock.setIntervalUs(intervalUs);
+      this.runningIntervalUs = intervalUs;
+    }
+  }
+
   /** Derived from the tune's own rate, never the tempo multiplier — riding the tempo must not make
-   *  the ring's spacing breathe. */
+   *  the ring's spacing breathe. Runs on every tick, through the ring's spacing check, so it reads the
+   *  rate as a number. */
   private seekReachFrames(): Frames {
-    return frames(msToPlayCalls(SEEK_REACH_MS, this.nominalIntervalUs, this.playRate()));
+    return frames(
+      Math.round(
+        (SEEK_REACH_MS * MICROSECONDS_PER_MILLISECOND) /
+          playCallIntervalUsAt(this.nominalIntervalUs, this.callsPerFrameInForce()),
+      ),
+    );
   }
 
   /** What the chip actually does: latched XOR held. */
@@ -2419,6 +2796,9 @@ class SidPlayerCoordinator implements SidPlayer {
   private buildSnapshot(): PlayerSnapshot {
     const rate = this.playRate();
     const trackEndFrame = this.track.trackEndFrame();
+    this.publishedLoop = this.activeLoop.get();
+    this.publishedChange = this.activeLoop.pendingChange();
+    this.publishedVarispeed = this.varispeedActive;
     return {
       transport: this.transport,
       tune:
@@ -2460,6 +2840,20 @@ class SidPlayerCoordinator implements SidPlayer {
       error: this.error,
     };
   }
+}
+
+/** Whether two queued-jump records say the same, which two records built from one `queueJump` call
+ *  and its twin on a restored state do without being the same object. */
+function sameQueuedJump(a: QueuedJump | null, b: QueuedJump | null): boolean {
+  if (a === b) return true;
+  return (
+    a !== null &&
+    b !== null &&
+    a.startFrame === b.startFrame &&
+    a.endFrame === b.endFrame &&
+    a.varispeedStart === b.varispeedStart &&
+    a.lapPhase === b.lapPhase
+  );
 }
 
 /** `name`, or `name` of voice `n` — enough to tell a refused hold's field apart in a warning. */

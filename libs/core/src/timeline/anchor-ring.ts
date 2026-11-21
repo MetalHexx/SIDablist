@@ -1,12 +1,14 @@
 import type { C64Machine, MachineSnapshot } from '../cpu/c64-machine.js';
 import type { RegisterFrame, RegisterValuesSnapshot } from '../registers/register-frame.js';
 import type { Frames } from '../units.js';
+import { createImageBuffer, type ImageBuffer } from './crossing-captures.js';
 
 /**
  * Anchor images kept at once: three recent ones plus the frame-0 seed that never leaves index 0.
- * Each is a 64 KB memory image, so this is a memory-against-replay-distance trade — but not a free
- * one to re-make: `anchorIntervalFrames` spaces the ring against this number, so changing it moves
- * how far back a seek can reach as well as what the ring costs.
+ * Each is a 68 KB memory image, allocated once with the ring, so this is a
+ * memory-against-replay-distance trade — but not a free one to re-make: `anchorIntervalFrames`
+ * spaces the ring against this number, so changing it moves how far back a seek can reach as well
+ * as what the ring costs.
  */
 const ANCHOR_RING_SIZE = 4;
 
@@ -30,15 +32,21 @@ export interface PositionAnchor {
  * the tune and stalls for as long as that takes.
  */
 export interface AnchorRing {
-  /** Adds the live machine to the ring, dropping the oldest non-seed entry when full. */
+  /** Copies the live machine into the ring's oldest non-seed slot once it is full, allocating
+   *  nothing. */
   record(machine: C64Machine, frame: RegisterFrame, framesRendered: Frames): void;
   /** Records only every `interval` frames — what a tick loop calls every frame so the spacing check
    *  lives beside the ring it gates. */
   maybeRecord(machine: C64Machine, frame: RegisterFrame, framesRendered: Frames): void;
-  /** The newest entry far enough back that a seek to `frame` still lands after it. */
+  /** The newest entry far enough back that a seek to `frame` still lands after it. The anchor is the
+   *  ring's own image, refilled by a later `record`: use it before the next one and never keep it. */
   select(frame: Frames): PositionAnchor | null;
   /** Drops every anchor, seed included — each describes a machine that no longer exists. */
   reset(): void;
+  /** Drops every anchor but the seed, allocating nothing — for a caller that cannot vouch for what
+   *  the later ones were recorded under. The seed is the machine just initialised, which no
+   *  recording along the way changes. */
+  keepSeedOnly(): void;
 }
 
 /**
@@ -70,17 +78,24 @@ function anchorIntervalFrames(nudgeRangeFrames: Frames): number {
  *   the ring instead of needing a new one built around it.
  */
 export function createAnchorRing(nudgeRangeFrames: () => Frames): AnchorRing {
-  const ring: PositionAnchor[] = [];
+  const images: ImageBuffer[] = Array.from({ length: ANCHOR_RING_SIZE }, createImageBuffer);
+  /** Indices into `images` of the live anchors, oldest first; `order[0]` is always the seed. */
+  const order = new Int32Array(ANCHOR_RING_SIZE);
+  let count = 0;
 
   function record(machine: C64Machine, frame: RegisterFrame, framesRendered: Frames): void {
-    ring.push({
-      frame: framesRendered,
-      machine: machine.snapshot(),
-      registers: frame.snapshotValues(),
-    });
-    if (ring.length > ANCHOR_RING_SIZE) {
-      ring.splice(1, 1);
+    let slot: number;
+    if (count < ANCHOR_RING_SIZE) {
+      slot = count++;
+    } else {
+      slot = order[1];
+      for (let i = 1; i < count - 1; i++) order[i] = order[i + 1];
     }
+    order[count - 1] = slot;
+    const image = images[slot];
+    machine.snapshotInto(image.machine);
+    frame.snapshotValuesInto(image.registers);
+    image.frame = framesRendered;
   }
 
   return {
@@ -103,17 +118,23 @@ export function createAnchorRing(nudgeRangeFrames: () => Frames): AnchorRing {
      */
     select(frame: Frames): PositionAnchor | null {
       const latestUsable = frame - nudgeRangeFrames();
-      for (let i = ring.length - 1; i >= 0; i--) {
-        if (ring[i].frame <= latestUsable) {
-          return ring[i];
+      for (let i = count - 1; i >= 0; i--) {
+        const image = images[order[i]];
+        if (image.frame <= latestUsable) {
+          return image;
         }
       }
-      const seed: PositionAnchor | undefined = ring[0];
-      return seed !== undefined && seed.frame <= frame ? seed : null;
+      if (count === 0) return null;
+      const seed = images[order[0]];
+      return seed.frame <= frame ? seed : null;
     },
 
     reset(): void {
-      ring.length = 0;
+      count = 0;
+    },
+
+    keepSeedOnly(): void {
+      count = Math.min(count, 1);
     },
   };
 }

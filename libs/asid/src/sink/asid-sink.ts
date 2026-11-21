@@ -5,6 +5,8 @@ import type {
   SidFrame,
   Frames,
   SidModel,
+  TimeSource,
+  EngineLog,
 } from '@sidablist/core';
 import type { Microseconds, Milliseconds } from '@sidablist/core';
 import { milliseconds, MICROSECONDS_PER_SECOND } from '@sidablist/core';
@@ -14,6 +16,9 @@ import {
   buildSidTypePacket,
   buildStartPacket,
   buildStopPacket,
+  SID_DATA_PACKET_MAX_LENGTH,
+  SID_DATA_PACKET_MIN_LENGTH,
+  writeSidDataPacket,
 } from '../wire/encoder.js';
 import type { DeliveryStats } from './delivery-stats.js';
 import type { MidiOutputPort } from './midi-output-port.js';
@@ -59,12 +64,39 @@ const CHIP_INDEX = 0;
  *  the port's ordering of two near-equal timestamps never decides which of them lands first. */
 const UNSCHEDULED_SEND_SPACING_MS = 1;
 
+/** The shortest frame interval the ring is first sized for, in ms. The engine plays at most 16 calls
+ *  a frame, so a frame is never shorter than about 1.25 ms (PAL) or 1.04 ms (NTSC). The sink is not
+ *  told a tune's own rate, so the ring is sized for that floor rather than for a typical tune. A
+ *  tempo command that asks for a shorter interval still grows the ring through `retime()`. */
+const DEFAULT_SHORTEST_FRAME_INTERVAL_MS = 1;
+/** The fewest slots the ring ever has, whatever the schedule-ahead. */
+const MIN_RING_SLOTS = 8;
+/** The most slots the ring grows to. Sizing follows a schedule-ahead and a tempo the host chooses, so
+ *  it needs a bound of its own; past it, the overflow rule applies. */
+const MAX_RING_SLOTS = 256;
+
 /** One packet already handed to the port with a future delivery time — pruned as its delivery time
  *  passes. What a tempo change can still catch: `retime()` cancels the port's queue and re-sends
- *  exactly these, at the new spacing, rather than losing whatever they were carrying. */
-interface CommittedHostSend {
-  readonly packet: Uint8Array;
-  readonly scheduledAtMs: Milliseconds;
+ *  exactly these, at the new spacing, rather than losing whatever they were carrying.
+ *
+ *  Each slot owns its `buffer` until it is pruned, because `retime()` re-sends those very bytes.
+ *  `views[n - SID_DATA_PACKET_MIN_LENGTH]` is `buffer.subarray(0, n)`: `MidiOutputPort.send` takes no
+ *  length, and a `subarray` made per send would be garbage on the frame path, so every length a data
+ *  packet can have gets its view when the slot is made. */
+interface CommittedSlot {
+  readonly buffer: Uint8Array;
+  readonly views: readonly Uint8Array[];
+  length: number;
+  scheduledAtMs: number;
+}
+
+function createSlot(): CommittedSlot {
+  const buffer = new Uint8Array(SID_DATA_PACKET_MAX_LENGTH);
+  const views: Uint8Array[] = [];
+  for (let length = SID_DATA_PACKET_MIN_LENGTH; length <= SID_DATA_PACKET_MAX_LENGTH; length++) {
+    views.push(buffer.subarray(0, length));
+  }
+  return { buffer, views, length: 0, scheduledAtMs: 0 };
 }
 
 class AsidSinkImpl implements AsidSink {
@@ -72,29 +104,53 @@ class AsidSinkImpl implements AsidSink {
   private packetsSent = 0;
   private bytesSent = 0;
   private lastCancelLatencyMs = -1;
-  private committedHostSends: CommittedHostSend[] = [];
-  /** The latest delivery time handed to the port. Unlike `committedHostSends` it survives `reset()`
+  /** The ring of committed sends: `slots[0..committedCount)` are live, oldest first, and the rest are
+   *  free. Grown only off the tick (`setScheduleAhead`, `retime`), pruned in place on the tick. When
+   *  a send finds it full, the oldest live slot is recycled for it — that send is no longer tracked, so
+   *  a later `retime()` does not re-send it. Nothing allocates on the tick. */
+  private readonly slots: CommittedSlot[] = [];
+  private committedCount = 0;
+  /** Whether the ring has recycled a live slot since `begin()` or `reset()`, so the host hears of it once. */
+  private ringOverflowReported = false;
+  /** Where an untracked send — one already due when it arrives — is packed. */
+  private readonly stagingSlot = createSlot();
+  private shortestFrameIntervalMs = DEFAULT_SHORTEST_FRAME_INTERVAL_MS;
+  /** `deliver` calls since the last `begin` or `reset`. This sink sends each at once, so all have passed. */
+  private deliveredCount = 0;
+  private readonly liveCapabilities: SinkCapabilities;
+  /** The latest delivery time handed to the port. Unlike the committed ring it survives `reset()`
    *  and `end()`: a port that cannot cancel still delivers everything up to here, whatever this
    *  sink has stopped counting. See `sendUnscheduled`. */
   private lastStampedAtMs = 0;
 
   constructor(
     private readonly port: MidiOutputPort,
+    private readonly time: TimeSource,
+    private readonly log: EngineLog | undefined,
     scheduleAheadMs: Milliseconds,
   ) {
     this.scheduleAheadMsValue = scheduleAheadMs;
-  }
-
-  get capabilities(): SinkCapabilities {
-    return {
+    this.growRing();
+    // One object for the sink's life, read live through accessors: a fresh object per read would be
+    // garbage for a caller that reads it on the tick.
+    const scheduleAhead = () => this.effectiveScheduleAheadMs();
+    this.liveCapabilities = {
       perWriteOffsets: false, // ASID has no per-write time offset on the wire
-      cancellation: this.port.supportsCancel, // can flip on a port swap or reconnect
-      scheduleAheadMs: this.effectiveScheduleAheadMs(), // the clamped value, not the requested one
+      get cancellation() {
+        return port.supportsCancel; // can flip on a port swap or reconnect
+      },
+      get scheduleAheadMs() {
+        return scheduleAhead(); // the clamped value, not the requested one
+      },
       // One SID_DATA packet carries a whole frame's present/value slots in the firmware's fixed
       // slot order (`ASID_SLOT_TO_REGISTER`) — the far end applies them in that order regardless
       // of the order the writes arrived in, so cross-register arrival order never reaches the wire.
       preservesWriteOrder: false,
     };
+  }
+
+  get capabilities(): SinkCapabilities {
+    return this.liveCapabilities;
   }
 
   get stats(): DeliveryStats {
@@ -107,20 +163,22 @@ class AsidSinkImpl implements AsidSink {
       // mid-session port swap, so a swap to a non-cancelling port must force this back to -1 rather
       // than surface a stale reading from the port it replaced.
       lastCancelLatencyMs: cancelSupported ? this.lastCancelLatencyMs : -1,
-      inFlight: this.inFlightCount(performance.now()),
+      inFlight: this.inFlightCount(this.time.now()),
     };
   }
 
   begin(tune: { readonly chipModel: SidModel }): void {
     // The header already told us the model; this sink forwards it as its own packet, immediately
     // before the start packet — the order the engine used pre-extraction.
+    this.deliveredCount = 0;
+    this.ringOverflowReported = false;
     this.sendControl(buildSidTypePacket(CHIP_INDEX, tune.chipModel === 'mos8580'));
     this.sendControl(buildStartPacket());
   }
 
   end(): void {
     // Stopping supersedes anything still outstanding — nothing is coming to land it.
-    this.committedHostSends = [];
+    this.committedCount = 0;
     this.sendControl(buildStopPacket());
   }
 
@@ -136,19 +194,31 @@ class AsidSinkImpl implements AsidSink {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     catchUpClamped: boolean,
   ): void {
-    const packet = buildSidDataPacket(frame);
+    const nowMs = this.time.now();
     const scheduledAtMs = milliseconds(dueAtMs + this.effectiveScheduleAheadMs());
-    this.port.send(packet, scheduledAtMs);
+    this.pruneCommittedHostSends(nowMs);
+    // A send whose delivery time has already passed, because the host stalled between the frame
+    // falling due and reaching this sink, has been handed over for immediate release: there is
+    // nothing left to cancel or re-time, so it is not tracked.
+    const tracked = scheduledAtMs > nowMs;
+    const slot = tracked ? this.acquireSlot() : this.stagingSlot;
+    const length = writeSidDataPacket(frame, slot.buffer);
+    slot.length = length;
+    slot.scheduledAtMs = scheduledAtMs;
+    this.port.send(slot.views[length - SID_DATA_PACKET_MIN_LENGTH], scheduledAtMs);
+    if (tracked) {
+      this.committedCount++;
+    }
     if (scheduledAtMs > this.lastStampedAtMs) {
       this.lastStampedAtMs = scheduledAtMs;
     }
-    this.recordCommittedHostSend(packet, scheduledAtMs);
     this.packetsSent++;
-    this.bytesSent += packet.length;
+    this.bytesSent += length;
+    this.deliveredCount++;
   }
 
   /** Packs and sends unscheduled — the pause gate-off's contract, and why this never touches
-   *  `committedHostSends`. Ahead of anything scheduled on a port that can cancel; just behind what
+   *  the committed ring. Ahead of anything scheduled on a port that can cancel; just behind what
    *  is already committed on one that cannot (`sendUnscheduled`). */
   deliverNow(frame: SidFrame): void {
     this.sendControl(buildSidDataPacket(frame));
@@ -165,34 +235,41 @@ class AsidSinkImpl implements AsidSink {
    * so `setScheduleAhead()`'s live clamp is what keeps that window inaudible instead.
    */
   retime(intervalUs: Microseconds): void {
-    const nowMs = performance.now();
+    const nowMs = this.time.now();
+    const newIntervalMs = intervalUs / (MICROSECONDS_PER_SECOND / 1000);
+    if (newIntervalMs > 0 && newIntervalMs < this.shortestFrameIntervalMs) {
+      this.shortestFrameIntervalMs = newIntervalMs;
+      this.growRing();
+    }
     this.pruneCommittedHostSends(nowMs);
-    if (this.committedHostSends.length === 0 || !this.port.supportsCancel) {
+    if (this.committedCount === 0 || !this.port.supportsCancel) {
       return;
     }
     if (!this.port.cancelPending()) {
       return;
     }
 
-    const outstanding = this.committedHostSends;
     // The furthest-out entry is the one that would have kept arriving longest without the cancel —
     // how far past this request it was still committed to land is the cancel's measured reach.
-    this.lastCancelLatencyMs = Math.max(...outstanding.map((entry) => entry.scheduledAtMs)) - nowMs;
-    this.committedHostSends = [];
+    let furthestMs = this.slots[0].scheduledAtMs;
+    for (let index = 1; index < this.committedCount; index++) {
+      furthestMs = Math.max(furthestMs, this.slots[index].scheduledAtMs);
+    }
+    this.lastCancelLatencyMs = furthestMs - nowMs;
     // `supportsCancel` is already confirmed true above, so this equals `scheduleAheadMsValue` —
     // read via the same helper `deliver` uses purely so both call sites agree on one source of
     // truth for "the window actually in effect right now."
     const aheadMs = this.effectiveScheduleAheadMs();
-    const newIntervalMs = intervalUs / (MICROSECONDS_PER_SECOND / 1000);
     // The same `nowMs` the latency above was measured against: a second reading would put the
     // measurement and the first re-sent packet on two different anchors.
     let scheduledAtMs = nowMs + aheadMs;
-    for (const { packet } of outstanding) {
-      this.port.send(packet, scheduledAtMs);
-      this.committedHostSends.push({ packet, scheduledAtMs: milliseconds(scheduledAtMs) });
+    for (let index = 0; index < this.committedCount; index++) {
+      const slot = this.slots[index];
+      slot.scheduledAtMs = scheduledAtMs;
+      this.port.send(slot.views[slot.length - SID_DATA_PACKET_MIN_LENGTH], scheduledAtMs);
       this.lastStampedAtMs = scheduledAtMs;
       this.packetsSent++;
-      this.bytesSent += packet.length;
+      this.bytesSent += slot.length;
       scheduledAtMs += newIntervalMs;
     }
   }
@@ -211,12 +288,25 @@ class AsidSinkImpl implements AsidSink {
     if (this.port.supportsCancel) {
       this.port.cancelPending();
     }
-    this.committedHostSends = [];
+    this.committedCount = 0;
+    this.deliveredCount = 0;
+    this.ringOverflowReported = false;
+  }
+
+  /** Every frame went to the port as it arrived, stamped ahead, so all of them have passed. */
+  passedCount(): number {
+    return this.deliveredCount;
+  }
+
+  /** Holds nothing to drop: a frame already handed to the port cannot be taken back, so replacements
+   *  begin after the last delivery. */
+  replaceFrom(): number {
+    return this.deliveredCount;
   }
 
   readAt(): FarEndConsumption {
     // ASID cannot know what the far end has consumed, but it does know its own in-flight depth.
-    return { kind: 'unknown', inFlight: this.inFlightCount(performance.now()) };
+    return { kind: 'unknown', inFlight: this.inFlightCount(this.time.now()) };
   }
 
   showText(text: string): void {
@@ -225,20 +315,21 @@ class AsidSinkImpl implements AsidSink {
 
   setScheduleAhead(ms: Milliseconds): void {
     if (!Number.isFinite(ms) || ms < 0) {
-      console.warn(`ASID sink: ignoring a schedule-ahead of ${ms} ms.`);
+      this.log?.warn(`ASID sink: ignoring a schedule-ahead of ${ms} ms.`);
       return;
     }
     const clamped = this.port.supportsCancel
       ? ms
       : milliseconds(Math.min(ms, UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS));
     if (clamped !== ms) {
-      console.warn(
+      this.log?.warn(
         `ASID sink: clamped schedule-ahead from ${ms} ms to ${clamped} ms — the selected MIDI ` +
           `port cannot cancel a pending send, so a deeper window would risk stale-tempo frames ` +
           `playing out audibly.`,
       );
     }
     this.scheduleAheadMsValue = clamped;
+    this.growRing();
   }
 
   /**
@@ -272,7 +363,7 @@ class AsidSinkImpl implements AsidSink {
    * `UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS` caps for exactly this kind of port.
    */
   private sendUnscheduled(packet: Uint8Array): void {
-    if (this.port.supportsCancel || this.lastStampedAtMs <= performance.now()) {
+    if (this.port.supportsCancel || this.lastStampedAtMs <= this.time.now()) {
       this.port.send(packet);
       return;
     }
@@ -280,39 +371,79 @@ class AsidSinkImpl implements AsidSink {
     this.port.send(packet, this.lastStampedAtMs);
   }
 
-  /** Drops whatever has already reached its scheduled delivery time, so `committedHostSends` never
-   *  holds more than a tempo change could actually still catch. */
+  /** Drops whatever has already reached its scheduled delivery time, so the ring never holds more
+   *  than a tempo change could actually still catch. Compacts in place, keeping the order of what
+   *  stays; the slots that leave the live range are swapped, not discarded, so each is reused. */
   private pruneCommittedHostSends(nowMs: number): void {
-    this.committedHostSends = this.committedHostSends.filter(
-      (entry) => entry.scheduledAtMs > nowMs,
-    );
+    let kept = 0;
+    for (let index = 0; index < this.committedCount; index++) {
+      const slot = this.slots[index];
+      if (slot.scheduledAtMs > nowMs) {
+        this.slots[index] = this.slots[kept];
+        this.slots[kept] = slot;
+        kept++;
+      }
+    }
+    this.committedCount = kept;
   }
 
-  /** Records a send a tempo change could still catch — and only such a send. One whose delivery
-   *  time has already passed, because the host stalled between the frame falling due and reaching
-   *  this sink, has been handed over for immediate release: there is nothing left to cancel or
-   *  re-time, so it never belonged in this collection. */
-  private recordCommittedHostSend(packet: Uint8Array, scheduledAtMs: Milliseconds): void {
-    const nowMs = performance.now();
-    this.pruneCommittedHostSends(nowMs);
-    if (scheduledAtMs > nowMs) {
-      this.committedHostSends.push({ packet, scheduledAtMs });
+  /** The slot the next tracked send is packed into, once the ring has been pruned. A full ring gives
+   *  up its oldest live slot: that send stops being tracked, so a later `retime()` does not re-send
+   *  it. It is the soonest due, so it is the one least worth keeping. The caller counts the slot in
+   *  with `committedCount++` after the send. The first recycle after `begin()` or `reset()` is
+   *  reported to the log, once: the one string built is off the steady state, which never recycles. */
+  private acquireSlot(): CommittedSlot {
+    if (this.committedCount === this.slots.length) {
+      if (!this.ringOverflowReported) {
+        this.ringOverflowReported = true;
+        this.log?.warn(
+          `ASID sink: more sends are outstanding than the ${this.slots.length}-slot ring holds; a tempo change will not re-send the oldest.`,
+        );
+      }
+      const oldest = this.slots[0];
+      this.slots.copyWithin(0, 1);
+      this.slots[this.slots.length - 1] = oldest;
+      this.committedCount--;
+    }
+    return this.slots[this.committedCount];
+  }
+
+  /** Adds slots until the ring can hold every send that can be outstanding: the schedule-ahead over
+   *  the shortest frame interval seen, plus a little. Never shrinks, and never runs on the tick. */
+  private growRing(): void {
+    const outstanding = Math.ceil(this.scheduleAheadMsValue / this.shortestFrameIntervalMs) + 2;
+    const wanted = Math.min(MAX_RING_SLOTS, Math.max(MIN_RING_SLOTS, outstanding));
+    while (this.slots.length < wanted) {
+      this.slots.push(createSlot());
     }
   }
 
   private inFlightCount(nowMs: number): number {
-    return this.committedHostSends.reduce(
-      (count, entry) => (entry.scheduledAtMs > nowMs ? count + 1 : count),
-      0,
-    );
+    let count = 0;
+    for (let index = 0; index < this.committedCount; index++) {
+      if (this.slots[index].scheduledAtMs > nowMs) {
+        count++;
+      }
+    }
+    return count;
   }
 }
 
-/** Builds an ASID sink over an injected `MidiOutputPort`. The class itself is not exported —
- *  `AsidSink` is the contract a consumer builds against. */
+/** Builds an ASID sink over an injected `MidiOutputPort`, reading time from the host's
+ *  `TimeSource` and reporting rejected input to `log` (silent when absent). The class itself is not
+ *  exported — `AsidSink` is the contract a consumer builds against. */
 export function createAsidSink(
   port: MidiOutputPort,
-  options?: { readonly scheduleAheadMs?: Milliseconds },
+  options: {
+    readonly time: TimeSource;
+    readonly scheduleAheadMs?: Milliseconds;
+    readonly log?: EngineLog;
+  },
 ): AsidSink {
-  return new AsidSinkImpl(port, options?.scheduleAheadMs ?? milliseconds(0));
+  return new AsidSinkImpl(
+    port,
+    options.time,
+    options.log,
+    options.scheduleAheadMs ?? milliseconds(0),
+  );
 }

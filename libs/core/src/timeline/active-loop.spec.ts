@@ -1038,3 +1038,168 @@ describe('lap arithmetic', () => {
     expect(isUsableLoopLength(10, 10)).toBe(true);
   });
 });
+
+describe('saving and restoring the active loop tracker', () => {
+  let registers: RegisterFrame;
+  let machine: C64Machine;
+  let ring: AnchorRing;
+  const track = createTrackStructure();
+  const imageAt = (frame: number): PositionAnchor => ({
+    frame: frames(frame),
+    ...runUnbrokenTo(frames(frame)),
+  });
+
+  beforeEach(() => {
+    registers = createRegisterFrame();
+    machine = createC64Machine(counterTune(), registers);
+    machine.initSubtune(1);
+    ring = createAnchorRing(() => frames(50));
+    ring.record(machine, registers, frames(0));
+  });
+
+  /** The live pair as it stands, put back by the returned function: a tracker restore does not
+   *  touch the machine, which belongs to the caller. */
+  function keepPair(): () => void {
+    const snapshot = machine.snapshot();
+    const values = registers.snapshotValues();
+    return () => {
+      machine.restore(snapshot);
+      registers.restoreValues(values);
+    };
+  }
+
+  /** What `advance` reports from `from` to `to`, with what the tracker and the pair read after each. */
+  function advanceThrough(tracker: ActiveLoopTracker, from: number, to: number) {
+    const out: unknown[] = [];
+    for (let rendered = from; rendered <= to; rendered++) {
+      const result = { ...tracker.advance(machine, registers, ring, track, frames(rendered)) };
+      out.push({
+        result,
+        loop: tracker.get(),
+        phase: tracker.lapPhase(),
+        pending: tracker.pendingChange(),
+        entry: tracker.entryImage()?.frame ?? null,
+        counter: registers.snapshotValues().values[0],
+      });
+    }
+    return out;
+  }
+
+  it('hands off at the same wrap, from the same phase, as a tracker that never left', () => {
+    const beforeLanding = vi.fn();
+    const tracker = createActiveLoopTracker({ wrapLeadFrames: 1 });
+    tracker.set({ startFrame: frames(10), endFrame: frames(16.5), lapPhase: 0.25 });
+    tracker.setEntryImage(imageAt(10));
+    tracker.queue({
+      startFrame: frames(30),
+      loop: { startFrame: frames(30), endFrame: frames(38.375), lapPhase: 0.5 },
+      beforeLanding,
+    });
+    tracker.setQueuedImage(imageAt(30));
+    advanceThrough(tracker, 11, 12);
+    const state = tracker.createState();
+    tracker.saveInto(state);
+    const rewind = keepPair();
+
+    const never = advanceThrough(tracker, 13, 60);
+    const landings = beforeLanding.mock.calls.length;
+    tracker.restoreFrom(state);
+    rewind();
+    const restored = advanceThrough(tracker, 13, 60);
+
+    expect(restored).toEqual(never);
+    expect(landings).toBe(1);
+    expect(beforeLanding).toHaveBeenCalledTimes(2);
+    expect(
+      never.some((step) => (step as { result: { action: string } }).result.action === 'handed-off'),
+    ).toBe(true);
+  });
+
+  it('lands a pending change at the same wrap as a tracker that never left', () => {
+    const tracker = createActiveLoopTracker({ wrapLeadFrames: 1 });
+    tracker.set({ startFrame: frames(10), endFrame: frames(22) });
+    tracker.setEntryImage(imageAt(10));
+    tracker.changeAt(
+      frames(22),
+      { startFrame: frames(30), endFrame: frames(37.5), lapPhase: 0.5 },
+      imageAt(30),
+    );
+    advanceThrough(tracker, 11, 15);
+    const state = tracker.createState();
+    tracker.saveInto(state);
+    const rewind = keepPair();
+
+    const never = advanceThrough(tracker, 16, 70);
+    tracker.restoreFrom(state);
+    rewind();
+    const restored = advanceThrough(tracker, 16, 70);
+
+    expect(restored).toEqual(never);
+    expect(tracker.get()).toMatchObject({ startFrame: 30, endFrame: 37.5 });
+    expect(never.some((step) => (step as { pending: unknown }).pending !== null)).toBe(true);
+  });
+
+  it('cancels a pending change back to the loop it changed, after other loops came and went', () => {
+    const tracker = createActiveLoopTracker();
+    tracker.set({ startFrame: frames(10), endFrame: frames(22) });
+    tracker.changeAt(frames(16), { startFrame: frames(30), endFrame: frames(37) }, imageAt(30));
+    const state = tracker.createState();
+    tracker.saveInto(state);
+    tracker.set({ startFrame: frames(50), endFrame: frames(60) });
+    tracker.changeAt(frames(55), { startFrame: frames(70), endFrame: frames(77) }, imageAt(70));
+
+    tracker.restoreFrom(state);
+    expect(tracker.pendingChange()).toMatchObject({ atFrame: 16 });
+    tracker.cancelChange();
+
+    expect(tracker.get()).toEqual({ startFrame: 10, endFrame: 22 });
+  });
+
+  it('puts back the track’s own loop and its lack of a phase to pass on', () => {
+    const repeating = createTrackStructure();
+    repeating.setTrackStructure({
+      loopStartFrame: frames(0),
+      loopPeriodFrames: frames(20),
+      endedAtFrame: null,
+    });
+    repeating.setRepeatEnabled(true);
+    const tracker = createActiveLoopTracker({ wrapLeadFrames: 1 });
+    tracker.advance(machine, registers, ring, repeating, frames(19));
+    expect(tracker.get()).toEqual({ startFrame: 0, endFrame: 20 });
+    tracker.queue({
+      startFrame: frames(30),
+      loop: { startFrame: frames(30), endFrame: frames(38.375), lapPhase: 0.5 },
+    });
+    tracker.setQueuedImage(imageAt(30));
+    const state = tracker.createState();
+    tracker.saveInto(state);
+    const rewind = keepPair();
+
+    const landed = (): unknown => {
+      tracker.advance(machine, registers, ring, repeating, frames(19));
+      return tracker.lapPhase();
+    };
+    const never = landed();
+    tracker.set({ startFrame: frames(3), endFrame: frames(9.5), lapPhase: 0.75 });
+    tracker.restoreFrom(state);
+    rewind();
+
+    expect(landed()).toEqual(never);
+    // The queued loop lapped from its own phase: the track's loop passes none on.
+    expect(never).toBe(0.5);
+  });
+
+  it('puts back an empty tracker over a running one', () => {
+    const tracker = createActiveLoopTracker();
+    const empty = tracker.createState();
+    tracker.saveInto(empty);
+    tracker.set({ startFrame: frames(10), endFrame: frames(20) });
+    tracker.setEntryImage(imageAt(10));
+
+    tracker.restoreFrom(empty);
+
+    expect(tracker.get()).toBeNull();
+    expect(tracker.entryImage()).toBeNull();
+    expect(tracker.lapPhase()).toBeNull();
+  });
+});

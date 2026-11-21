@@ -78,6 +78,9 @@ export interface PlayerSnapshot {
     readonly effectiveIntervalUs: Microseconds;
     readonly nominalIntervalUs: Microseconds;
     readonly callsPerFrame: number;
+    /** The rate in force. A tune can change its own mid-song, and the player does not notify for
+     *  that: this and `effectiveIntervalUs` catch up at the next notification for any other reason,
+     *  and `getStats().rate` always reads the machine's rate as it stands. */
     readonly rate: PlayRate;
     readonly timingMode: TimingMode;
     /** True from `enterVarispeed` until live playback or the paused landing takes over. The rate
@@ -146,8 +149,9 @@ export interface PlayerStats {
   /** Whether a resync's gate-off step is still owed to the stream — 1 while `queueResync` is
    *  waiting for the next tick to release it, 0 once it has gone out. */
   readonly resync: { readonly inFlightDepth: number };
-  /** The tune's multispeed exactly as its CIA timer latch describes it, alongside the integer form
-   *  already published in `tempo.callsPerFrame` — see `C64Machine.exactCallsPerFrame`'s own doc for
-   *  the rounding discrepancy this makes visible. */
+  /** The tune's play rate exactly as its timer describes it, alongside the integer form already
+   *  published in `tempo.callsPerFrame` — see `C64Machine.exactCallsPerFrame`'s own doc for the
+   *  rounding discrepancy this makes visible. The exact rate is below 1 for a timer slower than a
+   *  frame. Read live, so it follows a rate the tune changes mid-song. */
   readonly rate: { readonly exactCallsPerFrame: number; readonly roundedCallsPerFrame: number };
 }

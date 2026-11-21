@@ -22,7 +22,7 @@ export interface DeliveryBatch {
   readonly capacity: number;
   /** `capacity × SID_REGISTER_COUNT`: the 25 registers the chip holds after each delivery. */
   readonly registers: Uint8Array;
-  /** `capacity`: each delivery's time, on the frame clock's `performance.now()` timeline. */
+  /** `capacity`: each delivery's time, on the host's `TimeSource` timeline. */
   readonly timesMs: Float64Array;
   /** `capacity × VOICE_COUNT × 2`: per voice, the control bytes the chip received in that delivery,
    *  in order. A voice with fewer than two leaves the rest 0. */

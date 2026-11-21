@@ -7,6 +7,8 @@ import {
   buildSidTypePacket,
   buildStartPacket,
   buildStopPacket,
+  SID_DATA_PACKET_MAX_LENGTH,
+  writeSidDataPacket,
 } from './encoder.js';
 
 function emptyFrame(): SidFrame {
@@ -126,5 +128,68 @@ describe('buildSidDataPacket', () => {
         0x02, 0xf7,
       ]),
     );
+  });
+});
+
+describe('writeSidDataPacket', () => {
+  function frameOf(writes: readonly (readonly [number, number])[]): SidFrame {
+    return {
+      count: writes.length,
+      registers: Uint8Array.from(writes.map(([register]) => register)),
+      values: Uint8Array.from(writes.map(([, value]) => value)),
+      offsetsUs: new Int32Array(writes.length),
+    };
+  }
+
+  it('writes the same bytes buildSidDataPacket returns, and the length, into the front of a larger buffer', () => {
+    const frame = frameOf([
+      [0, 0x91],
+      [4, 0x01],
+      [4, 0x02],
+      [24, 0x0f],
+    ]);
+    const into = new Uint8Array(SID_DATA_PACKET_MAX_LENGTH).fill(0xee);
+
+    const length = writeSidDataPacket(frame, into);
+
+    expect(into.subarray(0, length)).toEqual(buildSidDataPacket(frame));
+    expect(into[length]).toBe(0xee);
+  });
+
+  it('is the same for a frame that writes every slot', () => {
+    const frame = frameOf(
+      Array.from({ length: 25 }, (_, register) => [register, register + 1] as const),
+    );
+    const doubled = {
+      ...frame,
+      count: frame.count + 3,
+      registers: Uint8Array.from([...frame.registers, 4, 11, 18]),
+      values: Uint8Array.from([...frame.values, 0x40, 0x41, 0x42]),
+      offsetsUs: new Int32Array(frame.count + 3),
+    };
+    const into = new Uint8Array(SID_DATA_PACKET_MAX_LENGTH);
+
+    expect(writeSidDataPacket(doubled, into)).toBe(SID_DATA_PACKET_MAX_LENGTH);
+    expect(into).toEqual(buildSidDataPacket(doubled));
+  });
+
+  it('leaves nothing of an earlier, fuller frame behind', () => {
+    const into = new Uint8Array(SID_DATA_PACKET_MAX_LENGTH);
+    writeSidDataPacket(
+      frameOf([
+        [0, 1],
+        [1, 2],
+        [2, 3],
+      ]),
+      into,
+    );
+
+    const length = writeSidDataPacket(frameOf([[24, 5]]), into);
+
+    expect(into.subarray(0, length)).toEqual(buildSidDataPacket(frameOf([[24, 5]])));
+  });
+
+  it('refuses a buffer too small for the longest packet', () => {
+    expect(() => writeSidDataPacket(frameOf([[0, 1]]), new Uint8Array(12))).toThrow(RangeError);
   });
 });

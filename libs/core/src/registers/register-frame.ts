@@ -1,5 +1,6 @@
 import type { SidWriteSink } from '../cpu/c64-machine.js';
 import { clamp } from '../common/math.js';
+import type { Saveable } from '../common/saveable.js';
 import { clockRatio } from './clock-ratio.js';
 import type { SidFrame } from './sid-frame.js';
 import {
@@ -35,6 +36,44 @@ import type { SidChipFieldName, SidField, SidFieldEntry, SidVoiceFieldName } fro
  */
 export interface RegisterValuesSnapshot {
   readonly values: Uint8Array;
+}
+
+/**
+ * Everything a `RegisterFrame` builds its next frame from, so that a restore leaves the next
+ * `takeSnapshot` exactly as it would have been. All typed arrays and numbers, sized once.
+ *
+ * In, the register accumulator: `values` (the shadow) and `retriggerValues` (a doubled control
+ * write's second byte, held apart from it).
+ * In, the frame under construction: `writtenThisFrame`, `writeOrder`, `writeIsRetrigger`,
+ * `writeCount`, `forcedRegisters` (a pending `markAllDirty` or a mute's zeroing lives only here)
+ * and `suppressedWrites` (the lifetime count `suppressedWriteCount` reads).
+ * In, the output stage: `mutedVoices`, `fieldMultiplier`, `fieldOffset`, `restoreOnNextSnapshot`,
+ * `clockRatio`, `voicePitch` and `ratePitch`.
+ * In, the holds: `held`, `heldValue`, `heldAmount` and `releaseOnNextSnapshot`.
+ *
+ * Out: the override and hold masks and bits, which `takeSnapshot` and `readRegisters` rebuild from
+ * the fields above before reading them, and the reused `SidFrame` a `takeSnapshot` refills.
+ */
+export interface RegisterFrameState {
+  readonly values: Uint8Array;
+  readonly retriggerValues: Uint8Array;
+  readonly writtenThisFrame: Uint8Array;
+  readonly writeOrder: Uint8Array;
+  readonly writeIsRetrigger: Uint8Array;
+  writeCount: number;
+  readonly forcedRegisters: Uint8Array;
+  suppressedWrites: number;
+  readonly mutedVoices: Uint8Array;
+  readonly fieldMultiplier: Float64Array;
+  readonly fieldOffset: Int32Array;
+  readonly restoreOnNextSnapshot: Uint8Array;
+  clockRatio: number;
+  readonly voicePitch: Float64Array;
+  ratePitch: number;
+  readonly held: Uint8Array;
+  readonly heldValue: Uint16Array;
+  readonly heldAmount: Float64Array;
+  readonly releaseOnNextSnapshot: Uint8Array;
 }
 
 /** A voice's own registers, decoded — raw, not scaled: what the tune itself put there, the same
@@ -156,7 +195,7 @@ function heldByte(base: number, holdMask: number, holdBits: number): number {
  * other register overwrites the first where it already stands and is counted as suppressed. Either
  * way the frame is never flushed early: one frame is one call of the tune's play routine.
  */
-export interface RegisterFrame extends SidWriteSink {
+export interface RegisterFrame extends SidWriteSink, Saveable<RegisterFrameState> {
   /** Voice 0/1/2. Muting forces that voice's control register to 0 once, then drops every further
    * write the tune's code makes to it until unmuted — every other register for that voice keeps
    * updating live throughout — the hardware-mute technique the TeensyROM firmware uses.
@@ -344,6 +383,9 @@ export interface RegisterFrame extends SidWriteSink {
    *
    * Mute is not part of the snapshot: whichever voices are muted *now* stay muted, so returning to a
    * cue captured before a mute does not un-mute it on the way back in.
+   *
+   * It is a cue's restore. `restoreFrom` is the whole frame's: values, the half-built frame with its
+   * pending resync, mutes, multipliers, offsets and holds.
    */
   restoreValues(snapshot: RegisterValuesSnapshot): void;
 
@@ -395,7 +437,8 @@ class RegisterFrameImpl implements RegisterFrame {
    *  mute engaging. They follow the tune's own writes, ascending. */
   private readonly forcedRegisters = new Uint8Array(SID_REGISTER_COUNT);
   private suppressedWrites = 0;
-  private readonly mutedVoices = new Set<number>(); // voice index 0..2
+  /** 1 for a muted voice, by voice index 0..2. */
+  private readonly mutedVoices = new Uint8Array(VOICE_COUNT);
 
   /** The output stage, one slot per `SID_FIELD_TABLE` entry and sized once so nothing on the frame
    *  path allocates. An entry is off home while its multiplier is not exactly 1 or its offset is
@@ -445,14 +488,14 @@ class RegisterFrameImpl implements RegisterFrame {
 
   setVoiceMuted(voice: number, muted: boolean): void {
     if (voice < 0 || voice >= VOICE_CONTROL_REGISTERS.length) return;
-    if (muted === this.mutedVoices.has(voice)) return;
+    if (muted === (this.mutedVoices[voice] === 1)) return;
     if (muted) {
-      this.mutedVoices.add(voice);
+      this.mutedVoices[voice] = 1;
       const register = VOICE_CONTROL_REGISTERS[voice];
       this.values[register] = 0;
       this.forcedRegisters[register] = 1;
     } else {
-      this.mutedVoices.delete(voice);
+      this.mutedVoices[voice] = 0;
     }
   }
 
@@ -556,7 +599,7 @@ class RegisterFrameImpl implements RegisterFrame {
 
   onSidWrite(register: number, value: number): void {
     const voiceIndex = VOICE_INDEX_FOR_REGISTER.get(register);
-    if (voiceIndex !== undefined && this.mutedVoices.has(voiceIndex)) {
+    if (voiceIndex !== undefined && this.mutedVoices[voiceIndex] === 1) {
       return; // muted — matches the firmware's discard-register redirect
     }
 
@@ -643,7 +686,7 @@ class RegisterFrameImpl implements RegisterFrame {
 
   /** A muted voice's control register belongs to the mute, so holds on its fields wait. */
   private isInert(entry: SidFieldEntry): boolean {
-    return entry.voiceControl && this.mutedVoices.has(entry.voice);
+    return entry.voiceControl && this.mutedVoices[entry.voice] === 1;
   }
 
   /** Self-emission for the output stage: every register of every off-home entry, and one further
@@ -742,9 +785,77 @@ class RegisterFrameImpl implements RegisterFrame {
     this.writtenThisFrame.fill(0);
     this.forcedRegisters.fill(0);
     this.writeCount = 0;
-    for (const voice of this.mutedVoices) {
-      this.values[VOICE_CONTROL_REGISTERS[voice]] = 0;
+    for (let voice = 0; voice < VOICE_CONTROL_REGISTERS.length; voice++) {
+      if (this.mutedVoices[voice] === 1) this.values[VOICE_CONTROL_REGISTERS[voice]] = 0;
     }
+  }
+
+  createState(): RegisterFrameState {
+    return {
+      values: new Uint8Array(SID_REGISTER_COUNT),
+      retriggerValues: new Uint8Array(SID_REGISTER_COUNT),
+      writtenThisFrame: new Uint8Array(SID_REGISTER_COUNT),
+      writeOrder: new Uint8Array(MAX_FRAME_WRITES),
+      writeIsRetrigger: new Uint8Array(MAX_FRAME_WRITES),
+      writeCount: 0,
+      forcedRegisters: new Uint8Array(SID_REGISTER_COUNT),
+      suppressedWrites: 0,
+      mutedVoices: new Uint8Array(VOICE_COUNT),
+      fieldMultiplier: new Float64Array(SID_FIELD_TABLE.length).fill(1),
+      fieldOffset: new Int32Array(SID_FIELD_TABLE.length),
+      restoreOnNextSnapshot: new Uint8Array(SID_FIELD_TABLE.length),
+      clockRatio: 1,
+      voicePitch: new Float64Array(VOICE_COUNT).fill(1),
+      ratePitch: 1,
+      held: new Uint8Array(SID_FIELD_TABLE.length),
+      heldValue: new Uint16Array(SID_FIELD_TABLE.length),
+      heldAmount: new Float64Array(SID_FIELD_TABLE.length),
+      releaseOnNextSnapshot: new Uint8Array(SID_FIELD_TABLE.length),
+    };
+  }
+
+  saveInto(target: RegisterFrameState): void {
+    target.values.set(this.values);
+    target.retriggerValues.set(this.retriggerValues);
+    target.writtenThisFrame.set(this.writtenThisFrame);
+    target.writeOrder.set(this.writeOrder);
+    target.writeIsRetrigger.set(this.writeIsRetrigger);
+    target.writeCount = this.writeCount;
+    target.forcedRegisters.set(this.forcedRegisters);
+    target.suppressedWrites = this.suppressedWrites;
+    target.mutedVoices.set(this.mutedVoices);
+    target.fieldMultiplier.set(this.fieldMultiplier);
+    target.fieldOffset.set(this.fieldOffset);
+    target.restoreOnNextSnapshot.set(this.restoreOnNextSnapshot);
+    target.clockRatio = this.clockRatio;
+    target.voicePitch.set(this.voicePitch);
+    target.ratePitch = this.ratePitch;
+    target.held.set(this.held);
+    target.heldValue.set(this.heldValue);
+    target.heldAmount.set(this.heldAmount);
+    target.releaseOnNextSnapshot.set(this.releaseOnNextSnapshot);
+  }
+
+  restoreFrom(source: RegisterFrameState): void {
+    this.values.set(source.values);
+    this.retriggerValues.set(source.retriggerValues);
+    this.writtenThisFrame.set(source.writtenThisFrame);
+    this.writeOrder.set(source.writeOrder);
+    this.writeIsRetrigger.set(source.writeIsRetrigger);
+    this.writeCount = source.writeCount;
+    this.forcedRegisters.set(source.forcedRegisters);
+    this.suppressedWrites = source.suppressedWrites;
+    this.mutedVoices.set(source.mutedVoices);
+    this.fieldMultiplier.set(source.fieldMultiplier);
+    this.fieldOffset.set(source.fieldOffset);
+    this.restoreOnNextSnapshot.set(source.restoreOnNextSnapshot);
+    this.clockRatio = source.clockRatio;
+    this.voicePitch.set(source.voicePitch);
+    this.ratePitch = source.ratePitch;
+    this.held.set(source.held);
+    this.heldValue.set(source.heldValue);
+    this.heldAmount.set(source.heldAmount);
+    this.releaseOnNextSnapshot.set(source.releaseOnNextSnapshot);
   }
 
   voiceState(voice: number): VoiceRegisterState {

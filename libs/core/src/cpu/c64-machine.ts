@@ -3,20 +3,34 @@ import { cycles, type Cycles } from '../units.js';
 import { createCpuStateRecord, createVendorCpu } from './vendor-cpu.js';
 import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 import {
+  BASIC_ROM_FIRST_PAGE,
+  BASIC_ROM_LAST_PAGE,
+  BRK_HANDLER_STUB,
+  CHIP_REGISTERS_FIRST,
+  CHIP_REGISTERS_LAST,
   CIA1_INTERRUPT_CONTROL,
-  CIA1_TIMER_A_LATCH_HIGH,
-  CIA1_TIMER_A_LATCH_LOW,
   CIA2_INTERRUPT_CONTROL,
   CIA_INTERRUPT_TIMER_A_SET,
+  DRIVER_FIRST_PAGE,
+  DRIVER_LAST_PAGE,
   FIRST_RELOCATABLE_PAGE,
   INIT_BUDGET_FRAMES,
+  INTERRUPT_CONTINUATION_LENGTH,
+  INTERRUPT_ENTRY_EXTRA_CYCLES_HARDWARE,
+  INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL,
+  INTERRUPT_STATUS_BYTE,
   IO_FIRST_PAGE,
   IO_LAST_PAGE,
+  IO_SIZE,
+  IO_START,
+  IRQ_ACKNOWLEDGE_STUB,
   IRQ_HANDLER_STUB,
+  IRQ_RESTORE_STUB,
   IRQ_VECTOR_HARDWARE,
   IRQ_VECTOR_KERNAL,
   KERNAL_STUB_ADDRESSES,
   LAST_RELOCATABLE_PAGE,
+  MACHINE_MEMORY_SIZE,
   MAX_CALLS_PER_FRAME,
   MEMORY_SIZE,
   NTSC_CYCLES_PER_FRAME,
@@ -24,13 +38,30 @@ import {
   NTSC_RASTER_LINES,
   OPCODE_JMP_ABSOLUTE,
   OPCODE_JSR_ABSOLUTE,
+  OPCODE_LDA_ABSOLUTE,
   OPCODE_LDA_IMMEDIATE,
+  OPCODE_PHA,
+  OPCODE_PLA,
   OPCODE_RTI,
   OPCODE_RTS,
+  OPCODE_TAX,
+  OPCODE_TAY,
   PAL_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_RASTER_LINE,
   PAL_RASTER_LINES,
   PLAY_BUDGET_FRAMES,
+  PORT_BANK_MASK,
+  PORT_CHAREN_BIT,
+  PORT_DATA,
+  PORT_DATA_DEFAULT,
+  PORT_DDR,
+  PORT_DDR_DEFAULT,
+  PORT_HIRAM_LORAM_MASK,
+  PORT_PULLUPS,
+  PSID_DEFAULT_TIMER_A_LATCH_NTSC,
+  PSID_DEFAULT_TIMER_A_LATCH_PAL,
+  psidBankFor,
+  RELOC_NO_ROOM_PAGE,
   RESET_VECTOR,
   SID_LAST_AUDIBLE_REGISTER,
   SID_RANGE_END,
@@ -39,13 +70,20 @@ import {
   TRAMPOLINE_BASE,
   TRAMPOLINE_IDLE_OFFSET,
   TRAMPOLINE_INIT_OFFSET,
+  TRAMPOLINE_INTERRUPT_HANDLER_OFFSET,
+  TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET,
+  TRAMPOLINE_INTERRUPT_KERNAL_OFFSET,
+  TRAMPOLINE_INTERRUPT_LENGTH,
+  TRAMPOLINE_INTERRUPT_TAIL_OFFSET,
   TRAMPOLINE_LENGTH,
   TRAMPOLINE_PLAY_OFFSET,
+  TRAMPOLINE_PLAY_RETURN_OFFSET,
   TRAMPOLINE_PLAY_TARGET_OFFSET,
   VIC_CONTROL_IDLE_BITS,
   VIC_CONTROL_REGISTER,
   VIC_RASTER_REGISTER,
 } from './cpu-constants.js';
+import { CALL_CIA, CALL_RASTER, CHIP_STATE_LENGTH, IoChips } from './io-chips.js';
 
 /** Receives every write a tune makes into the SID's address range. */
 export interface SidWriteSink {
@@ -53,7 +91,12 @@ export interface SidWriteSink {
   onSidWrite(register: number, value: number): void;
 }
 
-/** The outcome of one emulated routine call. */
+/**
+ * The outcome of one emulated routine call.
+ *
+ * The machine hands back one object it refills on every call, so a tick allocates none: read it
+ * before the next `initSubtune` or `runFrame` and never keep it.
+ */
 export interface FrameResult {
   readonly cyclesUsed: number;
   /** `false` means the cycle budget ran out before the routine returned — the tune is broken. */
@@ -62,6 +105,15 @@ export interface FrameResult {
 
 /** Thrown when a tune exposes no usable play address, so there is nothing to call each frame. */
 export class UnplayableTuneError extends Error {}
+
+/** Whether a PSID player may put its driver on `page`: `$04`–`$CF`, outside the BASIC ROM's pages. */
+function isDriverPage(page: number): boolean {
+  return (
+    page >= DRIVER_FIRST_PAGE &&
+    page <= DRIVER_LAST_PAGE &&
+    !(page >= BASIC_ROM_FIRST_PAGE && page <= BASIC_ROM_LAST_PAGE)
+  );
+}
 
 /** One entry per opcode byte, 1 where the core's decoder falls through to its 2-cycle no-op. */
 function buildIllegalOpcodeTable(cpu: Cpu6502): Uint8Array {
@@ -84,7 +136,15 @@ export interface MachineSnapshot {
   readonly trampoline: number;
   readonly idleAddress: number;
   readonly playAddress: number;
-  readonly timerALatch: number | null;
+  /**
+   * The VIC's raster flag and enables, both CIAs' counters, latches, controls, flags and enables,
+   * and the cycle count placing each call in time, in the fixed layout `io-chips.ts` documents. The
+   * play rate is read from it. A typed array, so a snapshot still structured-clones to and from the
+   * replay worker and a capture copies it with `set`.
+   */
+  readonly chips: Float64Array;
+  /** The played song's bit of the header's speed word, the other input of the play rate. */
+  readonly speedBit: number;
   readonly cyclesThisCall: number;
   readonly reachedIdle: boolean;
   readonly expectingOpcodeFetch: boolean;
@@ -101,7 +161,8 @@ export interface WritableMachineSnapshot {
   trampoline: number;
   idleAddress: number;
   playAddress: number;
-  timerALatch: number | null;
+  readonly chips: Float64Array;
+  speedBit: number;
   cyclesThisCall: number;
   reachedIdle: boolean;
   expectingOpcodeFetch: boolean;
@@ -109,15 +170,17 @@ export interface WritableMachineSnapshot {
 }
 
 /** An image holding nothing yet, for `snapshotInto` or `copyMachineImage` to fill. Allocates the
- *  64 KB address space, so call it off the frame path and keep what it returns. */
+ *  68 KB address space (the 64 KB plus the 4 KB under I/O) and the chip state, so call it off the frame
+ *  path and keep what it returns. */
 export function createMachineImage(): WritableMachineSnapshot {
   return {
-    memory: new Uint8Array(MEMORY_SIZE),
+    memory: new Uint8Array(MACHINE_MEMORY_SIZE),
     cpu: createCpuStateRecord(),
     trampoline: 0,
     idleAddress: 0,
     playAddress: 0,
-    timerALatch: null,
+    chips: new Float64Array(CHIP_STATE_LENGTH),
+    speedBit: 0,
     cyclesThisCall: 0,
     reachedIdle: false,
     expectingOpcodeFetch: false,
@@ -133,7 +196,8 @@ export function copyMachineImage(source: MachineSnapshot, target: WritableMachin
   target.trampoline = source.trampoline;
   target.idleAddress = source.idleAddress;
   target.playAddress = source.playAddress;
-  target.timerALatch = source.timerALatch;
+  target.chips.set(source.chips);
+  target.speedBit = source.speedBit;
   target.cyclesThisCall = source.cyclesThisCall;
   target.reachedIdle = source.reachedIdle;
   target.expectingOpcodeFetch = source.expectingOpcodeFetch;
@@ -141,32 +205,46 @@ export function copyMachineImage(source: MachineSnapshot, target: WritableMachin
 }
 
 /**
- * A 64 KB address space with just enough faked C64 hardware — CIA timers, a moving raster counter
- * and ROM vector stubs — for a tune's `init` and `play` routines to run to completion. Every write
- * the tune makes to the SID's address range is handed to the sink.
+ * A 64 KB address space, and the 4 KB of RAM under I/O, with just enough faked C64 hardware — the
+ * 6510's port, a VIC raster flag, both CIAs' timers, a moving raster counter and ROM vector stubs —
+ * for a tune's `init` and `play` routines to run to completion. Every write the tune makes to the
+ * SID's address range is handed to the sink, while the port has the chips in.
  */
 export interface C64Machine {
-  /** Cycles between play calls when the tune programmed CIA 1 timer A; `null` for a frame-rate tune. */
+  /**
+   * Cycles between play calls when CIA 1 timer A sets the rate — its latch plus one, the latch being
+   * the tune's own or, for a CIA-timed PSID that wrote none, the PSID default; `null` when the tune
+   * plays once per frame. Read live from the chip model: a latch or interrupt-enable write takes
+   * effect from the next call.
+   */
   readonly cyclesPerPlayCall: number | null;
 
   /**
    * How many play calls a second of this tune wants per frame, 1..16. This is advice for the
-   * caller's clock — `runFrame` still calls the play routine exactly once.
+   * caller's clock — `runFrame` still calls the play routine exactly once. A timer slower than a
+   * frame still reads 1 here; `exactCallsPerFrame` is the one that follows it below 1.
    */
   readonly callsPerFrame: number;
 
   /**
    * The same rate as `callsPerFrame`, but unrounded — the fractional play rate the CIA timer latch
-   * actually describes.
+   * actually describes. At most 16, and below 1 for a timer slower than a frame.
    *
    * A tune programs timer A to whatever period it wants, and that period is under no obligation to
-   * divide the frame evenly: rates like 2.4 calls per frame are ordinary. `callsPerFrame` rounds,
-   * which is right for the integer "how many calls does a frame want" question its name asks, but
-   * wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow, and
-   * the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock; use
-   * `callsPerFrame` only where an integer count is genuinely what is wanted.
+   * divide the frame evenly: rates like 2.4 calls per frame are ordinary, and so is 0.5. `callsPerFrame`
+   * rounds, which is right for the integer "how many calls does a frame want" question its name asks,
+   * but wrong as a divisor for the inter-call interval — rounding 2.4 to 2 paces the stream 20% slow,
+   * and the tune plays at the wrong tempo. Use this wherever the answer feeds a duration or a clock;
+   * use `callsPerFrame` only where an integer count is genuinely what is wanted.
    */
   readonly exactCallsPerFrame: number;
+
+  /**
+   * Writes `exactCallsPerFrame` to `into[0]` and `callsPerFrame` to `into[1]`: the same two numbers,
+   * for a caller that reads them on every tick. A getter returning a fractional double allocates
+   * when it is not inlined, and an array write does not.
+   */
+  readRatesInto(into: Float64Array): void;
 
   /**
    * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
@@ -175,18 +253,25 @@ export interface C64Machine {
    */
   readonly frameCycleBudget: Cycles;
 
-  /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
+  /**
+   * The address `runFrame` calls: the header's play address, or the vector an RSID installed. A
+   * PSID with play address 0 follows its interrupt vector, so this is the handler the latest call
+   * entered, and moves when the tune re-points the vector.
+   */
   readonly resolvedPlayAddress: number;
 
-  /** Where the entry trampoline was written — moved off the default page when the tune covers it. */
+  /**
+   * Where the entry trampoline was written: where a PSID driver lives, or for an RSID the default
+   * page, moved when the tune covers it.
+   */
   readonly trampolineBase: number;
 
   /** Undocumented opcodes executed since the last `initSubtune`; each ran as a 2-cycle no-op. */
   readonly illegalOpcodeCount: number;
 
   /**
-   * A complete, detached copy of the machine's mutable state: 64 KB of address space, the CPU's
-   * execution state, and this class's own bookkeeping.
+   * A complete, detached copy of the machine's mutable state: 68 KB of memory (the 64 KB address
+   * space and the 4 KB under I/O), the CPU's execution state, and this class's own bookkeeping.
    *
    * The point of it is `restore` — a position captured here can be returned to in constant time
    * rather than by re-emulating the tune from `init`, which is what makes a cue hop free of the
@@ -211,8 +296,9 @@ export interface C64Machine {
   restore(snapshot: MachineSnapshot): void;
 
   /**
-   * Resets the address space, reloads the tune and runs its init routine for the given 1-based
-   * subtune, then resolves the play address an RSID installs during init.
+   * Resets the address space and the 6510's port, reloads the tune and runs its init routine for
+   * the given 1-based subtune, then resolves the play address an RSID installs during init. A PSID
+   * starts with `$01` set to the bank value for its init address, as a PSID driver would leave it.
    *
    * @throws {RangeError} when `song` is outside the tune's subtune range.
    * @throws {UnplayableTuneError} when init finished but left no play address to call.
@@ -221,7 +307,10 @@ export interface C64Machine {
 
   /**
    * Runs the play routine exactly once. Batching several calls into one frame would collapse them
-   * downstream, which is precisely the data a multispeed tune exists to deliver.
+   * downstream, which is precisely the data a multispeed tune exists to deliver. A PSID with a play
+   * address has `$01` set to the bank value for it first, whatever the last call left there.
+   *
+   * The returned result is the machine's own, refilled by the next call to this or `initSubtune`.
    *
    * @throws {UnplayableTuneError} when no play address has been resolved.
    */
@@ -236,40 +325,88 @@ export function createC64Machine(file: SidFile, sink: SidWriteSink): C64Machine 
 class C64MachineImpl implements C64Machine {
   private readonly file: SidFile;
   private readonly sink: SidWriteSink;
+  /**
+   * The 64 KB address space, then the 4 KB of RAM under I/O. `memory[$D000-$DFFF]` is the I/O view —
+   * what the chips are given and what a tune that never banks them out reads — and the RAM under it
+   * lives at `MEMORY_SIZE + (address - IO_START)`, reached only while the port banks the chips out.
+   * `memory[0]` and `memory[1]` are the 6510's port.
+   */
   private readonly memory: Uint8Array;
   private readonly cpu: Cpu6502;
+
+  /**
+   * The CPU's bus. A class, not a literal of arrows, because a literal builds a fresh `read` and a
+   * fresh `write` closure for every machine: the CPU's call sites see a second target once a second
+   * machine exists, lose the inlining they had on the first, and stay slower for the life of the
+   * process. A class's methods are one function shared by every machine.
+   *
+   * Each access looks `read` and `write` up on the machine instance, never binds or captures them,
+   * so a diagnostic that wraps them on the instance sees every access.
+   */
+  private static readonly Bus = class implements Cpu6502Bus {
+    constructor(private readonly machine: C64MachineImpl) {}
+
+    read(address: number): number {
+      return this.machine.read(address);
+    }
+
+    write(address: number, value: number): void {
+      this.machine.write(address, value);
+    }
+  };
+
   private readonly illegalOpcodeTable: Uint8Array;
   private readonly cyclesPerFrame: number;
   private readonly cyclesPerRasterLine: number;
   private readonly rasterLineCount: number;
+  /** The VIC flag and the CIAs, and the cycle count that places each call in time. */
+  private readonly chips: IoChips;
+  /** A PSID's reads of the chip registers come from the model; an RSID keeps plain memory and a constant `$DC0D`/`$DD0D`. */
+  private readonly modelsChipReads: boolean;
+  /** A PSID with header play address 0: the play call enters the tune's own handler as an interrupt. */
+  private readonly entersAsInterrupt: boolean;
+  /** A PSID with a play address: the driver writes the bank value for that address to `$01` before every call. */
+  private readonly rebanksEveryCall: boolean;
+  /** What `$FFFE` holds until a tune installs its own handler. */
+  private readonly defaultHardwareVector: number;
 
   private trampoline = TRAMPOLINE_BASE;
   private idleAddress = TRAMPOLINE_BASE + TRAMPOLINE_IDLE_OFFSET;
   private playAddress = 0;
-  private timerALatch: number | null = null;
+  /** The played song's bit of the header's speed word, set by `initSubtune`. */
+  private speedBit = 0;
   private cyclesThisCall = 0;
   private reachedIdle = false;
+  /** Refilled by every routine call and handed back as it is, so a tick builds no result. */
+  private readonly result = { cyclesUsed: 0, completed: false };
   private expectingOpcodeFetch = false;
   private illegalOpcodes = 0;
+  /** Cycles the interrupt entry spent past a `JSR`'s, left uncounted when the handler's first opcode is fetched. */
+  private pendingEntryCredit = 0;
 
   constructor(file: SidFile, sink: SidWriteSink) {
     this.file = file;
     this.sink = sink;
-    this.memory = new Uint8Array(MEMORY_SIZE);
+    this.memory = new Uint8Array(MACHINE_MEMORY_SIZE);
+    this.entersAsInterrupt = file.format === 'PSID' && file.playAddress === 0;
+    this.rebanksEveryCall = file.format === 'PSID' && file.playAddress !== 0;
+    this.defaultHardwareVector = file.format === 'PSID' ? BRK_HANDLER_STUB : IRQ_HANDLER_STUB;
+
+    this.modelsChipReads = file.format === 'PSID';
 
     const ntsc = file.clock === 'ntsc';
     this.cyclesPerFrame = ntsc ? NTSC_CYCLES_PER_FRAME : PAL_CYCLES_PER_FRAME;
     this.cyclesPerRasterLine = ntsc ? NTSC_CYCLES_PER_RASTER_LINE : PAL_CYCLES_PER_RASTER_LINE;
     this.rasterLineCount = ntsc ? NTSC_RASTER_LINES : PAL_RASTER_LINES;
+    this.chips = new IoChips(
+      this.cyclesPerFrame,
+      ntsc ? PSID_DEFAULT_TIMER_A_LATCH_NTSC : PSID_DEFAULT_TIMER_A_LATCH_PAL,
+    );
 
-    // The core resets inside its own constructor, reading $FFFC/$FFFD back through this callback,
-    // so the address space has to exist first. The PC it lands on is meaningless — every entry
-    // re-points the reset vector and resets again.
-    const bus: Cpu6502Bus = {
-      read: (address: number): number => this.read(address),
-      write: (address: number, value: number): void => this.write(address, value),
-    };
-    this.cpu = createVendorCpu(bus);
+    // The core resets inside its own constructor, reading $FFFC/$FFFD back through the bus, so the
+    // address space has to exist first. The PC it lands on is meaningless — every entry re-points
+    // the reset vector and resets again.
+    this.cpu = createVendorCpu(new C64MachineImpl.Bus(this));
     this.illegalOpcodeTable = buildIllegalOpcodeTable(this.cpu);
   }
 
@@ -280,7 +417,8 @@ class C64MachineImpl implements C64Machine {
       trampoline: this.trampoline,
       idleAddress: this.idleAddress,
       playAddress: this.playAddress,
-      timerALatch: this.timerALatch,
+      chips: this.chips.state.slice(),
+      speedBit: this.speedBit,
       cyclesThisCall: this.cyclesThisCall,
       reachedIdle: this.reachedIdle,
       expectingOpcodeFetch: this.expectingOpcodeFetch,
@@ -294,7 +432,8 @@ class C64MachineImpl implements C64Machine {
     target.trampoline = this.trampoline;
     target.idleAddress = this.idleAddress;
     target.playAddress = this.playAddress;
-    target.timerALatch = this.timerALatch;
+    target.chips.set(this.chips.state);
+    target.speedBit = this.speedBit;
     target.cyclesThisCall = this.cyclesThisCall;
     target.reachedIdle = this.reachedIdle;
     target.expectingOpcodeFetch = this.expectingOpcodeFetch;
@@ -307,7 +446,8 @@ class C64MachineImpl implements C64Machine {
     this.trampoline = snapshot.trampoline;
     this.idleAddress = snapshot.idleAddress;
     this.playAddress = snapshot.playAddress;
-    this.timerALatch = snapshot.timerALatch;
+    this.chips.state.set(snapshot.chips);
+    this.speedBit = snapshot.speedBit;
     this.cyclesThisCall = snapshot.cyclesThisCall;
     this.reachedIdle = snapshot.reachedIdle;
     this.expectingOpcodeFetch = snapshot.expectingOpcodeFetch;
@@ -315,23 +455,60 @@ class C64MachineImpl implements C64Machine {
   }
 
   get cyclesPerPlayCall(): number | null {
-    return this.timerALatch === null ? null : this.timerALatch + 1;
+    if (!this.timerAGovernsRate()) {
+      return null;
+    }
+    return this.chips.timerALatch() + 1;
   }
 
   get callsPerFrame(): number {
-    const rate = this.cyclesPerPlayCall;
-    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+    const cyclesPerCall = this.cyclesPerPlayCall;
+    if (cyclesPerCall === null || cyclesPerCall >= this.cyclesPerFrame) {
       return 1;
     }
-    return Math.min(MAX_CALLS_PER_FRAME, Math.max(1, Math.round(this.cyclesPerFrame / rate)));
+    return Math.min(
+      MAX_CALLS_PER_FRAME,
+      Math.max(1, Math.round(this.cyclesPerFrame / cyclesPerCall)),
+    );
   }
 
   get exactCallsPerFrame(): number {
-    const rate = this.cyclesPerPlayCall;
-    if (rate === null || rate <= 0 || rate >= this.cyclesPerFrame) {
+    const cyclesPerCall = this.cyclesPerPlayCall;
+    if (cyclesPerCall === null) {
       return 1;
     }
-    return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / rate);
+    return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / cyclesPerCall);
+  }
+
+  readRatesInto(into: Float64Array): void {
+    into[0] = this.exactCallsPerFrame;
+    into[1] = this.callsPerFrame;
+  }
+
+  /**
+   * Whether CIA 1 timer A's rate, rather than one call per frame, is the tune's play rate.
+   *
+   * A PSID with a play address follows its speed bit, whatever the tune writes to the CIA. One
+   * without installed its own handler: the speed bits are ignored and the rate is whatever interrupt
+   * the tune has enabled in CIA 1. An RSID keeps the rule it always had, that a tune which wrote the
+   * latch is CIA-timed.
+   */
+  private timerAGovernsRate(): boolean {
+    if (this.file.format === 'RSID') {
+      return this.chips.timerALatchWritten();
+    }
+    return this.entersAsInterrupt ? this.chips.timerAInterruptEnabled() : this.speedBit === 1;
+  }
+
+  /**
+   * The played song's bit of the header's speed word. Version 1 files and PSIDs flagged PlaySID
+   * specific repeat the 32 bits across songs; a later version without the flag gives every song past
+   * the 32nd the last bit.
+   */
+  private speedBitFor(song: number): number {
+    const { version, speedFlags, psidSpecific } = this.file;
+    const index = version === 1 || psidSpecific === true ? (song - 1) % 32 : Math.min(song - 1, 31);
+    return (speedFlags >>> index) & 1;
   }
 
   get frameCycleBudget(): Cycles {
@@ -357,20 +534,23 @@ class C64MachineImpl implements C64Machine {
     }
 
     this.memory.fill(0);
-    this.timerALatch = null;
+    this.speedBit = this.speedBitFor(song);
+    this.chips.reset(this.speedBit);
     this.illegalOpcodes = 0;
 
     this.installRomStubs();
     this.loadTune();
     this.writeTrampoline(song);
+    this.resetPort();
 
     const result = this.runRoutine(
       this.trampoline + TRAMPOLINE_INIT_OFFSET,
       this.cyclesPerFrame * INIT_BUDGET_FRAMES,
     );
+    this.chips.endInit(result.cyclesUsed);
 
     this.playAddress = this.resolvePlayAddress();
-    this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
+    this.patchPlayTarget();
 
     if (result.completed && this.playAddress === 0) {
       throw new UnplayableTuneError(
@@ -384,14 +564,26 @@ class C64MachineImpl implements C64Machine {
     if (this.playAddress === 0) {
       throw new UnplayableTuneError('no play address has been resolved — run initSubtune first');
     }
-    return this.runRoutine(
+    if (this.rebanksEveryCall) {
+      this.memory[PORT_DATA] = psidBankFor(this.playAddress);
+    }
+    if (this.entersAsInterrupt) {
+      this.followInterruptVector();
+    }
+    this.chips.beginCall(this.timerAGovernsRate() ? CALL_CIA : CALL_RASTER);
+    const result = this.runRoutine(
       this.trampoline + TRAMPOLINE_PLAY_OFFSET,
       this.cyclesPerFrame * PLAY_BUDGET_FRAMES,
+      this.interruptEntryCredit(),
     );
+    this.chips.endCall(result.cyclesUsed);
+    return result;
   }
 
-  private runRoutine(entryAddress: number, budget: number): FrameResult {
+  /** `entryCredit` cycles are dropped from the count when the handler's first opcode is fetched. */
+  private runRoutine(entryAddress: number, budget: number, entryCredit = 0): FrameResult {
     this.writeWord(RESET_VECTOR, entryAddress);
+    this.pendingEntryCredit = entryCredit;
     this.cyclesThisCall = 0;
     this.reachedIdle = false;
     this.expectingOpcodeFetch = false;
@@ -405,24 +597,38 @@ class C64MachineImpl implements C64Machine {
       this.cyclesThisCall++;
     }
 
-    return { cyclesUsed: this.cyclesThisCall, completed: this.reachedIdle };
+    this.result.cyclesUsed = this.cyclesThisCall;
+    this.result.completed = this.reachedIdle;
+    return this.result;
   }
 
   /**
    * The read side of the CPU's bus.
    *
-   * The `$01` banking register is stored as ordinary RAM and ignored for decoding: the ranges below
-   * always decode as I/O whatever a tune banks in. That is a deliberate simplification, not an
-   * oversight — no KERNAL or BASIC ROM image ships here, so there is nothing else to bank to.
+   * The 6510's port decides what `$D000`–`$DFFF` is (see `ioVisible`): with the chips banked out the
+   * read is the RAM under them. Only that overlay is modelled. No KERNAL, BASIC or character ROM image
+   * ships here, so `$A000`–`$BFFF` and `$E000`–`$FFFF` always read RAM whatever the port selects, and
+   * the character ROM, which the port can bring in over `$D000`–`$DFFF`, reads the RAM under I/O too.
    */
   private read(address: number): number {
     const fetchingOpcode = this.expectingOpcodeFetch;
     this.expectingOpcodeFetch = false;
 
-    if (address === this.idleAddress) {
-      // The only reason the CPU ever fetches from the idle block is that the routine returned.
+    if (
+      fetchingOpcode &&
+      (address === this.idleAddress ||
+        (address === this.trampoline + TRAMPOLINE_PLAY_RETURN_OFFSET && !this.entersAsInterrupt))
+    ) {
+      // The only reason the CPU ever fetches an opcode from the idle block is that the routine
+      // returned; a data read of that address, from a tune sharing the page, is no return. A play
+      // routine that returns with `RTI` pulls the trampoline `JSR`'s frame as its PC and lands on that
+      // `JSR`'s own last byte, which an `RTS` never reaches: it has returned too, so it counts here.
       // Detecting it here keeps the hot loop free of the allocations `getState()` would cost.
       this.reachedIdle = true;
+    }
+    if (this.pendingEntryCredit !== 0 && fetchingOpcode && address === this.playAddress) {
+      this.cyclesThisCall -= this.pendingEntryCredit;
+      this.pendingEntryCredit = 0;
     }
 
     const value = this.readBus(address);
@@ -433,23 +639,78 @@ class C64MachineImpl implements C64Machine {
   }
 
   private readBus(address: number): number {
-    switch (address) {
-      case VIC_CONTROL_REGISTER:
-        return VIC_CONTROL_IDLE_BITS | ((this.rasterLine() & 0x100) >> 1);
-      case VIC_RASTER_REGISTER:
-        return this.rasterLine() & 0xff;
-      case CIA1_INTERRUPT_CONTROL:
-      case CIA2_INTERRUPT_CONTROL:
-        return CIA_INTERRUPT_TIMER_A_SET;
-      default:
-        return this.memory[address & 0xffff];
+    if (address >= IO_START) {
+      if (address < IO_START + IO_SIZE) {
+        if (!this.ioVisible()) {
+          return this.memory[MEMORY_SIZE + address - IO_START];
+        }
+        switch (address) {
+          case VIC_CONTROL_REGISTER:
+            return VIC_CONTROL_IDLE_BITS | ((this.rasterLine() & 0x100) >> 1);
+          case VIC_RASTER_REGISTER:
+            return this.rasterLine() & 0xff;
+        }
+        if (address >= CHIP_REGISTERS_FIRST && address <= CHIP_REGISTERS_LAST) {
+          return this.readChipRegister(address);
+        }
+      }
+    } else if (address === PORT_DATA) {
+      return this.readPortData();
     }
+    return this.memory[address & 0xffff];
   }
 
-  /** The write side of the CPU's bus. See `read` for why banking is ignored. */
+  /**
+   * Whether `$D000`–`$DFFF` is the chips rather than RAM or the character ROM: CHAREN high with
+   * LORAM or HIRAM high. An input line is pulled up, so it reads 1 whatever `$01` holds for it.
+   * Allocates nothing, since every bus access in that range asks.
+   */
+  private ioVisible(): boolean {
+    const pins = (this.memory[PORT_DATA] | ~this.memory[PORT_DDR]) & PORT_BANK_MASK;
+    return (pins & PORT_CHAREN_BIT) !== 0 && (pins & PORT_HIRAM_LORAM_MASK) !== 0;
+  }
+
+  /** `$01` reads the data bits of the output lines and the pulled-up level of the input lines. */
+  private readPortData(): number {
+    const direction = this.memory[PORT_DDR];
+    return (this.memory[PORT_DATA] & direction) | (PORT_PULLUPS & ~direction);
+  }
+
+  /**
+   * A read in the range the chip model covers. Some of these reads change the model — `$xD` clears
+   * the flags it returns — so `read` is the only caller, and it calls once per bus access.
+   */
+  private readChipRegister(address: number): number {
+    if (this.modelsChipReads) {
+      const value = this.chips.read(address, this.cyclesThisCall);
+      if (value >= 0) {
+        return value;
+      }
+    } else if (address === CIA1_INTERRUPT_CONTROL || address === CIA2_INTERRUPT_CONTROL) {
+      return CIA_INTERRUPT_TIMER_A_SET;
+    }
+    return this.memory[address & 0xffff];
+  }
+
+  /**
+   * The write side of the CPU's bus. A write to `$D000`–`$DFFF` with the chips banked out lands in the
+   * RAM under them and reaches no chip and no sink; see `read` for what else the port does not model.
+   * A write under a ROM's addresses lands in RAM, as on hardware.
+   *
+   * Every register the machine reacts to lies between `$D019` and `$DD0F`, so one range test lets an
+   * ordinary RAM store skip the rest.
+   */
   private write(address: number, value: number): void {
     const byte = value & 0xff;
+    if (address >= IO_START && address < IO_START + IO_SIZE && !this.ioVisible()) {
+      this.memory[MEMORY_SIZE + address - IO_START] = byte;
+      return;
+    }
     this.memory[address & 0xffff] = byte;
+
+    if (address < CHIP_REGISTERS_FIRST || address > CHIP_REGISTERS_LAST) {
+      return;
+    }
 
     if (address >= SID_RANGE_START && address <= SID_RANGE_END) {
       if (!this.isSecondOrThirdSidAddress(address)) {
@@ -461,9 +722,7 @@ class C64MachineImpl implements C64Machine {
       return;
     }
 
-    if (address === CIA1_TIMER_A_LATCH_LOW || address === CIA1_TIMER_A_LATCH_HIGH) {
-      this.timerALatch = this.readWord(CIA1_TIMER_A_LATCH_LOW);
-    }
+    this.chips.write(address, byte, this.cyclesThisCall);
   }
 
   /**
@@ -485,20 +744,57 @@ class C64MachineImpl implements C64Machine {
     return ((this.cyclesThisCall / this.cyclesPerRasterLine) | 0) % this.rasterLineCount;
   }
 
+  /**
+   * A PSID gets the KERNAL's real IRQ exits — `$EA31` jumps to `$EA7E`, which acknowledges the CIA
+   * and falls into `$EA81`, which pops Y, X, A and returns — and a separate `RTI` for `BRK` behind
+   * `$FFFE`. An RSID keeps one `RTI` at `$EA31` for both vectors.
+   */
   private installRomStubs(): void {
     for (const address of KERNAL_STUB_ADDRESSES) {
       this.memory[address] = OPCODE_RTS;
     }
-    this.memory[IRQ_HANDLER_STUB] = OPCODE_RTI;
     this.writeWord(IRQ_VECTOR_KERNAL, IRQ_HANDLER_STUB);
-    this.writeWord(IRQ_VECTOR_HARDWARE, IRQ_HANDLER_STUB);
+    this.writeWord(IRQ_VECTOR_HARDWARE, this.defaultHardwareVector);
+
+    if (this.file.format !== 'PSID') {
+      this.memory[IRQ_HANDLER_STUB] = OPCODE_RTI;
+      return;
+    }
+    this.memory.set(
+      [OPCODE_JMP_ABSOLUTE, IRQ_ACKNOWLEDGE_STUB & 0xff, IRQ_ACKNOWLEDGE_STUB >> 8],
+      IRQ_HANDLER_STUB,
+    );
+    this.memory.set(
+      [OPCODE_LDA_ABSOLUTE, CIA1_INTERRUPT_CONTROL & 0xff, CIA1_INTERRUPT_CONTROL >> 8],
+      IRQ_ACKNOWLEDGE_STUB,
+    );
+    this.memory.set(
+      [OPCODE_PLA, OPCODE_TAY, OPCODE_PLA, OPCODE_TAX, OPCODE_PLA, OPCODE_RTI],
+      IRQ_RESTORE_STUB,
+    );
+    this.memory[BRK_HANDLER_STUB] = OPCODE_RTI;
   }
 
-  /** Copies the payload over the stubs, so the tune wins any overlap. */
+  /**
+   * Copies the payload over the stubs, so the tune wins any overlap. A payload that reaches
+   * `$D000`–`$DFFF` is the RAM under I/O as well as the I/O view, so it is seeded into both.
+   */
   private loadTune(): void {
     const available = MEMORY_SIZE - this.file.loadAddress;
     const length = Math.min(this.file.data.length, Math.max(0, available));
     this.memory.set(this.file.data.subarray(0, length), this.file.loadAddress);
+    this.memory.copyWithin(MEMORY_SIZE, IO_START, IO_START + IO_SIZE);
+  }
+
+  /**
+   * The port as init finds it: the KERNAL's reset direction, and for a PSID the bank value its driver
+   * writes before calling init. An RSID starts from the KERNAL's `$37` and is left alone. Written
+   * after the payload, which may cover `$00`/`$01`.
+   */
+  private resetPort(): void {
+    this.memory[PORT_DDR] = PORT_DDR_DEFAULT;
+    this.memory[PORT_DATA] =
+      this.file.format === 'PSID' ? psidBankFor(this.file.initAddress) : PORT_DATA_DEFAULT;
   }
 
   /**
@@ -513,6 +809,25 @@ class C64MachineImpl implements C64Machine {
    * base+0x0B:  JMP idle
    * base+0x0E:  JMP idle          ; branches to itself
    * ```
+   *
+   * A PSID with play address 0 enters its handler as an interrupt instead. `base+0x08` becomes a
+   * `JMP` to one of two entries, picked after init by which vector holds the handler. Both push
+   * a hardware frame — return PC `P:P`, status `$0A`, with `P` the trampoline's page — and the
+   * `$0314` entry also pushes A, X, Y as the KERNAL's `$FF48` does. The shared tail then zeroes
+   * A, X and Y, as a `JSR` entry leaves them, and jumps to the handler:
+   *
+   * ```
+   * base+0x11:  LDA #P / PHA / PHA / LDA #$0A / PHA        ; $0314 entry: PCH, PCL, status
+   * base+0x18:  PHA / LDA #P / PHA / LDA #$0A / PHA         ; A = $0A, X = P, Y = $0A
+   * base+0x1F:  JMP tail
+   * base+0x22:  LDA #P / PHA / PHA / LDA #$0A / PHA        ; $FFFE entry: the frame alone
+   * base+0x29:  LDA #0 / TAX / TAY / JMP handler           ; handler patched after init
+   * P:P:        JMP idle                                    ; where an RTI lands
+   * ```
+   *
+   * An `RTI` pulls status `$0A` and goes to `P:P`. An `RTS` pulls the top two bytes as a low and
+   * high address byte — Y and X on the `$0314` path, status and PCL on the `$FFFE` path — which
+   * are `$0A` and `P` either way, and goes to `base+0x0B`. Both end in `JMP idle`.
    */
   private writeTrampoline(song: number): void {
     this.trampoline = this.chooseTrampolineBase();
@@ -533,7 +848,7 @@ class C64MachineImpl implements C64Machine {
         OPCODE_JMP_ABSOLUTE,
         idleLow,
         idleHigh,
-        OPCODE_JSR_ABSOLUTE,
+        this.entersAsInterrupt ? OPCODE_JMP_ABSOLUTE : OPCODE_JSR_ABSOLUTE,
         0x00,
         0x00,
         OPCODE_JMP_ABSOLUTE,
@@ -545,14 +860,152 @@ class C64MachineImpl implements C64Machine {
       ],
       this.trampoline,
     );
+
+    if (this.entersAsInterrupt) {
+      this.writeInterruptEntry(idleLow, idleHigh);
+    }
   }
 
+  /** Writes everything past `base+0x11` that `writeTrampoline`'s doc comment lays out. */
+  private writeInterruptEntry(idleLow: number, idleHigh: number): void {
+    const page = this.trampoline >> 8;
+    const tail = this.trampoline + TRAMPOLINE_INTERRUPT_TAIL_OFFSET;
+    const pushFrame = [
+      OPCODE_LDA_IMMEDIATE,
+      page,
+      OPCODE_PHA,
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      INTERRUPT_STATUS_BYTE,
+      OPCODE_PHA,
+    ];
+    const pushRegisters = [
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      page,
+      OPCODE_PHA,
+      OPCODE_LDA_IMMEDIATE,
+      INTERRUPT_STATUS_BYTE,
+      OPCODE_PHA,
+    ];
+
+    this.memory.set(
+      [...pushFrame, ...pushRegisters, OPCODE_JMP_ABSOLUTE, tail & 0xff, tail >> 8],
+      this.trampoline + TRAMPOLINE_INTERRUPT_KERNAL_OFFSET,
+    );
+    this.memory.set(
+      [
+        ...pushFrame,
+        OPCODE_LDA_IMMEDIATE,
+        0x00,
+        OPCODE_TAX,
+        OPCODE_TAY,
+        OPCODE_JMP_ABSOLUTE,
+        0x00,
+        0x00,
+      ],
+      this.trampoline + TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET,
+    );
+    this.memory.set(
+      [OPCODE_JMP_ABSOLUTE, idleLow, idleHigh],
+      this.interruptContinuation(this.trampoline),
+    );
+  }
+
+  /** Where an `RTI` out of a handler lands: `P:P`, a page byte that also serves as `RTS`'s high byte. */
+  private interruptContinuation(base: number): number {
+    const page = base >> 8;
+    return (page << 8) | page;
+  }
+
+  /**
+   * Points the play entry at what init resolved: the handler itself for a `JSR` entry, otherwise
+   * the interrupt entry for the vector that holds it, with the handler patched into its tail.
+   */
+  private patchPlayTarget(): void {
+    if (!this.entersAsInterrupt) {
+      this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
+      return;
+    }
+    this.pointInterruptEntry(this.handlerIsOnKernalVector());
+  }
+
+  private pointInterruptEntry(onKernal: boolean): void {
+    const entryOffset = onKernal
+      ? TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      : TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET;
+    this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.trampoline + entryOffset);
+    this.writeWord(this.trampoline + TRAMPOLINE_INTERRUPT_HANDLER_OFFSET, this.playAddress);
+  }
+
+  /**
+   * Re-reads the interrupt vector before a call, as a real C64 does at every interrupt, and
+   * re-points the trampoline when the tune moved it. Both vectors back at their defaults is the
+   * KERNAL's own handler: it is entered through the `$0314` entry, so its three pulls balance the
+   * pushes.
+   */
+  private followInterruptVector(): void {
+    let handler = this.resolvePlayAddress();
+    let onKernal = this.handlerIsOnKernalVector();
+    if (handler === 0) {
+      handler = IRQ_HANDLER_STUB;
+      onKernal = true;
+    }
+    const entryOffset = onKernal
+      ? TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      : TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET;
+    const entry = this.trampoline + entryOffset;
+    if (
+      handler === this.playAddress &&
+      this.readWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET) === entry
+    ) {
+      return;
+    }
+    this.playAddress = handler;
+    this.pointInterruptEntry(onKernal);
+  }
+
+  /** Cycles to leave uncounted on this call: what the entry costs beyond a `JSR`. */
+  private interruptEntryCredit(): number {
+    if (!this.entersAsInterrupt) {
+      return 0;
+    }
+    const entry = this.readWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET);
+    return entry === this.trampoline + TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      ? INTERRUPT_ENTRY_EXTRA_CYCLES_KERNAL
+      : INTERRUPT_ENTRY_EXTRA_CYCLES_HARDWARE;
+  }
+
+  /**
+   * The base the trampoline goes at. A PSID's goes where a PSID player puts its driver (see
+   * `firstDriverBase`), so a tune's init cannot overwrite it by filling the RAM under the KERNAL or
+   * clearing page 2. Otherwise — an RSID, a PSID with no room or none that fits — it is the default
+   * page, else the first one clear of the tune. An interrupt-entry tune's continuation must be clear
+   * too, and must lie past the trampoline.
+   */
   private chooseTrampolineBase(): number {
     const start = this.file.loadAddress;
     const end = Math.min(start + this.file.data.length, MEMORY_SIZE);
-    const overlapsTune = (base: number): boolean => base < end && start < base + TRAMPOLINE_LENGTH;
+    const overlapsTune = (at: number, length: number): boolean => at < end && start < at + length;
+    const fits = (base: number): boolean => {
+      if (!this.entersAsInterrupt) {
+        return !overlapsTune(base, TRAMPOLINE_LENGTH);
+      }
+      const continuation = this.interruptContinuation(base);
+      return (
+        continuation >= base + TRAMPOLINE_INTERRUPT_LENGTH &&
+        !overlapsTune(base, TRAMPOLINE_INTERRUPT_LENGTH) &&
+        !overlapsTune(continuation, INTERRUPT_CONTINUATION_LENGTH)
+      );
+    };
 
-    if (!overlapsTune(TRAMPOLINE_BASE)) {
+    if (this.file.format === 'PSID') {
+      const driverBase = this.firstDriverBase(fits, overlapsTune);
+      if (driverBase !== null) {
+        return driverBase;
+      }
+    }
+    if (fits(TRAMPOLINE_BASE)) {
       return TRAMPOLINE_BASE;
     }
     for (let page = FIRST_RELOCATABLE_PAGE; page <= LAST_RELOCATABLE_PAGE; page++) {
@@ -560,7 +1013,7 @@ class C64MachineImpl implements C64Machine {
         continue;
       }
       const base = page << 8;
-      if (!overlapsTune(base)) {
+      if (fits(base)) {
         return base;
       }
     }
@@ -570,19 +1023,56 @@ class C64MachineImpl implements C64Machine {
   }
 
   /**
+   * Where a PSID player would put its driver: the first page that `fits` in the header's free range,
+   * when the range is one libsidplayfp's `checkRelocInfo` accepts (both ends in the driver pages, clear
+   * of the image), else — for a tune that names none, a start page or a page count of 0 — the first
+   * page that `fits` from `DRIVER_FIRST_PAGE` to `DRIVER_LAST_PAGE`. Null when the header says there is
+   * no room, names a range that is not usable, or nothing fits.
+   */
+  private firstDriverBase(
+    fits: (base: number) => boolean,
+    overlapsTune: (at: number, length: number) => boolean,
+  ): number | null {
+    const startPage = this.file.relocStartPage ?? 0;
+    const pageCount = this.file.relocPages ?? 0;
+    if (startPage === RELOC_NO_ROOM_PAGE) {
+      return null;
+    }
+
+    let first = DRIVER_FIRST_PAGE;
+    let last = DRIVER_LAST_PAGE;
+    if (startPage !== 0 && pageCount !== 0) {
+      first = startPage;
+      last = startPage + pageCount - 1;
+      if (!isDriverPage(first) || !isDriverPage(last) || overlapsTune(first << 8, pageCount << 8)) {
+        return null;
+      }
+    }
+    for (let page = first; page <= last; page++) {
+      if (isDriverPage(page) && fits(page << 8)) {
+        return page << 8;
+      }
+    }
+    return null;
+  }
+
+  /**
    * A header play address of 0 means the tune installed its own interrupt handler during init.
-   * Returns 0 when neither vector moved off the RTI stub, rather than jumping to address 0.
+   * Returns 0 when neither vector moved off its default stub, rather than jumping to address 0.
    */
   private resolvePlayAddress(): number {
     if (this.file.playAddress !== 0) {
       return this.file.playAddress;
     }
-    const kernalVector = this.readWord(IRQ_VECTOR_KERNAL);
-    if (kernalVector !== IRQ_HANDLER_STUB) {
-      return kernalVector;
+    if (this.handlerIsOnKernalVector()) {
+      return this.readWord(IRQ_VECTOR_KERNAL);
     }
     const hardwareVector = this.readWord(IRQ_VECTOR_HARDWARE);
-    return hardwareVector === IRQ_HANDLER_STUB ? 0 : hardwareVector;
+    return hardwareVector === this.defaultHardwareVector ? 0 : hardwareVector;
+  }
+
+  private handlerIsOnKernalVector(): boolean {
+    return this.readWord(IRQ_VECTOR_KERNAL) !== IRQ_HANDLER_STUB;
   }
 
   private readWord(address: number): number {

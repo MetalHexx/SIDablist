@@ -20,6 +20,8 @@ interface HeaderOptions {
   author?: string;
   released?: string;
   flags?: number;
+  relocStartPage?: number;
+  relocPages?: number;
   secondSidByte?: number;
   thirdSidByte?: number;
   payload?: number[];
@@ -48,6 +50,10 @@ function buildSidFileBytes(options: HeaderOptions = {}): Uint8Array {
 
   if (headerSize >= 0x78 && options.flags !== undefined) {
     view.setUint16(0x76, options.flags, false);
+  }
+  if (headerSize >= 0x7c) {
+    buffer[0x78] = options.relocStartPage ?? 0;
+    buffer[0x79] = options.relocPages ?? 0;
   }
   if (headerSize >= 0x7b && options.secondSidByte !== undefined) {
     buffer[0x7a] = options.secondSidByte;
@@ -151,6 +157,34 @@ describe('parseSidFile', () => {
 
     expect(file.clock).toBe(clock);
     expect(file.model).toBe(model);
+  });
+
+  it.each([
+    ['a v2 PSID with flags bit 1 set', { version: 2, flags: 0b10 }, true],
+    ['a v4 PSID with flags bit 1 set', { version: 4, flags: 0b10 }, true],
+    ['a v2 PSID with it clear', { version: 2, flags: 0b01 }, false],
+    ['a v1 PSID, which has no flags', { version: 1 }, false],
+    ['an RSID, whose bit 1 is the BASIC flag', { magic: 'RSID', flags: 0b10 }, false],
+  ] as const)('reads the PlaySID-specific flag of %s', (_name, options, expected) => {
+    expect(parseSidFile(buildSidFileBytes(options)).psidSpecific).toBe(expected);
+  });
+
+  it('reads the relocation range from +$78 and +$79 of a v2 header', () => {
+    const file = parseSidFile(buildSidFileBytes({ relocStartPage: 0x50, relocPages: 0x10 }));
+
+    expect(file.relocStartPage).toBe(0x50);
+    expect(file.relocPages).toBe(0x10);
+  });
+
+  it.each([
+    ['a v2 header that ends at +$78, where those bytes are payload', { dataOffset: 0x78 }],
+    ['a v1 header', { version: 1 }],
+  ] as const)('leaves the relocation range at 0 for %s', (_name, options) => {
+    const file = parseSidFile(buildSidFileBytes({ ...options, payload: [0xa9, 0x42, 0x60] }));
+
+    expect(file.relocStartPage).toBe(0);
+    expect(file.relocPages).toBe(0);
+    expect(file.data).toEqual(new Uint8Array([0xa9, 0x42, 0x60]));
   });
 
   it('resolves a v3 secondSidAddress from the encoded byte', () => {

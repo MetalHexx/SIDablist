@@ -29,7 +29,9 @@ function sanitizedIntervalUs(nominalIntervalUs: number): number {
 }
 
 /** Reads both of `machine`'s rates and packages the one `mode` selects as the one in force. A null
- *  machine — nothing loaded — reports 1 for all three, same as a tune with no CIA timer latch. */
+ *  machine — nothing loaded — reports 1 for all three, same as a tune that plays once per frame. In
+ *  `'exact'` mode a timer slower than a frame puts the rate in force below 1, and every conversion
+ *  below stretches by it; `'rounded'` never goes under 1. */
 export function playRateFor(machine: C64Machine | null, mode: TimingMode): PlayRate {
   const exactCallsPerFrame = machine?.exactCallsPerFrame ?? 1;
   const roundedCallsPerFrame = machine?.callsPerFrame ?? 1;
@@ -52,9 +54,19 @@ export function asRounded(rate: PlayRate): PlayRate {
   return { ...rate, mode: 'rounded', callsPerFrame: rate.roundedCallsPerFrame };
 }
 
+/** µs between play calls at `callsPerFrame`, before the tempo multiplier. Takes the rate as a bare
+ *  number so a caller on the frame path divides without building a `PlayRate` to do it. A rate
+ *  below 1 — a timer slower than a frame — is a longer interval than the nominal one. */
+export function playCallIntervalUsAt(
+  nominalIntervalUs: number,
+  callsPerFrame: number,
+): Microseconds {
+  return microseconds(sanitizedIntervalUs(nominalIntervalUs) / callsPerFrame);
+}
+
 /** µs between play calls, before the tempo multiplier. */
 export function playCallIntervalUs(nominalIntervalUs: number, rate: PlayRate): Microseconds {
-  return microseconds(sanitizedIntervalUs(nominalIntervalUs) / rate.callsPerFrame);
+  return playCallIntervalUsAt(nominalIntervalUs, rate.callsPerFrame);
 }
 
 /** A real-time duration as a whole number of play calls. */

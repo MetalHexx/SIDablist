@@ -139,6 +139,31 @@ function multispeedBeatOutput(): ScanOutput {
   };
 }
 
+/** A stream from a timer slower than a frame (`callsPerFrame: 1`, `exactCallsPerFrame: 0.6`) with a
+ *  beat every 15 frames, ~0.5 s of music: all three voices start a note on each beat, and one voice
+ *  on each of the two steps between. */
+function slowTimerBeatOutput(): ScanOutput {
+  const beatFrames = 15;
+  const stepFrames = 5;
+  const frames = beatFrames * 40;
+  const controlBytes = new Uint8Array(frames * VOICES);
+  for (let f = 0; f < frames; f += stepFrames) {
+    const voicesStarting = f % beatFrames === 0 ? VOICES : 1;
+    for (let voice = 0; voice < voicesStarting; voice++) {
+      controlBytes[f * VOICES + voice] = 0x41;
+    }
+  }
+  return {
+    registerValues: new Uint8Array(frames * SID_REGISTER_COUNT),
+    writeCounts: new Uint8Array(frames),
+    frames,
+    callsPerFrame: 1,
+    exactCallsPerFrame: 0.6,
+    controlBytes,
+    retriggers: NO_RETRIGGERS,
+  };
+}
+
 describe('indexTune — the ladder', () => {
   it('opens with a zero-frame probe, and every rung after it shares that session', async () => {
     const scanner = new ScriptedScanner([
@@ -248,7 +273,7 @@ describe('indexTune — the ladder', () => {
 
     expect(record.sidHash).toBe('my-hash');
     expect(record.subtune).toBe(3);
-    expect(record.formatVersion).toBe(6);
+    expect(record.formatVersion).toBe(7);
     expect(record.callsPerFrame).toBe(1);
     expect(record.exactCallsPerFrame).toBe(1.03);
   });
@@ -292,6 +317,30 @@ describe('indexTune — the ladder', () => {
       endFrame: null,
     });
     expect(record.beatConfidence).not.toBe('none');
+  });
+
+  it("detects a slow timer's beat grid in frames, searching off the exact rate below one", async () => {
+    const beatOutput = slowTimerBeatOutput();
+    const scanner = new ScriptedScanner([
+      { kind: 'done', output: probeOutput(1, 0.6) },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+      { kind: 'done', output: beatOutput },
+    ]);
+
+    const record = await indexTune(scanner, BUNDLED_BYTES, IDENTITY);
+
+    // 15 frames at 19,950 µs / 0.6 calls-per-frame is ~0.4988 s of music, ~120 BPM. Read as a
+    // one-call-per-frame stream the same note starts would be 200 BPM beats.
+    expect(record.beatGrid).toEqual({
+      beatFrames: 15,
+      beatOneFrame: 0,
+      startFrame: 0,
+      endFrame: null,
+    });
+    expect(record.callsPerFrame).toBe(1);
+    expect(record.exactCallsPerFrame).toBe(0.6);
   });
 });
 

@@ -11,7 +11,11 @@ export interface MidiOutputPort {
   readonly portId: string | null;
   readonly supportsCancel: boolean;
   /** Omitting `timestampMs` sends immediately; supplying it hands the value to the underlying MIDI
-   *  subsystem's own clock so it releases the bytes when that clock reaches it. */
+   *  subsystem's own clock so it releases the bytes when that clock reaches it.
+   *
+   *  `bytes` is valid only during the call: the sink reuses the buffer behind it for a later send, so a
+   *  port that keeps it must copy. Web MIDI's `send` copies, and so do `postMessage` and a façade that
+   *  relays over one. */
   send(bytes: Uint8Array, timestampMs?: number): void;
   /** Withdraws whatever is still pending on this port. Returns whether it actually cancelled
    *  something — a port with nothing pending, or with no cancel support at all, reports `false`. */

@@ -127,3 +127,77 @@ describe('createTrackStructure', () => {
     expect(track.repeatEnabled()).toBe(false);
   });
 });
+
+describe('saving and restoring a track structure', () => {
+  const read = (track: TrackStructure) => ({
+    start: track.loopStartFrame(),
+    period: track.loopPeriodFrames(),
+    end: track.trackEndFrame(),
+    repeat: track.repeatEnabled(),
+  });
+
+  it('puts back a loop and the repeat setting that a later detection replaced', () => {
+    const track = createTrackStructure();
+    track.setTrackStructure({
+      loopStartFrame: frames(40),
+      loopPeriodFrames: frames(200),
+      endedAtFrame: null,
+    });
+    track.setRepeatEnabled(true);
+    const state = track.createState();
+    track.saveInto(state);
+    const saved = read(track);
+
+    track.setTrackStructure({
+      loopStartFrame: null,
+      loopPeriodFrames: null,
+      endedAtFrame: frames(70),
+    });
+    track.setRepeatEnabled(false);
+    track.restoreFrom(state);
+
+    expect(read(track)).toEqual(saved);
+    expect(saved.end).toBe(240);
+  });
+
+  it('puts back a track that only ended, and back to holding nothing', () => {
+    const track = createTrackStructure();
+    track.setTrackStructure({
+      loopStartFrame: null,
+      loopPeriodFrames: null,
+      endedAtFrame: frames(70),
+    });
+    const ended = track.createState();
+    track.saveInto(ended);
+    const nothing = track.createState();
+    track.setTrackStructure(null);
+    track.saveInto(nothing);
+
+    track.setTrackStructure({
+      loopStartFrame: frames(0),
+      loopPeriodFrames: frames(30),
+      endedAtFrame: null,
+    });
+    track.restoreFrom(ended);
+    expect(read(track)).toEqual({ start: null, period: null, end: 70, repeat: false });
+
+    track.restoreFrom(nothing);
+    expect(read(track)).toEqual({ start: null, period: null, end: null, repeat: false });
+  });
+
+  it('keeps a loop that starts at frame 0', () => {
+    const track = createTrackStructure();
+    track.setTrackStructure({
+      loopStartFrame: frames(0),
+      loopPeriodFrames: frames(64),
+      endedAtFrame: null,
+    });
+    const state = track.createState();
+    track.saveInto(state);
+    track.setTrackStructure(null);
+
+    track.restoreFrom(state);
+
+    expect(read(track)).toMatchObject({ start: 0, period: 64, end: 64 });
+  });
+});

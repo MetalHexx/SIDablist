@@ -1,8 +1,5 @@
 import type { ReplayRequest, ReplayResponse, ReplayRunner } from './replay-runner.js';
 
-const defaultWorkerFactory = (): Worker =>
-  new Worker(new URL('./replay.worker.js', import.meta.url), { type: 'module' });
-
 /**
  * The real runner: a dedicated worker thread that keeps a deep jump's emulation off the main one, so
  * a frame clock keeps ticking and a packet stream stays unbroken while the replay runs.
@@ -12,9 +9,7 @@ const defaultWorkerFactory = (): Worker =>
  * be in flight and only the newest one is wanted. The worker is constructed through
  * `workerFactory`, so a Node test never touches `Worker`.
  */
-export function createWorkerReplayRunner(
-  workerFactory: () => Worker = defaultWorkerFactory,
-): ReplayRunner {
+export function createWorkerReplayRunner(workerFactory: () => Worker): ReplayRunner {
   return new WorkerReplayRunnerImpl(workerFactory);
 }
 

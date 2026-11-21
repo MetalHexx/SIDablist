@@ -372,3 +372,64 @@ describe('moveBy held by a loop', () => {
     expect(travelled).toBe(0.5);
   });
 });
+
+describe('saving and restoring varispeed', () => {
+  const record = recordOf(24, RAMP, [
+    { entry: 3, register: 4, first: 0x11 },
+    { entry: 7, register: 4, first: 0x21 },
+    { entry: 12, register: 11, first: 0x41 },
+  ]);
+
+  /** What a run of moves feeds the chip, with where the playhead stands after each. */
+  function drive(varispeed: ReturnType<typeof createVarispeed>, rates: readonly number[]) {
+    const sink = new RecordingSink();
+    const fed: { writes: Write[]; position: number }[] = [];
+    for (const rate of rates) {
+      varispeed.moveBy(rate);
+      varispeed.feed(sink);
+      fed.push({ writes: sink.take(), position: varispeed.position });
+    }
+    return fed;
+  }
+
+  const ONWARD = [1, 1, 2.5, -6, 0.5, 0.5, 4, -1, 1, 1, 1, 3, -9, 0.25, 8];
+
+  it.each([5, 6.5, 9])(
+    'feeds the same bytes from a save made at position %s as if it had never left',
+    (position) => {
+      const varispeed = varispeedOver(record, 2);
+      varispeed.feed(new RecordingSink());
+      drive(varispeed, [1, 1, 1]);
+      varispeed.moveTo(position);
+      varispeed.feed(new RecordingSink());
+      const state = varispeed.createState();
+      varispeed.saveInto(state);
+
+      const never = drive(varispeed, ONWARD);
+      varispeed.setRecord(recordOf(8, RAMP));
+      drive(varispeed, [3, 3]);
+      varispeed.restoreFrom(state);
+      const restored = drive(varispeed, ONWARD);
+
+      expect(restored).toEqual(never);
+      expect(never.some((step) => step.writes.length > 0)).toBe(true);
+    },
+  );
+
+  it('puts back the record it held and no record at all', () => {
+    const varispeed = varispeedOver(record, 4);
+    const held = varispeed.createState();
+    varispeed.saveInto(held);
+    const empty = createVarispeed();
+    const none = empty.createState();
+    empty.saveInto(none);
+
+    varispeed.restoreFrom(none);
+    expect(varispeed.record).toBeNull();
+    expect(varispeed.position).toBe(0);
+
+    varispeed.restoreFrom(held);
+    expect(varispeed.record).toBe(record);
+    expect(varispeed.position).toBe(4);
+  });
+});

@@ -60,15 +60,15 @@ tree, and for upstream's own source, is `src/index.ts`, mirrored here as `index.
 
 `index.ts` is the entry point. It exports, all as named exports (see "What changed" below):
 
-| Export                                           | Kind     | Notes                                                                                                                                                                                                                                  |
-| ------------------------------------------------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mos6502`                                        | class    | The CPU. `new mos6502(read, write, debug?)` where `read: (address: number) => number` and `write: (address: number, value: number) => void`. Public: `emulate()`, `getFlag()`, `setFlag()`, `nmi()`, `reset()`, `irq()`, `getState()`. |
-| `decode`                                         | function | `(opcode: number) => Instruction` — opcode-to-instruction decode.                                                                                                                                                                      |
-| `hex`                                            | function | Formats a number as zero-padded uppercase hex.                                                                                                                                                                                         |
-| `formatDisassembly`                              | function | Formats a `DebugInfo` entry as a disassembly line.                                                                                                                                                                                     |
-| `formatRegisters`                                | function | Formats a `RegistersInfo` as a compact status string.                                                                                                                                                                                  |
-| `AddressingModes`, `AddressingModesMap`          | types    | From `addressing.ts`.                                                                                                                                                                                                                  |
-| `Instruction`, `Instructions`, `InstructionsMap` | types    | From `instructions.ts`.                                                                                                                                                                                                                |
+| Export                                           | Kind     | Notes                                                                                                                                                                                                                                                                                          |
+| ------------------------------------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mos6502`                                        | class    | The CPU. `new mos6502(bus, debug?)` where `bus` is a `Mos6502Bus`, an object with `read(address)` and `write(address, value)`. Public: `emulate()` (returns nothing), `processorStatus` (filled only when `debug` is on), `getFlag()`, `setFlag()`, `nmi()`, `reset()`, `irq()`, `getState()`. |
+| `decode`                                         | function | `(opcode: number) => Instruction` — opcode-to-instruction decode.                                                                                                                                                                                                                              |
+| `hex`                                            | function | Formats a number as zero-padded uppercase hex.                                                                                                                                                                                                                                                 |
+| `formatDisassembly`                              | function | Formats a `DebugInfo` entry as a disassembly line.                                                                                                                                                                                                                                             |
+| `formatRegisters`                                | function | Formats a `RegistersInfo` as a compact status string.                                                                                                                                                                                                                                          |
+| `AddressingModes`, `AddressingModesMap`          | types    | From `addressing.ts`.                                                                                                                                                                                                                                                                          |
+| `Instruction`, `Instructions`, `InstructionsMap` | types    | From `instructions.ts`.                                                                                                                                                                                                                                                                        |
 
 Present in the tree but **not** re-exported from `index.ts` (matching upstream, which doesn't
 re-export them either) — import these directly from their own files if needed:
@@ -79,7 +79,7 @@ re-export them either) — import these directly from their own files if needed:
 
 ## What changed from upstream
 
-Conversion only in this task — no behavioural edits:
+The conversion, then a rework for speed that changes no instruction's behaviour:
 
 - Every `export default` became a named export: `mos6502`, `decode`, `Flags`, `DebugInfo`,
   `RegistersInfo`.
@@ -88,6 +88,21 @@ Conversion only in this task — no behavioural edits:
   (`moduleResolution: NodeNext`, `verbatimModuleSyntax: true`).
 - Each `.ts` file carries a header naming this origin and stating that the file has been modified
   from upstream, so bugs introduced here aren't mistakenly attributed back to `kgtrey1/mos6502`.
+
+The rework leaves what each instruction and addressing mode does, and the cycles it takes, as upstream
+wrote them:
+
+- Every addressing mode and instruction, `ILL` included, is a prototype method rather than an arrow
+  function field, and `emulate`, `getFlag` and `setFlag` are methods too. The two dispatch tables
+  (`addressingModes`, `instructionsMap`) are built once for the class, not per instance, and map the same
+  names to the same methods, called with the instance as `this`. Dispatch is still by name, and stepping
+  is still a cycle at a time.
+- `emulate` returns nothing, where upstream returned a fresh `{ cycle, processorStatus }` every cycle.
+  The processor status is computed only when `debug` is on, and then kept on the public
+  `processorStatus` field.
+- The constructor takes one bus object, `{ read, write }`, and calls it directly at every access,
+  instead of taking two functions and storing them.
+- `decode` returns one shared constant for an opcode outside the matrix, instead of a new object.
 
 Everything else — logic, comments, formatting — is left as upstream wrote it.
 
