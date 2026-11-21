@@ -21,8 +21,9 @@ import type { AnchorRing, PositionAnchor } from './anchor-ring.js';
  * A target before the start of the tune resolves to frame 0 rather than erroring — a scrub dragged
  * off the left end of the bar is a gesture, not a fault.
  *
- * @returns the anchor the replay ran from — the ring's own image, overwritten by its next `record` — or null when `ring` holds nothing at or before the
- *   target — nothing loaded, or a ring reset and not yet reseeded. The pair is untouched then.
+ * @returns the anchor the replay ran from — the ring's own image, overwritten by its next `record`
+ *   — or null when `ring` holds nothing at or before the target — nothing loaded, or a ring reset
+ *   and not yet reseeded. The pair is untouched then.
  * @throws {FrameBudgetExceededError} when a replayed frame does not return inside its cycle budget.
  *   A thrown emulation error propagates untouched, as it does from `runFramesTo`.
  */

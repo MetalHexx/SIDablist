@@ -239,9 +239,13 @@ class SidPlayerCoordinator implements SidPlayer {
    *  it was taken at. Two numbers rather than an object, so a sync builds nothing. */
   private machineExactRate = 1;
   private machineRoundedRate = 1;
-  /** What the clock was last handed, or null before it has ever started — the rate diagnostics
-   *  report, rather than one derived from a tempo that may have changed while stopped. */
-  private runningIntervalUs: Microseconds | null = null;
+  /** Where `mirrorMachineRates` has the machine write its two rates. */
+  private readonly machineRates = new Float64Array(2);
+  /** What the clock was last handed, or NaN before it has ever started — the rate diagnostics
+   *  report, rather than one derived from a tempo that may have changed while stopped. A number
+   *  rather than a nullable one: V8 boxes every fractional store into a field that can also hold
+   *  null, and this is stored on every tick of a tune that keeps changing its rate. */
+  private runningIntervalUs = microseconds(Number.NaN);
 
   private readonly mutedVoices = [false, false, false];
   private readonly heldVoices = [false, false, false];
@@ -1790,6 +1794,9 @@ class SidPlayerCoordinator implements SidPlayer {
     if (state.varispeedActive && !this.varispeedActive && this.transport !== 'playing') {
       return 'taken in varispeed while the player is not playing';
     }
+    if (this.transport === 'stopped' || this.transport === 'ended') {
+      return 'into a player that has not started';
+    }
     return null;
   }
 
@@ -2056,7 +2063,7 @@ class SidPlayerCoordinator implements SidPlayer {
   /** The interval the running clock paces at — what a varispeed tick is handed as its own. Read
    *  from the value the clock was last given, since recomputing it builds a rate object. */
   private tickUs(): number {
-    return this.runningIntervalUs ?? 0;
+    return Number.isNaN(this.runningIntervalUs) ? 0 : this.runningIntervalUs;
   }
 
   /** Runs whatever loop is in force against the frame just rendered: a lap re-enters and owes the
@@ -2692,7 +2699,8 @@ class SidPlayerCoordinator implements SidPlayer {
    *  the rate the next `play()` would start at otherwise. */
   private reportedIntervalUs(): Microseconds {
     if (this.session.file === null) return microseconds(0);
-    return (this.transport === 'playing' || this.varispeedActive) && this.runningIntervalUs !== null
+    return (this.transport === 'playing' || this.varispeedActive) &&
+      !Number.isNaN(this.runningIntervalUs)
       ? this.runningIntervalUs
       : this.effectiveIntervalUs();
   }
@@ -2711,8 +2719,14 @@ class SidPlayerCoordinator implements SidPlayer {
   /** Copies `machine`'s two rates into the mirror — 1 and 1 with no machine — and says whether
    *  either moved. Two number compares, and nothing built. */
   private mirrorMachineRates(machine: C64Machine | null): boolean {
-    const exact = machine?.exactCallsPerFrame ?? 1;
-    const rounded = machine?.callsPerFrame ?? 1;
+    if (machine === null) {
+      this.machineRates[0] = 1;
+      this.machineRates[1] = 1;
+    } else {
+      machine.readRatesInto(this.machineRates);
+    }
+    const exact = this.machineRates[0];
+    const rounded = this.machineRates[1];
     if (exact === this.machineExactRate && rounded === this.machineRoundedRate) return false;
     this.machineExactRate = exact;
     this.machineRoundedRate = rounded;

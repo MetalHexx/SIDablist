@@ -211,6 +211,13 @@ export interface C64Machine {
   readonly exactCallsPerFrame: number;
 
   /**
+   * Writes `exactCallsPerFrame` to `into[0]` and `callsPerFrame` to `into[1]`: the same two numbers,
+   * for a caller that reads them on every tick. A getter returning a fractional double allocates
+   * when it is not inlined, and an array write does not.
+   */
+  readRatesInto(into: Float64Array): void;
+
+  /**
    * The cycle ceiling a `runFrame` call is allowed — `cyclesPerFrame * PLAY_BUDGET_FRAMES`, PAL or
    * NTSC depending on this tune's own clock. What a headroom figure divides `FrameResult.cyclesUsed`
    * against.
@@ -424,6 +431,11 @@ class C64MachineImpl implements C64Machine {
       return 1;
     }
     return Math.min(MAX_CALLS_PER_FRAME, this.cyclesPerFrame / cyclesPerCall);
+  }
+
+  readRatesInto(into: Float64Array): void {
+    into[0] = this.exactCallsPerFrame;
+    into[1] = this.callsPerFrame;
   }
 
   /**

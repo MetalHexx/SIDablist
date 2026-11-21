@@ -209,11 +209,10 @@ export interface SidPlayer {
    * tempo does; resets the anchor ring to its seed; and drops a jump still being replayed.
    *
    * Ignored, with a warning and no change, for a state from another file, subtune or load, one made
-   * for other crossing lines, one this player did not make, and one taken in varispeed while the
-   * player is not playing: nothing can start the clock from here.
-   *
-   * It needs a player that has started: a `stopped` or `ended` player keeps the transport, and
-   * `play()` from there begins again at frame 0, not at the restored position.
+   * for other crossing lines, one this player did not make, one taken in varispeed while the player
+   * is not playing (nothing can start the clock from here), and any state into a `stopped` or
+   * `ended` player: it keeps the transport, and `play()` from there begins again at frame 0, not at
+   * the restored position.
    */
   restoreState(from: SavedPlayerState): void;
 

@@ -6,7 +6,7 @@
 // core's tsconfig carries no Node types and the isolated CI job installs none, so the two Node
 // globals this needs are declared here rather than pulled from `@types/node`.
 declare const process: { memoryUsage(): { heapUsed: number } };
-type Gc = () => void;
+type Gc = (options?: { type: 'minor' | 'major' }) => void;
 
 /** `perf_hooks.constants.NODE_PERFORMANCE_GC_MINOR`: the entry kind of a young-generation collection. */
 const GC_KIND_MINOR = 1;
@@ -18,6 +18,11 @@ const GC_KIND_MINOR = 1;
  * the step path costs over a run of a million (about 3 MB for the core before it was reworked).
  */
 export const ALLOCATION_NOISE_BYTES = 256 * 1024;
+
+/** How long to wait after the warmup for the engine's background compiles to land. */
+const SETTLE_MS = 200;
+/** Passes that bring the code back to optimised after the collection that follows the warmup. */
+const REWARM = 3;
 
 export interface AllocationMeasurement {
   /** `heapUsed` after `work` minus before, with no collection in between. */
@@ -31,9 +36,9 @@ interface GcEntry {
 }
 
 /**
- * Runs `work` `warmup` times (default 2) so the engine has optimised it, collects, then runs it once
- * more and reports what that run allocated. Async because gc entries reach a `PerformanceObserver`
- * after a macrotask.
+ * Runs `work` `warmup` times (default 2) so the engine has optimised it, collects, runs it back up to
+ * speed, collects again, then runs it once more and reports what that run allocated. Async because
+ * gc entries reach a `PerformanceObserver` after a macrotask.
  *
  * Throws, rather than skipping, when the process was not started with `--expose-gc`: a measurement
  * that quietly cannot run would let an allocation regression pass.
@@ -54,7 +59,18 @@ export async function measureAllocation(
   for (let i = 0; i < warmup; i++) {
     work();
   }
+  // Optimised code that embeds an object the earlier work left dead is thrown away by the first
+  // collection, and the unoptimised code it falls back to boxes every fractional number it handles.
+  // So collect once, then run it back up to speed before the collection the measurement starts from.
   gc();
+  for (let i = 0; i < REWARM; i++) {
+    work();
+  }
+  // The engine compiles on another thread and installs on the next call after it finishes.
+  await new Promise<void>((resolve) => setTimeout(resolve, SETTLE_MS));
+  work();
+  // Only the young generation: a full collection here would throw the code away again.
+  gc({ type: 'minor' });
 
   let scavenges = 0;
   const count = (entries: readonly GcEntry[]): void => {

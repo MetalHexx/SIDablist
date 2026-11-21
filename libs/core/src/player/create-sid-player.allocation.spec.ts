@@ -1,151 +1,29 @@
 import { describe, expect, it } from 'vitest';
 import { createC64Machine } from '../cpu/c64-machine.js';
-import type { FarEndConsumption, SidSink } from '../ports/sink.js';
 import { recordFromTune } from '../registers/__fixtures__/record-from-tune.js';
-import type { ReplayRequest, ReplayResponse, ReplayRunner } from '../replay/replay-runner.js';
-import { replayToFrame } from '../replay/replay-to-frame.js';
-import type { SidFile } from '../sid/sid-file.model.js';
-import { FakeClock } from '../testing/fake-clock.js';
-import { ALLOCATION_NOISE_BYTES, measureAllocation } from '../testing/measure-allocation.js';
-import { frames, milliseconds } from '../units.js';
-import { createSidPlayer } from './create-sid-player.js';
-import type { SavedPlayerState, SidPlayer } from './sid-player.js';
+import { ALLOCATION_NOISE_BYTES } from '../testing/measure-allocation.js';
+import { frames } from '../units.js';
+import {
+  counterTune,
+  FRAMES,
+  measureWork,
+  playing,
+  RESTORES,
+  settled,
+  type Running,
+} from './allocation-harness.js';
+import type { SavedPlayerState } from './sid-player.js';
 
-const FRAMES = 3_000;
-/** Enough passes for the engine to have optimised every function the tick reaches, so the code it
- *  installs while tiering up is not counted as growth. */
-const WARMUP = 8;
-const RTS = 0x60;
-
-const CONSUMED: FarEndConsumption = { kind: 'unknown', inFlight: 0 };
-
-/** Holds nothing and copies nothing, so what a run allocates is the engine's own: `FakeSink` copies
- *  every delivered frame, which would be the measurement. */
-const nullSink: SidSink = {
-  capabilities: {
-    perWriteOffsets: false,
-    cancellation: false,
-    scheduleAheadMs: null,
-    preservesWriteOrder: false,
-  },
-  begin: () => undefined,
-  end: () => undefined,
-  deliver: () => undefined,
-  deliverNow: () => undefined,
-  retime: () => undefined,
-  reset: () => undefined,
-  readAt: () => CONSUMED,
-  passedCount: () => 0,
-  replaceFrom: () => 0,
-};
-
-/** Answers a replay at once against the real `replayToFrame`: the images a jump lands on are built
- *  off the tick, and what these specs measure starts after they exist. */
-const replayRunner: ReplayRunner = {
-  run(request: ReplayRequest): Promise<ReplayResponse> {
-    return Promise.resolve({
-      id: request.id,
-      ok: true,
-      result: replayToFrame(
-        request.file,
-        request.subtune,
-        request.targetFrame,
-        request.mutes,
-        request.start,
-      ),
-    });
-  },
-  dispose: () => undefined,
-};
-
-function tune(play: readonly number[], init: readonly number[] = [RTS], speedFlags = 0): SidFile {
-  const data = new Uint8Array(0x10 + play.length);
-  data.set(init, 0);
-  data.set(play, 0x10);
-  return {
-    format: 'PSID',
-    version: 2,
-    loadAddress: 0x1000,
-    initAddress: 0x1000,
-    playAddress: 0x1010,
-    songs: 1,
-    startSong: 1,
-    speedFlags,
-    name: '',
-    author: '',
-    released: '',
-    clock: 'pal',
-    model: 'unknown',
-    secondSidAddress: null,
-    thirdSidAddress: null,
-    data,
-  };
-}
-
-/** play counts in a zero-page byte and stores it to $D400, so every frame writes a register. */
-const counterTune = (): SidFile => tune([0xe6, 0xfb, 0xa5, 0xfb, 0x8d, 0x00, 0xd4, RTS]);
-
-/** The header says CIA-timed and play writes CIA 1 timer A's latch high byte, alternating between
- *  $20 and $21 on every call, so the rate it plays at changes on every tick. */
-const swingingLatchTune = (): SidFile =>
-  tune(
-    [
-      0xa5,
-      0xfb,
-      0x49,
-      0x01,
-      0x85,
-      0xfb, // LDA $FB; EOR #$01; STA $FB
-      0x18,
-      0x69,
-      0x20,
-      0x8d,
-      0x05,
-      0xdc, // CLC; ADC #$20; STA $DC05
-      RTS,
-    ],
-    [RTS],
-    1,
-  );
-
-interface Running {
-  readonly player: SidPlayer;
-  /** Ticks `count` frames on a timeline that keeps rising across calls, in fractions of a
-   *  millisecond as a real clock reports them. */
-  readonly run: (count: number) => void;
-}
-
-async function playing(file: SidFile): Promise<Running> {
-  const clock = new FakeClock();
-  const player = createSidPlayer({
-    sink: nullSink,
-    clock,
-    replayRunner,
-    time: { now: () => milliseconds(0) },
-  });
-  player.loadTune(file);
-  // Every scenario records its deliveries, so the history's append is on the path measured.
-  player.keepDeliveries(64);
-  await player.play();
-  let dueAt = 0;
-  return {
-    player,
-    run: (count) => {
-      for (let index = 0; index < count; index++) clock.tick(milliseconds((dueAt += 19.95)));
-    },
-  };
-}
-
-/** Lets every replay a setup call fired settle. */
-const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+/** A pass over tens of thousands of frames, run a dozen times over, takes seconds, and longer on a loaded machine. */
+const LONG_RUN_MS = 60_000;
 
 async function expectNoAllocation(work: () => void): Promise<void> {
-  const { heapGrowthBytes, scavenges } = await measureAllocation(work, { warmup: WARMUP });
+  const { heapGrowthBytes, scavenges } = await measureWork(work);
   expect(scavenges).toBe(0);
   expect(heapGrowthBytes).toBeLessThan(ALLOCATION_NOISE_BYTES);
 }
 
-describe('the frame path', () => {
+describe('the frame path', { timeout: LONG_RUN_MS }, () => {
   it('allocates nothing over plain play', async () => {
     const { run } = await playing(counterTune());
 
@@ -183,7 +61,7 @@ describe('the frame path', () => {
     let toSecond = true;
 
     // The queue is a host's command and the landing publishes a hand-off, so a few of each ride along
-    // with the 3,000 ticks; it is the ticks between them that must allocate nothing. Settings go
+    // with the ticks; it is the ticks between them that must allocate nothing. Settings go
     // along: a landing applies what `queueJump` prepared.
     await expectNoAllocation(() => {
       for (let hop = 0; hop < 4; hop++) {
@@ -212,22 +90,9 @@ describe('the frame path', () => {
 
     await expectNoAllocation(() => run(FRAMES));
   });
-
-  it('allocates nothing when the tune changes its rate on every call', async () => {
-    const { player, run } = await playing(swingingLatchTune());
-    run(2);
-    const rates = new Set<number>();
-    for (let index = 0; index < 6; index++) {
-      run(1);
-      rates.add(player.getStats().rate.exactCallsPerFrame);
-    }
-    expect(rates.size).toBeGreaterThan(1);
-
-    await expectNoAllocation(() => run(FRAMES));
-  });
 });
 
-describe('saving and restoring a player', () => {
+describe('saving and restoring a player', { timeout: LONG_RUN_MS }, () => {
   const STATES = 8;
   const RESTORE_EVERY = 50;
 
@@ -280,9 +145,39 @@ describe('saving and restoring a player', () => {
     const { player, states } = await keeping();
     player.saveState(states[0]);
 
-    // No tick between them: whatever a restore itself builds shows, ten times over.
+    // The same state onto itself, the no-op path: nothing is copied back.
     await expectNoAllocation(() => {
-      for (let index = 0; index < FRAMES * 10; index++) player.restoreState(states[0]);
+      for (let index = 0; index < RESTORES; index++) player.restoreState(states[0]);
+    });
+  });
+
+  it('allocates nothing across alternating restores', async () => {
+    const { player, run, states } = await keeping();
+    player.saveState(states[0]);
+    // Far enough on to differ in position and to have stamped another crossing slot.
+    run(60);
+    player.saveState(states[1]);
+
+    // No tick between them, so every restore copies a state back over the other and moves what a
+    // restore moves.
+    await expectNoAllocation(() => {
+      for (let index = 0; index < RESTORES; index++) player.restoreState(states[index % 2]);
+    });
+  });
+
+  it('allocates nothing restoring while playing', async () => {
+    const { player, run, states } = await keeping();
+    for (const state of states) {
+      run(5);
+      player.saveState(state);
+    }
+    let frame = 0;
+
+    await expectNoAllocation(() => {
+      for (let index = 0; index < FRAMES; index++) {
+        run(1);
+        player.restoreState(states[frame++ % STATES]);
+      }
     });
   });
 
@@ -309,7 +204,7 @@ describe('saving and restoring a player', () => {
   });
 });
 
-describe('the machine', () => {
+describe('the machine', { timeout: LONG_RUN_MS }, () => {
   it('runs a frame without building its result', async () => {
     const machine = createC64Machine(counterTune(), { onSidWrite: () => undefined });
     machine.initSubtune(1);

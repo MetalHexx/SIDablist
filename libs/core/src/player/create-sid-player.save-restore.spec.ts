@@ -766,6 +766,63 @@ describe('restoring a saved state', () => {
       }
     });
 
+    it('into a player that has not started, before any play', async () => {
+      const rig = await Rig.playing(chordTune());
+      rig.run(6);
+      const state = rig.player.createSavedState();
+      rig.player.saveState(state);
+      rig.player.stop();
+      expect(rig.player.getSnapshot().transport).toBe('stopped');
+      const before = untouched(rig);
+
+      rig.player.restoreState(state);
+
+      expect(warn).toHaveBeenCalledWith(
+        'SID player: ignoring a saved state into a player that has not started.',
+      );
+      expect(untouched(rig)).toEqual(before);
+    });
+
+    it('into a player that has ended', async () => {
+      const rig = new Rig(chordTune());
+      rig.player.setTrackStructure({
+        loopStartFrame: null,
+        loopPeriodFrames: null,
+        endedAtFrame: frames(8),
+      });
+      rig.player.setRepeatTrack(false);
+      await rig.player.play();
+      rig.run(4);
+      const state = rig.player.createSavedState();
+      rig.player.saveState(state);
+      rig.run(4);
+      expect(rig.player.getSnapshot().transport).toBe('ended');
+      const before = untouched(rig);
+
+      rig.player.restoreState(state);
+
+      expect(warn).toHaveBeenCalledWith(
+        'SID player: ignoring a saved state into a player that has not started.',
+      );
+      expect(untouched(rig)).toEqual(before);
+    });
+
+    it('but not into a paused player, which keeps its transport', async () => {
+      const rig = await Rig.playing(chordTune());
+      rig.run(6);
+      const state = rig.player.createSavedState();
+      rig.player.saveState(state);
+      rig.run(5);
+      rig.player.pause();
+      rig.run(0);
+
+      rig.player.restoreState(state);
+
+      expect(warn).not.toHaveBeenCalled();
+      expect(rig.player.getPosition()).toBe(6);
+      expect(rig.player.getSnapshot().transport).toBe('paused');
+    });
+
     it('from another subtune', async () => {
       const rig = await Rig.playing(tune([RTS], [RTS], 2));
       rig.run(4);

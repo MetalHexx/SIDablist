@@ -246,6 +246,10 @@ describe('C64Machine', () => {
     // The integer form still answers its own question, and the two genuinely disagree here — an
     // interval divided by the rounded rate would run this tune 20% slow.
     expect(machine.callsPerFrame).toBe(2);
+
+    const into = new Float64Array(2);
+    machine.readRatesInto(into);
+    expect([into[0], into[1]]).toEqual([machine.exactCallsPerFrame, machine.callsPerFrame]);
   });
 
   it("reports the frame cycle budget against the tune's own clock, PAL or NTSC", () => {

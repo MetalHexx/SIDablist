@@ -167,6 +167,7 @@ export class IoChips {
    */
   beginCall(drive: CallDrive): void {
     const s = this.state;
+    this.rebase();
     const due = s[CALL_DUE];
     const start = Math.max(due, s[CALL_END]);
     s[CALL_START] = start;
@@ -183,6 +184,28 @@ export class IoChips {
     }
     s[CIA1 + CIA_FLAGS] |= CIA_INTERRUPT_TIMER_A_BIT;
     s[CALL_DUE] = start + s[timerA + LATCH] + 1;
+  }
+
+  /**
+   * Moves the clock's zero up to the end of the last call, so every cycle count the frame path
+   * handles stays small however long the tune has played. Only differences between these counts are
+   * ever read, so nothing observable moves; but a count past what a 32-bit integer holds is a
+   * double the engine boxes each time one crosses a call, which would make every play call of a
+   * CIA-timed tune allocate. The stamps of the timers a tune never touches fall behind by the
+   * shift, which their next sync takes back out.
+   */
+  private rebase(): void {
+    const s = this.state;
+    const origin = s[CALL_END];
+    if (origin === 0) {
+      return;
+    }
+    s[CALL_END] = 0;
+    s[CALL_DUE] -= origin;
+    s[CIA1 + TIMER_A + SYNC] -= origin;
+    s[CIA1 + TIMER_B + SYNC] -= origin;
+    s[CIA2 + TIMER_A + SYNC] -= origin;
+    s[CIA2 + TIMER_B + SYNC] -= origin;
   }
 
   /** The call that `beginCall` started has ended after `cyclesUsed` cycles. */
