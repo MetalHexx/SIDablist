@@ -13,6 +13,7 @@ import {
   PLAY_BUDGET_FRAMES,
   TRAMPOLINE_BASE,
   TRAMPOLINE_IDLE_OFFSET,
+  TRAMPOLINE_PLAY_RETURN_OFFSET,
 } from './cpu-constants.js';
 import type { SidClock, SidFile } from '../sid/sid-file.model.js';
 import { parseSidFile } from '../sid/sid-file.parser.js';
@@ -400,6 +401,7 @@ describe('C64Machine placing the trampoline', () => {
     readonly machine: C64Machine;
     readonly initCompleted: boolean;
     readonly completed: boolean[];
+    readonly cycles: number[];
   }
 
   function runCalls(file: SidFile, calls: number): CallsRun {
@@ -407,8 +409,17 @@ describe('C64Machine placing the trampoline', () => {
     const machine = createC64Machine(file, sink);
     const initCompleted = machine.initSubtune(1).completed;
     sink.writes.length = 0;
-    const completed = Array.from({ length: calls }, () => machine.runFrame().completed);
-    return { sink, machine, initCompleted, completed };
+    const results = Array.from({ length: calls }, () => {
+      const { completed, cyclesUsed } = machine.runFrame();
+      return { completed, cyclesUsed };
+    });
+    return {
+      sink,
+      machine,
+      initCompleted,
+      completed: results.map((result) => result.completed),
+      cycles: results.map((result) => result.cyclesUsed),
+    };
   }
 
   it('keeps the trampoline clear of an init that fills the RAM under the KERNAL', () => {
@@ -531,27 +542,51 @@ describe('C64Machine placing the trampoline', () => {
     expect(sink.writes).toEqual(Array(3).fill({ register: 0, value: 0x22 }));
   });
 
-  it('ends a call on an opcode fetch of the idle address, not on a data read of it', () => {
-    // play: LDA idle / LDA #$44 / STA $D400 / RTS — the first load reads the idle address as data.
-    const playReadingIdle = (idle: number): SidFile =>
+  it.each([
+    ['the idle address', TRAMPOLINE_IDLE_OFFSET],
+    ["the play JSR's return address", TRAMPOLINE_PLAY_RETURN_OFFSET],
+  ])('ends a call on an opcode fetch of %s, not on a data read of it', (_name, offset) => {
+    // play: LDA <address> / LDA #$44 / STA $D400 / RTS — the first load reads the address as data.
+    const playReading = (address: number): SidFile =>
       tune({
         playAddress: 0x1001,
         blocks: [
           { at: 0x1000, bytes: [0x60] },
           {
             at: 0x1001,
-            bytes: [0xad, idle & 0xff, idle >> 8, 0xa9, 0x44, 0x8d, 0x00, 0xd4, 0x60],
+            bytes: [0xad, address & 0xff, address >> 8, 0xa9, 0x44, 0x8d, 0x00, 0xd4, 0x60],
           },
         ],
       });
-    const probe = createC64Machine(playReadingIdle(0), new RecordingSink());
+    const probe = createC64Machine(playReading(0), new RecordingSink());
     probe.initSubtune(1);
-    const idle = probe.trampolineBase + TRAMPOLINE_IDLE_OFFSET;
+    const address = probe.trampolineBase + offset;
 
-    const { sink, completed } = runCalls(playReadingIdle(idle), 3);
+    const { sink, completed } = runCalls(playReading(address), 3);
 
     expect(completed).toEqual([true, true, true]);
     expect(sink.writes).toEqual(Array(3).fill({ register: 0, value: 0x44 }));
+  });
+
+  it('counts a play routine that returns with RTI through the trampoline JSR frame as returned', () => {
+    // play: LDA #$66 / STA $D400 / JSR sub. sub: PLA / RTI — the PLA drops one byte of play's own JSR
+    // frame, so the RTI pulls a status byte and then the trampoline JSR's return address as its PC.
+    const file = tune({
+      playAddress: 0x1001,
+      blocks: [
+        { at: 0x1000, bytes: [0x60] },
+        { at: 0x1001, bytes: [0xa9, 0x66, 0x8d, 0x00, 0xd4, 0x20, 0x09, 0x10, 0x68, 0x40] },
+      ],
+    });
+
+    const { sink, initCompleted, completed, cycles } = runCalls(file, 4);
+
+    expect(initCompleted).toBe(true);
+    expect(completed).toEqual([true, true, true, true]);
+    expect(sink.writes).toEqual(Array(4).fill({ register: 0, value: 0x66 }));
+    // Without the sentinel the RTI lands in a walk through empty RAM that takes thousands of cycles
+    // to wander back onto the idle address, if it does.
+    expect(Math.max(...cycles)).toBeLessThan(100);
   });
 });
 

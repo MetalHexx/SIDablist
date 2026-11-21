@@ -123,6 +123,11 @@ export const TRAMPOLINE_LENGTH = 0x11;
 export const TRAMPOLINE_INIT_OFFSET = 0x00;
 export const TRAMPOLINE_PLAY_OFFSET = 0x08;
 export const TRAMPOLINE_PLAY_TARGET_OFFSET = 0x09;
+/**
+ * The address the `JSR play` pushes, its last byte: an `RTS` from the play routine lands one byte on,
+ * at the `JMP idle`, and only an `RTI` that pulls the `JSR`'s frame as its PC lands here.
+ */
+export const TRAMPOLINE_PLAY_RETURN_OFFSET = 0x0a;
 export const TRAMPOLINE_IDLE_OFFSET = 0x0e;
 
 /**

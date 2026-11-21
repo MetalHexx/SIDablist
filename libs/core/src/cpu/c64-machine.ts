@@ -65,6 +65,7 @@ import {
   TRAMPOLINE_INTERRUPT_TAIL_OFFSET,
   TRAMPOLINE_LENGTH,
   TRAMPOLINE_PLAY_OFFSET,
+  TRAMPOLINE_PLAY_RETURN_OFFSET,
   TRAMPOLINE_PLAY_TARGET_OFFSET,
   VIC_CONTROL_IDLE_BITS,
   VIC_CONTROL_REGISTER,
@@ -578,9 +579,15 @@ class C64MachineImpl implements C64Machine {
     const fetchingOpcode = this.expectingOpcodeFetch;
     this.expectingOpcodeFetch = false;
 
-    if (fetchingOpcode && address === this.idleAddress) {
+    if (
+      fetchingOpcode &&
+      (address === this.idleAddress ||
+        (address === this.trampoline + TRAMPOLINE_PLAY_RETURN_OFFSET && !this.entersAsInterrupt))
+    ) {
       // The only reason the CPU ever fetches an opcode from the idle block is that the routine
-      // returned; a data read of that address, from a tune sharing the page, is no return.
+      // returned; a data read of that address, from a tune sharing the page, is no return. A play
+      // routine that returns with `RTI` pulls the trampoline `JSR`'s frame as its PC and lands on that
+      // `JSR`'s own last byte, which an `RTS` never reaches: it has returned too, so it counts here.
       // Detecting it here keeps the hot loop free of the allocations `getState()` would cost.
       this.reachedIdle = true;
     }

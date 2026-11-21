@@ -269,7 +269,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   page 2 (_Piracy_): the call then never reaches the idle address, or reaches it by running tune data as
   code, and either way the header's play routine never runs. An RSID keeps `$EA00`: moving it changed 35
   of 69 sampled, all unloadable either way. A call ends only on an opcode fetch of the idle address,
-  never on a read of it as data, which a tune sharing the trampoline's page can make. Everything else
+  never on a read of it as data, which a tune sharing the trampoline's page can make; a `JSR`-entry call
+  also ends on an opcode fetch of the play `JSR`'s last byte (`base+$0A`), where a play routine that
+  returns with `RTI` lands once it has pulled the `JSR`'s frame (_Blood n' Guts_: its IRQ routine, called
+  by `JSR`, ends `PLA/TAY/PLA/TAX/PLA/RTI`), and an `RTS` never does. Without it that tune's call ran on
+  into junk and only "completed" when a data read of the idle address counted. Everything else
   a tune writes over, the KERNAL's `$EA31`/`$EA7E`/`$EA81` and `$FE66` stubs among it, is still plain
   RAM here, and a tune that fills the RAM under `$E000` takes those with it.
 - **A read of a chip register can change the chip, so a read is made once and nowhere else.** A PSID's
