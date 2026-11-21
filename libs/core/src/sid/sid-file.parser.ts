@@ -27,6 +27,11 @@ const OFFSET_NAME = 0x16;
 const OFFSET_AUTHOR = 0x36;
 const OFFSET_RELEASED = 0x56;
 const OFFSET_FLAGS = 0x76;
+const OFFSET_RELOC_START_PAGE = 0x78;
+const OFFSET_RELOC_PAGES = 0x79;
+// The data offset of a full v2+ header. A v2 header may end earlier, at `MIN_HEADER_BYTES_V2`, and the
+// relocation bytes are then the payload's first bytes.
+const FULL_HEADER_DATA_OFFSET = 0x7c;
 const OFFSET_SECOND_SID = 0x7a;
 const OFFSET_THIRD_SID = 0x7b;
 const TEXT_FIELD_LENGTH = 32;
@@ -85,12 +90,18 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
   let secondSidAddress: number | null = null;
   let thirdSidAddress: number | null = null;
   let psidSpecific = false;
+  let relocStartPage = 0;
+  let relocPages = 0;
 
   if (version >= 2) {
     const flags = view.getUint16(OFFSET_FLAGS, false);
     psidSpecific = magic === 'PSID' && (flags & 0b10) !== 0;
     clock = decodeClock((flags >> 2) & 0b11);
     model = decodeModel((flags >> 4) & 0b11);
+    if (dataOffset >= FULL_HEADER_DATA_OFFSET) {
+      relocStartPage = bytes[OFFSET_RELOC_START_PAGE];
+      relocPages = bytes[OFFSET_RELOC_PAGES];
+    }
   }
   if (version >= 3) {
     secondSidAddress = decodeExtraSidAddress(bytes[OFFSET_SECOND_SID]);
@@ -125,6 +136,8 @@ export function parseSidFile(bytes: Uint8Array): SidFile {
     startSong,
     speedFlags,
     psidSpecific,
+    relocStartPage,
+    relocPages,
     name,
     author,
     released,

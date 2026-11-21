@@ -260,6 +260,18 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (`INTERRUPT_ENTRY_EXTRA_CYCLES_*`). An RSID keeps the `JSR` entry and one `RTI` at `$EA31`, which its `BRK` shares; a
   PSID's `BRK` runs a separate `RTI` stub (`BRK_HANDLER_STUB`) that `resolvePlayAddress` treats as the
   default `$FFFE`.
+- **A PSID's trampoline lives where a PSID driver would, because a tune's init may overwrite any RAM
+  it is not asked to keep.** `chooseTrampolineBase` takes the header's free range (`relocStartPage` and
+  `relocPages`, read from `+$78`/`+$79` when the header reaches them) when it is one libsidplayfp's
+  `checkRelocInfo` accepts, else for a tune that names none the first page from `$04` to `$CF` outside
+  `$A0`–`$BF` that `fits()`, and only then falls back to `$EA00` and the first page from `$02`. Seven
+  tunes copy their player under the KERNAL to `$E000` and up, over the old trampoline, and one clears
+  page 2 (_Piracy_): the call then never reaches the idle address, or reaches it by running tune data as
+  code, and either way the header's play routine never runs. An RSID keeps `$EA00`: moving it changed 35
+  of 69 sampled, all unloadable either way. A call ends only on an opcode fetch of the idle address,
+  never on a read of it as data, which a tune sharing the trampoline's page can make. Everything else
+  a tune writes over, the KERNAL's `$EA31`/`$EA7E`/`$EA81` and `$FE66` stubs among it, is still plain
+  RAM here, and a tune that fills the RAM under `$E000` takes those with it.
 - **A read of a chip register can change the chip, so a read is made once and nowhere else.** A PSID's
   `$D019`, `$D01A` and CIA `$x4`–`$xF` come from `IoChips`, and a read of `$xD` returns the flags and
   clears them. `C64MachineImpl.read` is the only caller and calls once per bus access: a classifier, a
@@ -483,7 +495,8 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   covering it is overwritten rather than relocated around. Update the constants, then run
   `cpu/c64-machine.spec.ts` (the `entering a handler as an interrupt` specs) and the HVSC fingerprint
   check (`fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench), since
-  every tune's writes ride on this entry. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
+  every tune's writes ride on this entry. A change to where a PSID's trampoline goes
+  (`chooseTrampolineBase`) is `--change trampoline`. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
 - **Changed the VIC or CIA model (`cpu/io-chips.ts`; the register addresses in `cpu/cpu-constants.ts`;
   `readBus`, `readChipRegister` and `write` in `cpu/c64-machine.ts`)?** What a tune reads from
   `$D019`, `$D01A` and the CIA timers decides which branch a player takes, so a shifted flag, period

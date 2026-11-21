@@ -17,6 +17,13 @@ export interface SidFile {
    * or later has one; an RSID's bit 1 means something else and is not read.
    */
   readonly psidSpecific?: boolean;
+  /**
+   * The header's free range for a driver, in pages: `relocStartPage` is the first page and `relocPages`
+   * how many. Absent means 0 — "clean", the tune keeps no claim on where the driver goes. `$FF` for the
+   * start page means no room. Read only when the header reaches `+$78`/`+$79`, else both are 0.
+   */
+  readonly relocStartPage?: number;
+  readonly relocPages?: number;
   readonly name: string;
   readonly author: string;
   readonly released: string;

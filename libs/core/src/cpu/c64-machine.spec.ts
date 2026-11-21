@@ -12,6 +12,7 @@ import {
   PAL_CYCLES_PER_FRAME,
   PLAY_BUDGET_FRAMES,
   TRAMPOLINE_BASE,
+  TRAMPOLINE_IDLE_OFFSET,
 } from './cpu-constants.js';
 import type { SidClock, SidFile } from '../sid/sid-file.model.js';
 import { parseSidFile } from '../sid/sid-file.parser.js';
@@ -32,6 +33,8 @@ interface TuneOptions {
   version?: number;
   speedFlags?: number;
   psidSpecific?: boolean;
+  relocStartPage?: number;
+  relocPages?: number;
   padTo?: number;
   secondSidAddress?: number | null;
   thirdSidAddress?: number | null;
@@ -60,6 +63,8 @@ function tune(options: TuneOptions): SidFile {
     startSong: 1,
     speedFlags: options.speedFlags ?? 0,
     ...(options.psidSpecific === undefined ? {} : { psidSpecific: options.psidSpecific }),
+    ...(options.relocStartPage === undefined ? {} : { relocStartPage: options.relocStartPage }),
+    ...(options.relocPages === undefined ? {} : { relocPages: options.relocPages }),
     name: '',
     author: '',
     released: '',
@@ -369,6 +374,184 @@ describe('C64Machine', () => {
 
     // The PSID convention is zero-based in the accumulator even though subtunes are 1-based.
     expect(valuesFor(sink, 0)).toEqual([0, 2]);
+  });
+});
+
+describe('C64Machine placing the trampoline', () => {
+  const PLAY = [0xa9, 0x11, 0x8d, 0x00, 0xd4, 0x60]; // LDA #$11 / STA $D400 / RTS
+  const PLAY_AT = 0x100a;
+
+  /** LDA #0 / TAX / loop: STA `page`,X / INX / BNE loop / RTS — an init that clears one page. */
+  const clearPage = (page: number): number[] => [
+    0xa9,
+    0x00,
+    0xaa,
+    0x9d,
+    0x00,
+    page,
+    0xe8,
+    0xd0,
+    0xfa,
+    0x60,
+  ];
+
+  interface CallsRun {
+    readonly sink: RecordingSink;
+    readonly machine: C64Machine;
+    readonly initCompleted: boolean;
+    readonly completed: boolean[];
+  }
+
+  function runCalls(file: SidFile, calls: number): CallsRun {
+    const sink = new RecordingSink();
+    const machine = createC64Machine(file, sink);
+    const initCompleted = machine.initSubtune(1).completed;
+    sink.writes.length = 0;
+    const completed = Array.from({ length: calls }, () => machine.runFrame().completed);
+    return { sink, machine, initCompleted, completed };
+  }
+
+  it('keeps the trampoline clear of an init that fills the RAM under the KERNAL', () => {
+    const file = tune({
+      playAddress: PLAY_AT,
+      blocks: [
+        { at: 0x1000, bytes: clearPage(0xea) },
+        { at: PLAY_AT, bytes: PLAY },
+      ],
+    });
+
+    const { sink, machine, initCompleted, completed } = runCalls(file, 4);
+
+    expect(machine.trampolineBase).toBeGreaterThanOrEqual(0x0400);
+    expect(machine.trampolineBase).toBeLessThan(0xa000);
+    expect(initCompleted).toBe(true);
+    expect(completed).toEqual([true, true, true, true]);
+    expect(sink.writes).toEqual(Array(4).fill({ register: 0, value: 0x11 }));
+  });
+
+  it('puts the trampoline on a page of the header range', () => {
+    const file = tune({
+      playAddress: 0x1001,
+      relocStartPage: 0x50,
+      relocPages: 0x10,
+      blocks: [{ at: 0x1000, bytes: [0x60, ...PLAY] }],
+    });
+
+    const { machine, initCompleted, completed } = runCalls(file, 2);
+
+    expect(machine.trampolineBase).toBe(0x5000);
+    expect(initCompleted).toBe(true);
+    expect(completed).toEqual([true, true]);
+  });
+
+  it('ignores a header range that overlaps the image', () => {
+    const file = tune({
+      loadAddress: 0x5000,
+      playAddress: 0x5001,
+      padTo: 0x5200,
+      relocStartPage: 0x4f,
+      relocPages: 0x08,
+      blocks: [{ at: 0x5000, bytes: [0x60, ...PLAY] }],
+    });
+
+    expect(runCalls(file, 1).machine.trampolineBase).toBe(TRAMPOLINE_BASE);
+  });
+
+  it.each([
+    ['names the zero page, the stack and the KERNAL work area', 0x02, 0x04],
+    ['names the BASIC ROM', 0xa0, 0x10],
+    ['runs into the I/O area', 0xc8, 0x10],
+    ['runs past $FF', 0x80, 0x90],
+    ['says there is no room', 0xff, 0x01],
+  ])('falls back to the default page when the header range %s', (_name, startPage, pages) => {
+    const file = tune({
+      playAddress: 0x1001,
+      relocStartPage: startPage,
+      relocPages: pages,
+      blocks: [{ at: 0x1000, bytes: [0x60, ...PLAY] }],
+    });
+
+    expect(runCalls(file, 1).machine.trampolineBase).toBe(TRAMPOLINE_BASE);
+  });
+
+  it('keeps an RSID on the default page whatever its header says', () => {
+    const file = tune({
+      format: 'RSID',
+      playAddress: 0x1001,
+      relocStartPage: 0x50,
+      relocPages: 0x10,
+      blocks: [{ at: 0x1000, bytes: [0x60, ...PLAY] }],
+    });
+
+    expect(runCalls(file, 1).machine.trampolineBase).toBe(TRAMPOLINE_BASE);
+  });
+
+  it('keeps the trampoline clear of an init that clears page 2', () => {
+    const file = tune({
+      loadAddress: 0xe600,
+      initAddress: 0xe600,
+      playAddress: 0xe60a,
+      padTo: 0xec00,
+      blocks: [
+        { at: 0xe600, bytes: clearPage(0x02) },
+        { at: 0xe60a, bytes: PLAY },
+      ],
+    });
+
+    const { sink, machine, initCompleted, completed } = runCalls(file, 3);
+
+    expect(machine.trampolineBase).toBeGreaterThanOrEqual(0x0400);
+    expect(initCompleted).toBe(true);
+    expect(completed).toEqual([true, true, true]);
+    expect(sink.writes).toEqual(Array(3).fill({ register: 0, value: 0x11 }));
+  });
+
+  it('keeps an interrupt-entry trampoline and its continuation clear of an init that wipes the old page', () => {
+    // init: $0314 = $1100, then zero $EA00-$EA3F and $EAC0-$EAFF — the old trampoline and its $EAEA
+    // continuation, but not the $EA7E/$EA81 exits the handler leaves through.
+    const init = [
+      0xa9, 0x00, 0x8d, 0x14, 0x03, 0xa9, 0x11, 0x8d, 0x15, 0x03, 0xa9, 0x00, 0xaa, 0x9d, 0x00,
+      0xea, 0x9d, 0xc0, 0xea, 0xe8, 0xe0, 0x40, 0xd0, 0xf5, 0x60,
+    ];
+    // LDA #$22 / STA $D400 / JMP $EA81
+    const handler = [0xa9, 0x22, 0x8d, 0x00, 0xd4, 0x4c, 0x81, 0xea];
+    const file = tune({
+      playAddress: 0,
+      blocks: [
+        { at: 0x1000, bytes: init },
+        { at: 0x1100, bytes: handler },
+      ],
+    });
+
+    const { sink, machine, initCompleted, completed } = runCalls(file, 3);
+
+    expect(machine.trampolineBase).toBeGreaterThanOrEqual(0x3000);
+    expect(initCompleted).toBe(true);
+    expect(completed).toEqual([true, true, true]);
+    expect(sink.writes).toEqual(Array(3).fill({ register: 0, value: 0x22 }));
+  });
+
+  it('ends a call on an opcode fetch of the idle address, not on a data read of it', () => {
+    // play: LDA idle / LDA #$44 / STA $D400 / RTS — the first load reads the idle address as data.
+    const playReadingIdle = (idle: number): SidFile =>
+      tune({
+        playAddress: 0x1001,
+        blocks: [
+          { at: 0x1000, bytes: [0x60] },
+          {
+            at: 0x1001,
+            bytes: [0xad, idle & 0xff, idle >> 8, 0xa9, 0x44, 0x8d, 0x00, 0xd4, 0x60],
+          },
+        ],
+      });
+    const probe = createC64Machine(playReadingIdle(0), new RecordingSink());
+    probe.initSubtune(1);
+    const idle = probe.trampolineBase + TRAMPOLINE_IDLE_OFFSET;
+
+    const { sink, completed } = runCalls(playReadingIdle(idle), 3);
+
+    expect(completed).toEqual([true, true, true]);
+    expect(sink.writes).toEqual(Array(3).fill({ register: 0, value: 0x44 }));
   });
 });
 

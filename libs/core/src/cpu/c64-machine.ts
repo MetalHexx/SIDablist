@@ -3,12 +3,16 @@ import { cycles, type Cycles } from '../units.js';
 import { createCpuStateRecord, createVendorCpu } from './vendor-cpu.js';
 import type { Cpu6502, Cpu6502Bus, CpuState } from './cpu-port.js';
 import {
+  BASIC_ROM_FIRST_PAGE,
+  BASIC_ROM_LAST_PAGE,
   BRK_HANDLER_STUB,
   CHIP_REGISTERS_FIRST,
   CHIP_REGISTERS_LAST,
   CIA1_INTERRUPT_CONTROL,
   CIA2_INTERRUPT_CONTROL,
   CIA_INTERRUPT_TIMER_A_SET,
+  DRIVER_FIRST_PAGE,
+  DRIVER_LAST_PAGE,
   FIRST_RELOCATABLE_PAGE,
   INIT_BUDGET_FRAMES,
   INTERRUPT_CONTINUATION_LENGTH,
@@ -45,6 +49,7 @@ import {
   PLAY_BUDGET_FRAMES,
   PSID_DEFAULT_TIMER_A_LATCH_NTSC,
   PSID_DEFAULT_TIMER_A_LATCH_PAL,
+  RELOC_NO_ROOM_PAGE,
   RESET_VECTOR,
   SID_LAST_AUDIBLE_REGISTER,
   SID_RANGE_END,
@@ -87,6 +92,15 @@ export interface FrameResult {
 
 /** Thrown when a tune exposes no usable play address, so there is nothing to call each frame. */
 export class UnplayableTuneError extends Error {}
+
+/** Whether a PSID player may put its driver on `page`: `$04`–`$CF`, outside the BASIC ROM's pages. */
+function isDriverPage(page: number): boolean {
+  return (
+    page >= DRIVER_FIRST_PAGE &&
+    page <= DRIVER_LAST_PAGE &&
+    !(page >= BASIC_ROM_FIRST_PAGE && page <= BASIC_ROM_LAST_PAGE)
+  );
+}
 
 /** One entry per opcode byte, 1 where the core's decoder falls through to its 2-cycle no-op. */
 function buildIllegalOpcodeTable(cpu: Cpu6502): Uint8Array {
@@ -227,7 +241,10 @@ export interface C64Machine {
   /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
   readonly resolvedPlayAddress: number;
 
-  /** Where the entry trampoline was written — moved off the default page when the tune covers it. */
+  /**
+   * Where the entry trampoline was written: where a PSID driver lives, or for an RSID the default
+   * page, moved when the tune covers it.
+   */
   readonly trampolineBase: number;
 
   /** Undocumented opcodes executed since the last `initSubtune`; each ran as a 2-cycle no-op. */
@@ -561,8 +578,9 @@ class C64MachineImpl implements C64Machine {
     const fetchingOpcode = this.expectingOpcodeFetch;
     this.expectingOpcodeFetch = false;
 
-    if (address === this.idleAddress) {
-      // The only reason the CPU ever fetches from the idle block is that the routine returned.
+    if (fetchingOpcode && address === this.idleAddress) {
+      // The only reason the CPU ever fetches an opcode from the idle block is that the routine
+      // returned; a data read of that address, from a tune sharing the page, is no return.
       // Detecting it here keeps the hot loop free of the allocations `getState()` would cost.
       this.reachedIdle = true;
     }
@@ -840,8 +858,11 @@ class C64MachineImpl implements C64Machine {
   }
 
   /**
-   * The base the trampoline goes at: the default page, else the first one clear of the tune. An
-   * interrupt-entry tune's continuation must be clear too, and must lie past the trampoline.
+   * The base the trampoline goes at. A PSID's goes where a PSID player puts its driver (see
+   * `firstDriverBase`), so a tune's init cannot overwrite it by filling the RAM under the KERNAL or
+   * clearing page 2. Otherwise — an RSID, a PSID with no room or none that fits — it is the default
+   * page, else the first one clear of the tune. An interrupt-entry tune's continuation must be clear
+   * too, and must lie past the trampoline.
    */
   private chooseTrampolineBase(): number {
     const start = this.file.loadAddress;
@@ -859,6 +880,12 @@ class C64MachineImpl implements C64Machine {
       );
     };
 
+    if (this.file.format === 'PSID') {
+      const driverBase = this.firstDriverBase(fits, overlapsTune);
+      if (driverBase !== null) {
+        return driverBase;
+      }
+    }
     if (fits(TRAMPOLINE_BASE)) {
       return TRAMPOLINE_BASE;
     }
@@ -874,6 +901,40 @@ class C64MachineImpl implements C64Machine {
     throw new UnplayableTuneError(
       'the tune covers every page — there is nowhere for the trampoline',
     );
+  }
+
+  /**
+   * Where a PSID player would put its driver: the first page that `fits` in the header's free range,
+   * when the range is one libsidplayfp's `checkRelocInfo` accepts (both ends in the driver pages, clear
+   * of the image), else — for a tune that names none, a start page or a page count of 0 — the first
+   * page that `fits` from `DRIVER_FIRST_PAGE` to `DRIVER_LAST_PAGE`. Null when the header says there is
+   * no room, names a range that is not usable, or nothing fits.
+   */
+  private firstDriverBase(
+    fits: (base: number) => boolean,
+    overlapsTune: (at: number, length: number) => boolean,
+  ): number | null {
+    const startPage = this.file.relocStartPage ?? 0;
+    const pageCount = this.file.relocPages ?? 0;
+    if (startPage === RELOC_NO_ROOM_PAGE) {
+      return null;
+    }
+
+    let first = DRIVER_FIRST_PAGE;
+    let last = DRIVER_LAST_PAGE;
+    if (startPage !== 0 && pageCount !== 0) {
+      first = startPage;
+      last = startPage + pageCount - 1;
+      if (!isDriverPage(first) || !isDriverPage(last) || overlapsTune(first << 8, pageCount << 8)) {
+        return null;
+      }
+    }
+    for (let page = first; page <= last; page++) {
+      if (isDriverPage(page) && fits(page << 8)) {
+        return page << 8;
+      }
+    }
+    return null;
   }
 
   /**

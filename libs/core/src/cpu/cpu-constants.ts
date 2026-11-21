@@ -155,3 +155,14 @@ export const LAST_RELOCATABLE_PAGE = 0xfe;
 /** `$D000-$DFFF` always decodes as I/O here, so the trampoline can never live there. */
 export const IO_FIRST_PAGE = 0xd0;
 export const IO_LAST_PAGE = 0xdf;
+/**
+ * The pages a PSID player puts its driver in: `$04` (past the zero page, the stack and the KERNAL's
+ * work area) to `$CF` (below the I/O and the KERNAL), skipping the BASIC ROM's `$A0`–`$BF`. A tune's
+ * init may overwrite the RAM under the KERNAL, so the driver never goes there.
+ */
+export const DRIVER_FIRST_PAGE = 0x04;
+export const DRIVER_LAST_PAGE = 0xcf;
+export const BASIC_ROM_FIRST_PAGE = 0xa0;
+export const BASIC_ROM_LAST_PAGE = 0xbf;
+/** A header start page of `$FF` says the tune leaves no room for a driver at all. */
+export const RELOC_NO_ROOM_PAGE = 0xff;
