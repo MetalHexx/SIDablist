@@ -318,6 +318,13 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   place changed two loadable tunes for the worse (_Razorberries_, _Sleipner/Techno_), where hardware
   reads BASIC. The character ROM, which pins 1–3 bring over `$D000`–`$DFFF`, reads the RAM under I/O for
   now. A change to the port or its decode is `fingerprint.mjs check --change banking`.
+- **Init gets 200 frames (`INIT_BUDGET_FRAMES`), because a real driver lets it run until it returns.** The budget only stops an
+  init that never returns, and a tune cut off by it plays on tables init never filled. Five PSIDs in HVSC #85,
+  Julian Jaymz's _Simulcra_, _Slanted_, _Slanted 2SID_, _Square Two_ and _Square Two 2SID_, need 101 to 168 frames;
+  cut at 100, _Simulcra_ and _Square Two_ played through a null pointer into `$00`/`$01`, which read 0 until the port
+  had values and then hung their player. 93 never return by 3,000 frames, and each costs its whole budget once
+  per load. A change to the budget moves every tune whose init runs past the old one:
+  `fingerprint.mjs check --change init-budget`.
 - **A play-address-0 tune's interrupt vector is read once, after init.** `patchPlayTarget` resolves the
   handler from `$0314` (or `$FFFE`) when init returns and never again, where a real C64 reads it at
   every interrupt. A tune that re-points the vector after its first call keeps being entered at the

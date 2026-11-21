@@ -8,8 +8,14 @@ export const PAL_RASTER_LINES = 312;
 export const NTSC_CYCLES_PER_RASTER_LINE = 65;
 export const NTSC_RASTER_LINES = 263;
 
-/** Init routines legitimately spend a long time relocating and precomputing tables. */
-export const INIT_BUDGET_FRAMES = 100;
+/**
+ * Init routines legitimately spend a long time relocating and precomputing tables. A real PSID driver
+ * lets init run until it returns, so there is no cap on hardware; this one stops an init that never
+ * returns. Of the PSIDs in HVSC #85, five take longer than 100 frames to return and none more than
+ * 167.5, so 200 lets every init that returns return; 93 never return, whatever the budget up to 3,000.
+ * A stuck init costs its whole budget once per load.
+ */
+export const INIT_BUDGET_FRAMES = 200;
 export const PLAY_BUDGET_FRAMES = 2;
 
 /** A multispeed rate above this is not worth chasing; ASID sends one play call per packet. */

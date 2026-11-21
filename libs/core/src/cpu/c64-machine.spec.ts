@@ -382,6 +382,40 @@ describe('C64Machine', () => {
   });
 });
 
+describe('C64Machine init budget', () => {
+  // LDA #9 / STA $FB, then nine passes of a 256 x 256 countdown (about 329,000 cycles each, about 150
+  // PAL frames in all), then LDA #$5A / STA $1200 / RTS: an init that returns, but not within 100 frames.
+  const slowInit = [
+    0xa9, 0x09, 0x85, 0xfb, 0xa0, 0x00, 0xa2, 0x00, 0xca, 0xd0, 0xfd, 0x88, 0xd0, 0xf8, 0xc6, 0xfb,
+    0xd0, 0xf2, 0xa9, 0x5a, 0x8d, 0x00, 0x12, 0x60,
+  ];
+  // LDA $1200 / STA $D400 / RTS
+  const play = [0xad, 0x00, 0x12, 0x8d, 0x00, 0xd4, 0x60];
+
+  it('lets an init that returns after about 150 frames return, so play sees what it stored', () => {
+    const file = tune({
+      initAddress: 0x1000,
+      playAddress: 0x1100,
+      blocks: [
+        { at: 0x1000, bytes: slowInit },
+        { at: 0x1100, bytes: play },
+      ],
+    });
+    const sink = new RecordingSink();
+    const machine = createC64Machine(file, sink);
+
+    // The result is the machine's own, refilled by the next call: read what init says before playing.
+    const { completed, cyclesUsed } = machine.initSubtune(1);
+    sink.writes.length = 0;
+    const callsCompleted = Array.from({ length: 3 }, () => machine.runFrame().completed);
+
+    expect(completed).toBe(true);
+    expect(cyclesUsed).toBeGreaterThan(100 * PAL_CYCLES_PER_FRAME);
+    expect(callsCompleted).toEqual([true, true, true]);
+    expect(valuesFor(sink, 0)).toEqual([0x5a, 0x5a, 0x5a]);
+  });
+});
+
 describe('C64Machine placing the trampoline', () => {
   const PLAY = [0xa9, 0x11, 0x8d, 0x00, 0xd4, 0x60]; // LDA #$11 / STA $D400 / RTS
   const PLAY_AT = 0x100a;
