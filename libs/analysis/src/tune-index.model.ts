@@ -13,8 +13,9 @@ import type { DetectedBeatGrid } from './beat-grid.js';
  *
  *  Version 6 replaces the pulse fields with the beat grid.
  *
- *  Version 7: the engine's fixes to interrupt exits, play rate, the VIC and CIA, and the init budget
- *  change what some tunes play, so every stored scan is redone. */
+ *  Version 7: the engine's fixes to interrupt exits, play rate, the VIC and CIA, the init budget, the
+ *  trampoline's place, the 6510 port (`$01`) and the interrupt-vector re-read change what some tunes
+ *  play, so every stored scan is redone. */
 export const TUNE_INDEX_FORMAT_VERSION = 7;
 
 export type DetectorConfidence = 'strong' | 'weak' | 'none';

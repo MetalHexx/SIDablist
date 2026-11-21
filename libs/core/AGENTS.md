@@ -325,14 +325,15 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   had values and then hung their player. 93 never return by 3,000 frames, and each costs its whole budget once
   per load. A change to the budget moves every tune whose init runs past the old one:
   `fingerprint.mjs check --change init-budget`.
-- **A play-address-0 tune's interrupt vector is read once, after init.** `patchPlayTarget` resolves the
-  handler from `$0314` (or `$FFFE`) when init returns and never again, where a real C64 reads it at
-  every interrupt. A tune that re-points the vector after its first call keeps being entered at the
-  old one. Seven PSIDs in the test set do (_First Day Tune_, _Buon Natale_, _Mexico 86_, _Hoodoo
-  Voodoo_, _Toccata and Fugue_ parts 1 to 3): five still make sound, _First Day Tune_ writes only its
-  init registers, and _Hoodoo Voodoo_ writes nothing after init where it once wrote 7103 registers.
-  Re-reading the two words before each call would fix it, and is a change to every such tune's
-  output: `fingerprint.mjs check --change interrupt-exits`, in the shared SIDABLIST-ROOT bench.
+- **A play-address-0 tune's interrupt vector is read before every call.** `followInterruptVector`
+  re-reads `$0314` (else `$FFFE`), as a real C64 does at every interrupt, and re-points the trampoline
+  (`playAddress`, the play-target word and the handler word) only when it moved, so a tune that installs
+  a bootstrap handler and then re-points the vector plays past its first call. Both vectors back at
+  their defaults enters `$EA31` through the `$0314` entry, which balances `$EA81`'s three pulls
+  against the pushes; keeping the last handler would run _Mexico 86_ past its end, and the `$FFFE`
+  entry unbalances the stack. Nothing there may throw `UnplayableTuneError` mid-tune. A change to
+  this moves every such tune's output: `fingerprint.mjs check --change vector-reread`, in the shared
+  SIDABLIST-ROOT bench. An RSID's vector is still read once.
 - **The filter-type override is a hold of `filterType`, not state of its own.** `setFilterMode`
   routes through `holdField`/`releaseField`; giving the player or the frame a separate copy again
   re-creates two owners that can disagree about which mode is forced.
@@ -529,7 +530,8 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   and `cpu/c64-machine.spec.ts`, and the HVSC fingerprint check
   (`fingerprint.mjs check --change vic-cia`, in the shared SIDABLIST-ROOT bench), which says which
   tunes moved and which of those it cannot explain. `TUNE_INDEX_FORMAT_VERSION` already says the
-  engine's VIC and CIA changed what tunes play; a later change to it bumps the version again. Detail:
+  engine's VIC and CIA changed what tunes play. Changes landing before a release ship under the
+  version that release first carries; a later change bumps it again. Detail:
   [`cpu/io-chips.ts`](./src/cpu/io-chips.ts).
 - **Changed `C64Machine`'s frame/rate surface (`runFrame`, `callsPerFrame`, `exactCallsPerFrame`),
   what decides the rate (`speedFlags`, `psidSpecific`, the `$DC0D` and `$D01A` handling) or

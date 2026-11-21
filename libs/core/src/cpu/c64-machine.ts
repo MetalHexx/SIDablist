@@ -253,7 +253,11 @@ export interface C64Machine {
    */
   readonly frameCycleBudget: Cycles;
 
-  /** The address `runFrame` calls: the header's play address, or the vector an RSID installed. */
+  /**
+   * The address `runFrame` calls: the header's play address, or the vector an RSID installed. A
+   * PSID with play address 0 follows its interrupt vector, so this is the handler the latest call
+   * entered, and moves when the tune re-points the vector.
+   */
   readonly resolvedPlayAddress: number;
 
   /**
@@ -562,6 +566,9 @@ class C64MachineImpl implements C64Machine {
     }
     if (this.rebanksEveryCall) {
       this.memory[PORT_DATA] = psidBankFor(this.playAddress);
+    }
+    if (this.entersAsInterrupt) {
+      this.followInterruptVector();
     }
     this.chips.beginCall(this.timerAGovernsRate() ? CALL_CIA : CALL_RASTER);
     const result = this.runRoutine(
@@ -920,11 +927,42 @@ class C64MachineImpl implements C64Machine {
       this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.playAddress);
       return;
     }
-    const entryOffset = this.handlerIsOnKernalVector()
+    this.pointInterruptEntry(this.handlerIsOnKernalVector());
+  }
+
+  private pointInterruptEntry(onKernal: boolean): void {
+    const entryOffset = onKernal
       ? TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
       : TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET;
     this.writeWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET, this.trampoline + entryOffset);
     this.writeWord(this.trampoline + TRAMPOLINE_INTERRUPT_HANDLER_OFFSET, this.playAddress);
+  }
+
+  /**
+   * Re-reads the interrupt vector before a call, as a real C64 does at every interrupt, and
+   * re-points the trampoline when the tune moved it. Both vectors back at their defaults is the
+   * KERNAL's own handler: it is entered through the `$0314` entry, so its three pulls balance the
+   * pushes.
+   */
+  private followInterruptVector(): void {
+    let handler = this.resolvePlayAddress();
+    let onKernal = this.handlerIsOnKernalVector();
+    if (handler === 0) {
+      handler = IRQ_HANDLER_STUB;
+      onKernal = true;
+    }
+    const entryOffset = onKernal
+      ? TRAMPOLINE_INTERRUPT_KERNAL_OFFSET
+      : TRAMPOLINE_INTERRUPT_HARDWARE_OFFSET;
+    const entry = this.trampoline + entryOffset;
+    if (
+      handler === this.playAddress &&
+      this.readWord(this.trampoline + TRAMPOLINE_PLAY_TARGET_OFFSET) === entry
+    ) {
+      return;
+    }
+    this.playAddress = handler;
+    this.pointInterruptEntry(onKernal);
   }
 
   /** Cycles to leave uncounted on this call: what the entry costs beyond a `JSR`. */

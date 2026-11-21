@@ -898,6 +898,136 @@ describe('C64Machine entering a handler as an interrupt', () => {
   });
 });
 
+describe('C64Machine following an interrupt vector that moves', () => {
+  const H1 = 0x1100;
+  const H2 = 0x1200;
+  const KERNAL_VECTOR = 0x0314;
+  const HARDWARE_VECTOR = 0xfffe;
+  const RTI = 0x40;
+  const JMP_KERNAL_EXIT = [0x4c, 0x31, 0xea];
+  // INC $C000 / LDA $C000 / STA $D400: writes 1, 2, 3...
+  const COUNT = [0xee, 0x00, 0xc0, 0xad, 0x00, 0xc0, 0x8d, 0x00, 0xd4];
+
+  /** LDA #low / STA vector / LDA #high / STA vector+1 */
+  const setVector = (vector: number, value: number): number[] => [
+    0xa9,
+    value & 0xff,
+    0x8d,
+    vector & 0xff,
+    vector >> 8,
+    0xa9,
+    value >> 8,
+    0x8d,
+    (vector + 1) & 0xff,
+    (vector + 1) >> 8,
+  ];
+
+  /** Init installs H1 on `vector`; H1 runs `first`, H2 runs `second`, each ending as given. */
+  function revectoringTune(
+    vector: number,
+    first: readonly number[],
+    second: readonly number[],
+  ): SidFile {
+    return tune({
+      blocks: [
+        { at: 0x1000, bytes: [...setVector(vector, H1), 0x60] },
+        { at: H1, bytes: first },
+        { at: H2, bytes: second },
+      ],
+    });
+  }
+
+  function play(file: SidFile, calls: number) {
+    const sink = new RecordingSink();
+    const machine = createC64Machine(file, sink);
+    machine.initSubtune(1);
+    sink.writes.length = 0;
+    const handlers: number[] = [];
+    const completed: boolean[] = [];
+    const cycles: number[] = [];
+    const stackPointers: unknown[] = [];
+    for (let call = 0; call < calls; call++) {
+      const result = machine.runFrame();
+      completed.push(result.completed);
+      cycles.push(result.cyclesUsed);
+      handlers.push(machine.resolvedPlayAddress);
+      stackPointers.push(machine.snapshot().cpu['stkp']);
+    }
+    return { sink, machine, handlers, completed, cycles, stackPointers };
+  }
+
+  const values = (sink: RecordingSink): number[] => sink.writes.map((write) => write.value);
+
+  it('enters the handler a 0x0314 handler re-pointed to, from the next call on', () => {
+    const file = revectoringTune(
+      KERNAL_VECTOR,
+      [...setVector(KERNAL_VECTOR, H2), ...JMP_KERNAL_EXIT],
+      [...COUNT, ...JMP_KERNAL_EXIT],
+    );
+
+    const { sink, handlers, completed, stackPointers } = play(file, 4);
+
+    expect(completed).toEqual([true, true, true, true]);
+    expect(values(sink)).toEqual([1, 2, 3]);
+    expect(handlers).toEqual([H1, H2, H2, H2]);
+    expect(stackPointers).toEqual([0xff, 0xff, 0xff, 0xff]);
+  });
+
+  it('enters the handler a 0xFFFE handler re-pointed to, leaving by RTI', () => {
+    const file = revectoringTune(
+      HARDWARE_VECTOR,
+      [...setVector(HARDWARE_VECTOR, H2), RTI],
+      [...COUNT, RTI],
+    );
+
+    const { sink, handlers, completed, stackPointers } = play(file, 4);
+
+    expect(completed).toEqual([true, true, true, true]);
+    expect(values(sink)).toEqual([1, 2, 3]);
+    expect(handlers).toEqual([H1, H2, H2, H2]);
+    expect(stackPointers).toEqual([0xff, 0xff, 0xff, 0xff]);
+  });
+
+  it('takes the hardware entry credit when the tune moves from 0x0314 to 0xFFFE', () => {
+    const moved = revectoringTune(
+      KERNAL_VECTOR,
+      [...setVector(HARDWARE_VECTOR, H2), ...setVector(KERNAL_VECTOR, 0xea31), ...JMP_KERNAL_EXIT],
+      [...COUNT, RTI],
+    );
+    // The same H2 entered through the hardware vector from the first call: its credit is the reference.
+    const straight = tune({
+      blocks: [
+        { at: 0x1000, bytes: [...setVector(HARDWARE_VECTOR, H2), 0x60] },
+        { at: H2, bytes: [...COUNT, RTI] },
+      ],
+    });
+
+    const afterMove = play(moved, 3);
+    const hardware = play(straight, 3);
+
+    expect(afterMove.completed).toEqual([true, true, true]);
+    expect(values(afterMove.sink)).toEqual([1, 2]);
+    expect(afterMove.handlers).toEqual([H1, H2, H2]);
+    expect(afterMove.cycles[1]).toBe(hardware.cycles[1]);
+    expect(afterMove.stackPointers).toEqual([0xff, 0xff, 0xff]);
+  });
+
+  it('enters the KERNAL handler once both vectors are back at their defaults, writing nothing', () => {
+    const file = revectoringTune(
+      KERNAL_VECTOR,
+      [...setVector(KERNAL_VECTOR, 0xea31), ...JMP_KERNAL_EXIT],
+      [...COUNT, ...JMP_KERNAL_EXIT],
+    );
+
+    const { sink, handlers, completed, stackPointers } = play(file, 4);
+
+    expect(completed).toEqual([true, true, true, true]);
+    expect(sink.writes).toEqual([]);
+    expect(handlers).toEqual([H1, 0xea31, 0xea31, 0xea31]);
+    expect(stackPointers).toEqual([0xff, 0xff, 0xff, 0xff]);
+  });
+});
+
 describe('C64Machine play rate', () => {
   const ROUTINE = 0x1100;
   const RTS = 0x60;
