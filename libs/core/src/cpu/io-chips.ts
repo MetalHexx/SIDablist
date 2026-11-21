@@ -40,7 +40,8 @@ export type CallDrive = typeof CALL_RASTER | typeof CALL_CIA;
 /*
  * The layout of `IoChips.state`, one `Float64Array` so a snapshot copies it whole with `set` and
  * allocates nothing. Every slot is an integer-valued number; cycle counts are plain numbers, exact to
- * 2^53, because a long tune passes 2^31 cycles in about 36 minutes.
+ * 2^53, because a long tune passes 2^31 cycles in about 36 minutes. A slot holding a cycle count is
+ * shifted by `rebase()`, which runs at every `beginCall`, and must be listed there.
  *
  *   0  CALL_START      cycle count at which the current (or last) play call started
  *   1  CALL_DUE        cycle count at which the next call falls due: its start plus its period
@@ -105,7 +106,8 @@ function isModelledCiaRegister(register: number): boolean {
  * The VIC's raster flag and the two CIAs' timers, with just enough behaviour for a PSID player to
  * see what it would see when called on a real C64, and the cycle count that places each call in time.
  *
- * Time is one running cycle count. A play call starts one period after the last one started, or
+ * Time is one running cycle count, rebased to the end of the last call at every call so it stays
+ * small. A play call starts one period after the last one started, or
  * when the last one ended if it ran past its period, so a call's own cycles count inside its period
  * and an overrun delays the next call while the timers count on through it. Everything is integer
  * cycles, so it stays deterministic.
@@ -192,7 +194,8 @@ export class IoChips {
    * ever read, so nothing observable moves; but a count past what a 32-bit integer holds is a
    * double the engine boxes each time one crosses a call, which would make every play call of a
    * CIA-timed tune allocate. The stamps of the timers a tune never touches fall behind by the
-   * shift, which their next sync takes back out.
+   * shift, which their next sync takes back out. Every slot that holds a cycle count is shifted
+   * here: a new one that is left out reads wrong after the first call.
    */
   private rebase(): void {
     const s = this.state;

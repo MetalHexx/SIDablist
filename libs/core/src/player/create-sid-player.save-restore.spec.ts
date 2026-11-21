@@ -766,7 +766,7 @@ describe('restoring a saved state', () => {
       }
     });
 
-    it('into a player that has not started, before any play', async () => {
+    it('into a player that has been stopped after a play', async () => {
       const rig = await Rig.playing(chordTune());
       rig.run(6);
       const state = rig.player.createSavedState();

@@ -110,9 +110,11 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   `registers/register-frame.ts`). Frame delivery runs fifty times a second; wrapping any
   of it in a fresh object or a getter for readability is a real regression, and it is audible.
   `player/create-sid-player.allocation.spec.ts` and `timeline/anchor-ring.allocation.spec.ts` measure
-  plain play, laps, landings, the hand, a tune that changes its rate every call, a save every frame
-  with a restore every fifty and the anchor ring against a sink that holds nothing (they need `--expose-gc`, which `vitest.config.ts` gives the
-  workers). A new thing on the tick that allocates shows there: a result object, a `for…of` over a
+  plain play, laps, landings, the hand, a save every frame with a restore every fifty, alternating
+  restores, a restore while playing and the anchor ring against a sink that holds nothing;
+  `player/create-sid-player.allocation-rate.spec.ts` measures a tune that changes its rate every call,
+  whole and fractional, in a file of its own (they need `--expose-gc`, which `vitest.config.ts` gives
+  the workers). A new thing on the tick that allocates shows there: a result object, a `for…of` over a
   `Set` or `Map`, a keyed read or store of a field the CPU holds as a double (`copyStateInto` and
   `setState` name their fields for that reason), a snapshot built where nothing published changed.
 - **A saved state holds everything that decides the next frames, and a field left out restores
@@ -154,7 +156,8 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   needs the transport playing, since nothing from here can start the clock a non-playing varispeed
   owns, and is refused otherwise. Out of one, `endVarispeed` returns the rate pitch to home, and a
   non-playing varispeed's clock stops and its sink ends as for any other exit. A handback saved
-  before its image arrived asks for it again.
+  before its image arrived asks for it again. A player that is `stopped` or `ended` refuses every
+  state, with a warning and no change: nothing from here starts the transport it left.
 - **A result handed back on the tick is the owner's, and no caller keeps it.** `C64Machine.runFrame`
   and `initSubtune` return one object the machine refills, `ActiveLoopTracker.advance` returns a
   constant or one object the tracker refills, and `AnchorRing.select` returns the ring's own image,
@@ -268,7 +271,9 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   (`io-chips.ts` documents it) that a snapshot copies whole. A play call starts one period after the
   last one started — `latch + 1` when CIA 1 timer A drove it, `cyclesPerFrame` otherwise — or when the
   last one ended if it ran past that, and the timers count on through the gap. The cycle count is a
-  plain number, never an `int32`: it passes 2³¹ in about 36 minutes. A new register, or a field on
+  plain number, never an `int32`: it passes 2³¹ in about 36 minutes, which is why every play call
+  rebases it to zero at the last call's end (`IoChips.rebase`), and a slot that holds a cycle count
+  must be shifted there. A new register, or a field on
   the state, goes in the layout and in `CHIP_STATE_LENGTH` so every capture carries it; one that
   steps per cycle, builds an object per read, or lives outside `state` is the regression.
 - **CIA 1 timer A's latch keeps the default's byte for a half the tune never wrote.** A tune that

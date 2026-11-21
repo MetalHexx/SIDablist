@@ -13,9 +13,9 @@ import type { SidPlayer } from './sid-player.js';
  *  can. */
 
 export const FRAMES = 30_000;
-/** Restores with no tick between them cost far less than a tick, so ten times the frames' worth is
- *  what it takes for whatever one builds to show. */
-export const RESTORES = 3_000 * 10;
+/** Restores with no tick between them cost far less than a tick, so a run of them is as many as a
+ *  run of frames: enough for whatever one builds to show. */
+export const RESTORES = 30_000;
 /** Enough passes for the engine to have optimised every function the tick reaches, so the code it
  *  installs while tiering up is not counted as growth. */
 const WARMUP = 8;
@@ -25,7 +25,7 @@ const CONSUMED: FarEndConsumption = { kind: 'unknown', inFlight: 0 };
 
 /** Holds nothing and copies nothing, so what a run allocates is the engine's own: `FakeSink` copies
  *  every delivered frame, which would be the measurement. */
-export const nullSink: SidSink = {
+const nullSink: SidSink = {
   capabilities: {
     perWriteOffsets: false,
     cancellation: false,
@@ -45,7 +45,7 @@ export const nullSink: SidSink = {
 
 /** Answers a replay at once against the real `replayToFrame`: the images a jump lands on are built
  *  off the tick, and what these specs measure starts after they exist. */
-export const replayRunner: ReplayRunner = {
+const replayRunner: ReplayRunner = {
   run(request: ReplayRequest): Promise<ReplayResponse> {
     return Promise.resolve({
       id: request.id,
