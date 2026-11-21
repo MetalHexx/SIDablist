@@ -5,7 +5,7 @@ import { createImageBuffer, type ImageBuffer } from './crossing-captures.js';
 
 /**
  * Anchor images kept at once: three recent ones plus the frame-0 seed that never leaves index 0.
- * Each is a 64 KB memory image, allocated once with the ring, so this is a
+ * Each is a 68 KB memory image, allocated once with the ring, so this is a
  * memory-against-replay-distance trade — but not a free one to re-make: `anchorIntervalFrames`
  * spaces the ring against this number, so changing it moves how far back a seek can reach as well
  * as what the ring costs.

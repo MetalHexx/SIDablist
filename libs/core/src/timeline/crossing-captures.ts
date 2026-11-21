@@ -29,7 +29,7 @@ export interface ImageBuffer {
   readonly registers: { readonly values: Uint8Array };
 }
 
-/** An empty buffer. Allocates 64 KB: call it off the frame path and keep what it returns. */
+/** An empty buffer. Allocates 68 KB: call it off the frame path and keep what it returns. */
 export function createImageBuffer(): ImageBuffer {
   return {
     frame: frames(0),

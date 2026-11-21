@@ -15,7 +15,38 @@ export const PLAY_BUDGET_FRAMES = 2;
 /** A multispeed rate above this is not worth chasing; ASID sends one play call per packet. */
 export const MAX_CALLS_PER_FRAME = 16;
 
+/** The 64 KB address space a tune addresses. */
 export const MEMORY_SIZE = 0x10000;
+
+/** The 6510's on-chip port: `$00` is its data direction register and `$01` its data register. */
+export const PORT_DDR = 0x00;
+export const PORT_DATA = 0x01;
+/** What the KERNAL's reset leaves: `$2F` for the direction and `$37` for the data — BASIC, I/O and KERNAL all in. */
+export const PORT_DDR_DEFAULT = 0x2f;
+export const PORT_DATA_DEFAULT = 0x37;
+/** What the port's input lines read: the pull-ups of LORAM, HIRAM and CHAREN and the cassette sense line. */
+export const PORT_PULLUPS = 0x17;
+/** The port's three banking lines: LORAM, HIRAM and CHAREN. */
+export const PORT_BANK_MASK = 0x07;
+export const PORT_HIRAM_LORAM_MASK = 0x03;
+export const PORT_CHAREN_BIT = 0x04;
+
+/** `$D000-$DFFF`: the chips, or the RAM under them when the port banks them out. */
+export const IO_START = 0xd000;
+export const IO_SIZE = 0x1000;
+/** The RAM under I/O is kept past `$FFFF`, so `memory[$D000-$DFFF]` stays the I/O view. */
+export const MACHINE_MEMORY_SIZE = MEMORY_SIZE + IO_SIZE;
+
+/** What a PSID driver writes to `$01` before calling `address` (the PSID file format's rule). */
+export function psidBankFor(address: number): number {
+  if (address < 0xa000) {
+    return 0x37;
+  }
+  if (address < IO_START) {
+    return 0x36;
+  }
+  return address >= 0xe000 ? 0x35 : 0x34;
+}
 
 export const SID_RANGE_START = 0xd400;
 export const SID_RANGE_END = 0xd7ff;
@@ -157,7 +188,7 @@ export const INTERRUPT_ENTRY_EXTRA_CYCLES_HARDWARE = 19;
 /** Relocation skips the zero page, the stack page and the vector page at the top of memory. */
 export const FIRST_RELOCATABLE_PAGE = 0x02;
 export const LAST_RELOCATABLE_PAGE = 0xfe;
-/** `$D000-$DFFF` always decodes as I/O here, so the trampoline can never live there. */
+/** `$D000-$DFFF` is I/O or the RAM under it depending on the port, so the trampoline never lives there. */
 export const IO_FIRST_PAGE = 0xd0;
 export const IO_LAST_PAGE = 0xdf;
 /**

@@ -15,8 +15,8 @@ holds no notion of where bytes physically go or what a person wants.
 The public surface is `src/index.ts`; nothing outside it is meant to be imported directly.
 
 - `sid/` — parses a `.sid` file into the model the rest of this library runs.
-- `cpu/` — `C64Machine`, the faked 64 KB address space a tune's `init`/`play` routines run against,
-  driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in `vendor/mos6502/` implements.
+- `cpu/` — `C64Machine`, the faked 64 KB address space (68 KB with the RAM under I/O) a tune's
+  `init`/`play` routines run against, driven through a `Cpu6502` port (`cpu-port.ts`) the vendored core in `vendor/mos6502/` implements.
   `io-chips.ts` is its VIC raster flag and both CIAs' timers, with the cycle count that places each
   play call in time.
 - `registers/` — `SidFrame` (one frame's writes), `RegisterFrame` (the accumulator and the output
@@ -299,12 +299,25 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   calls a frame where the default's byte gives about one; `io-chips.spec.ts` and the `the play rate`
   specs in `c64-machine.spec.ts` pin the rule. A change here moves the rate of every tune that
   writes one half, and `--change play-rate` is its class.
-- **`$01` is ignored, so the RAM under the chips cannot be read.** The chip model answers `$D019`,
-  `$D01A` and the CIA timer registers whatever a tune banks in, so a tune that banks the I/O out to
-  copy the RAM under them reads live timers and not the memory it meant. `Snow_Strike` is the known
-  case (1519 SID writes in 300 calls while those reads returned memory, 5 since the chips went live).
-  Honouring `$01` for chip reads means honouring it for the SID write path too, which no change has
-  done yet.
+- **The 6510 port at `$00`/`$01` decides what `$D000`–`$DFFF` is, and that is all it decides.** `initSubtune`
+  sets `$00` to `$2F` and a PSID's `$01` to `psidBankFor(initAddress)` (`cpu-constants.ts`), after the
+  payload and the trampoline are in; an RSID starts at `$2F`/`$37`. `runFrame` writes `psidBankFor(play)`
+  before every call of a PSID with a play address, as a PSID driver does, so a call that left `$30` there
+  does not carry it into the next; a play-address-0 tune keeps what its own code leaves, as a real IRQ
+  does. The pins are `(data | ~ddr) & 7`, an input line being pulled up, and a read of `$01` is
+  `(data & ddr) | ($17 & ~ddr)`. The chips answer only while CHAREN and one of LORAM or HIRAM are high
+  (`ioVisible`); otherwise a read or write of `$D000`–`$DFFF` is the RAM under them, kept in the 4 KB past
+  `$FFFF` (`MACHINE_MEMORY_SIZE`, so every image, saved state and crossing slot carries it), and reaches
+  no chip and no sink. `memory[$D000-$DFFF]` stays the I/O view, so a tune that never banks I/O out runs
+  byte for byte as before; `loadTune` seeds the RAM under it from the payload. The decode sits on every
+  bus access of the frame path: one compare for an ordinary RAM access, and it allocates nothing.
+  `Snow_Strike` banks I/O out to copy the RAM under the CIA registers and `RGB` keeps the `$01` its init
+  reads as a "playing" flag; each is silent without the port.
+- **The ROM overlays are held back on purpose.** `$A000`–`$BFFF` and `$E000`–`$FFFF` read RAM whatever the
+  port selects, and every write lands in RAM. No ROM image ships, and reading an overlay of zeros in its
+  place changed two loadable tunes for the worse (_Razorberries_, _Sleipner/Techno_), where hardware
+  reads BASIC. The character ROM, which pins 1–3 bring over `$D000`–`$DFFF`, reads the RAM under I/O for
+  now. A change to the port or its decode is `fingerprint.mjs check --change banking`.
 - **A play-address-0 tune's interrupt vector is read once, after init.** `patchPlayTarget` resolves the
   handler from `$0314` (or `$FFFE`) when init returns and never again, where a real C64 reads it at
   every interrupt. A tune that re-points the vector after its first call keeps being entered at the
@@ -328,7 +341,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   — and a loop re-entered from that image has the voice silent after it is unmuted until the tune
   writes the register again.
 - **The crossing pool is allocated off the tick.** `setCrossingCaptures` allocates every buffer
-  (about 64 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
+  (about 68 KB each, `sum(keep) + 1` of them) and the tick only copies into one through
   `C64Machine.snapshotInto`, the CPU's `copyStateInto` and `RegisterFrame.snapshotValuesInto`. A
   capture that builds an object, a `snapshot()` or an iterator on the tick is the regression. A new
   declaration holds memory for as long as it stays declared. The anchor ring is the same: its
@@ -355,7 +368,7 @@ The public surface is `src/index.ts`; nothing outside it is meant to be imported
   the named frame at once and holds the new bounds in the tracker, which `set` clears and a subtune
   change cancels; the wrap there is a lap (`looped`), with no history restart. Setting the end through
   `ActiveLoopTracker.set` would drop the queued jump and the entry image with it.
-- **Every declared jump frame holds about 64 KB** (the machine image plus a register shadow), for as
+- **Every declared jump frame holds about 68 KB** (the machine image plus a register shadow), for as
   long as it stays declared. The four-image cache for undeclared captures does not bound them; the
   host's declaration does.
 - **A queued jump never lands without a held image.** A target that is not yet built waits whole
@@ -502,7 +515,7 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   every tune's writes ride on this entry. A change to where a PSID's trampoline goes
   (`chooseTrampolineBase`) is `--change trampoline`. Detail: [`cpu/c64-machine.ts`](./src/cpu/c64-machine.ts).
 - **Changed the VIC or CIA model (`cpu/io-chips.ts`; the register addresses in `cpu/cpu-constants.ts`;
-  `readBus`, `readChipRegister` and `write` in `cpu/c64-machine.ts`)?** What a tune reads from
+  `readBus`, `readChipRegister`, `ioVisible` and `write` in `cpu/c64-machine.ts`)?** What a tune reads from
   `$D019`, `$D01A` and the CIA timers decides which branch a player takes, so a shifted flag, period
   or read side effect changes what a tune writes, or hangs it, with no compile error. A new slot in
   `IoChips.state` is a new `chips` length that a snapshot carries as it is. Run `cpu/io-chips.spec.ts`

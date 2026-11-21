@@ -108,7 +108,7 @@ const SEEK_REACH_MS = milliseconds(1000);
 const MICROSECONDS_PER_MILLISECOND = 1000;
 
 /**
- * Loop entry images kept at once. Each is a 64 KB machine image plus a register shadow, so this is
+ * Loop entry images kept at once. Each is a 68 KB machine image plus a register shadow, so this is
  * the same memory-against-replay-distance trade `AnchorRing`'s own size is, and it is held at the
  * same number for the same reason.
  *

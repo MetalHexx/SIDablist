@@ -177,7 +177,7 @@ export interface SidPlayer {
   // Restore points
   /**
    * Space for one saved state, sized for the tune loaded now and the crossing lines declared now.
-   * Allocates (about 64 KB for the machine, 64 KB for the loop-entry image, and the same again for
+   * Allocates (about 68 KB for the machine, 68 KB for the loop-entry image, and the same again for
    * every image the crossing pool can hold): call it off the tick, after `loadTune` and
    * `setCrossingCaptures`. A state is for the load it was saved from and can be saved into again
    * for as long as the crossing lines it was made for stay declared.

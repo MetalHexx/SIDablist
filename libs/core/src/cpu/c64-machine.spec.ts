@@ -8,9 +8,13 @@ import {
   UnplayableTuneError,
 } from './c64-machine.js';
 import {
+  IO_START,
+  MEMORY_SIZE,
   NTSC_CYCLES_PER_FRAME,
   PAL_CYCLES_PER_FRAME,
   PLAY_BUDGET_FRAMES,
+  PORT_DATA,
+  PORT_DDR,
   TRAMPOLINE_BASE,
   TRAMPOLINE_IDLE_OFFSET,
   TRAMPOLINE_PLAY_RETURN_OFFSET,
@@ -1502,6 +1506,203 @@ describe('C64Machine VIC and CIA', () => {
       const highOnly = chipTune(store(0x20, 0xdc05), [], { format: 'RSID' });
 
       expect(run(highOnly, 0).machine.cyclesPerPlayCall).toBe(0x2025 + 1);
+    });
+  });
+
+  describe('the 6510 port', () => {
+    const ramUnderIo = (address: number): number => MEMORY_SIZE + address - IO_START;
+    /** LDA #bank / STA $01 */
+    const bankTo = (bank: number): number[] => store(bank, PORT_DATA);
+
+    it('reads the RAM under the chips while they are banked out, and the live timer while they are in', () => {
+      // A payload byte at $DC04 is what the RAM under CIA 1 holds. Bank / LDA $DC04 / STA $1200, then
+      // bank the chips back in so the sink sees what was read.
+      const seen = (bank: number): number[] => {
+        const read = [...bankTo(bank), ...load(0xdc04), ...save(0x1200), ...bankTo(0x37)];
+        const file = tune({
+          playAddress: PLAY,
+          blocks: [
+            { at: 0x1000, bytes: [RTS] },
+            { at: PLAY, bytes: [...read, ...report(0x1200, 0), RTS] },
+            { at: 0xdc04, bytes: [0x5a] },
+          ],
+        });
+        return valuesFor(run(file, 1).sink, 0);
+      };
+
+      expect(seen(0x34)).toEqual([0x5a]);
+      expect(seen(0x35)).toHaveLength(1);
+      expect(seen(0x35)).not.toEqual([0x5a]);
+    });
+
+    const heldUnder = 'lands in the RAM under the chips and reaches no sink';
+    const reachesChip = 'reaches the sink and leaves the RAM under the chips alone';
+    it.each([
+      ['$34', heldUnder, 0x34, [], 0x00, 0x0f],
+      ['$35', reachesChip, 0x35, [0x0f], 0x0f, 0x00],
+      ['$36', reachesChip, 0x36, [0x0f], 0x0f, 0x00],
+      ['$37', reachesChip, 0x37, [0x0f], 0x0f, 0x00],
+    ])('under %s a store to $D418 %s', (_name, _outcome, bank, reached, inIoView, underIo) => {
+      const { sink, machine } = run(chipTune([], [...bankTo(bank), ...store(0x0f, 0xd418)]), 1);
+
+      expect(valuesFor(sink, 24)).toEqual(reached);
+      const memory = machine.snapshot().memory;
+      expect(memory[0xd418]).toBe(inIoView);
+      expect(memory[ramUnderIo(0xd418)]).toBe(underIo);
+    });
+
+    it('leaves the play rate alone when a store to a CIA register lands in the RAM under it', () => {
+      const writeHigh = (bank: number): C64Machine =>
+        run(chipTune([...bankTo(bank), ...store(0x20, 0xdc05)], [], { speedFlags: 1 }), 0).machine;
+
+      const banked = writeHigh(0x34);
+      const live = writeHigh(0x35);
+
+      expect(banked.cyclesPerPlayCall).toBe(0x4025 + 1);
+      expect(banked.snapshot().memory[ramUnderIo(0xdc05)]).toBe(0x20);
+      expect(live.cyclesPerPlayCall).toBe(0x2025 + 1);
+    });
+
+    it.each([
+      ['below BASIC', 0x1000, 0x37],
+      ['under BASIC', 0xa000, 0x36],
+      ['under the chips', 0xd000, 0x34],
+      ['under the KERNAL', 0xe000, 0x35],
+    ])(
+      'starts the init of a PSID %s with $00 at $2F and $01 at its bank value',
+      (_where, initAt, bank) => {
+        // LDA $00 / STA $1200 / LDA $01 / STA $1201 / RTS, kept in RAM for play to report.
+        const probe = [
+          ...load(PORT_DDR),
+          ...save(0x1200),
+          ...load(PORT_DATA),
+          ...save(0x1201),
+          RTS,
+        ];
+        const file = tune({
+          initAddress: initAt,
+          playAddress: PLAY,
+          blocks: [
+            { at: initAt, bytes: probe },
+            { at: PLAY, bytes: [...report(0x1200, 0), ...report(0x1201, 1), RTS] },
+          ],
+        });
+
+        const { sink } = run(file, 1);
+
+        expect(valuesFor(sink, 0)).toEqual([0x2f]);
+        expect(valuesFor(sink, 1)).toEqual([bank]);
+      },
+    );
+
+    it.each([
+      ['at $1100', 0x1100, 0x37],
+      ['at $E000', 0xe000, 0x35],
+    ])(
+      'writes the bank value of a play routine %s before every call, even after a call left $30 there',
+      (_where, playAt, bank) => {
+        const file = tune({
+          playAddress: playAt,
+          blocks: [
+            { at: 0x1000, bytes: [RTS] },
+            { at: playAt, bytes: [...report(PORT_DATA, 0), ...bankTo(0x30), RTS] },
+          ],
+        });
+
+        const { sink } = run(file, 3);
+
+        expect(valuesFor(sink, 0)).toEqual([bank, bank, bank]);
+      },
+    );
+
+    it('shows the chips when the direction register leaves the banking lines as pulled-up inputs', () => {
+      const withDirection = (direction: number): number[] =>
+        valuesFor(
+          run(
+            chipTune([], [...store(direction, PORT_DDR), ...bankTo(0x00), ...store(0x0f, 0xd418)]),
+            1,
+          ).sink,
+          24,
+        );
+
+      expect(withDirection(0x28)).toEqual([0x0f]);
+      expect(withDirection(0x2f)).toEqual([]);
+    });
+
+    it('reads $01 as the output lines it drives and the pulled-up level of the rest', () => {
+      // DDR $28 makes bits 3 and 5 outputs; bits 0-2 and 4 are inputs, pulled up.
+      const play = [...store(0x28, PORT_DDR), ...bankTo(0xff), ...report(PORT_DATA, 0)];
+
+      expect(valuesFor(run(chipTune([], play), 1).sink, 0)).toEqual([0x28 | 0x17]);
+    });
+
+    it('leaves an RSID at $2F and $37 and never re-banks it', () => {
+      const init = [...report(PORT_DDR, 0), ...report(PORT_DATA, 1), ...bankTo(0x35)];
+
+      const { sink } = run(chipTune(init, report(PORT_DATA, 2), { format: 'RSID' }), 2);
+
+      expect(valuesFor(sink, 0)).toEqual([0x2f]);
+      expect(valuesFor(sink, 1)).toEqual([0x37]);
+      expect(valuesFor(sink, 2)).toEqual([0x35, 0x35]);
+    });
+
+    it('leaves a PSID entered as an interrupt with whatever its own code left in $01', () => {
+      const init = [
+        ...bankTo(0x35),
+        ...store(PLAY & 0xff, 0x0314),
+        ...store(PLAY >> 8, 0x0315),
+        RTS,
+      ];
+      const file = tune({
+        blocks: [
+          { at: 0x1000, bytes: init },
+          { at: PLAY, bytes: [...report(PORT_DATA, 0), 0x40] },
+        ],
+      });
+
+      const { sink } = run(file, 2);
+
+      expect(valuesFor(sink, 0)).toEqual([0x35, 0x35]);
+    });
+
+    it('carries the RAM under the chips through a snapshot and restore, into another machine too', () => {
+      // Init banks the chips out and leaves $AB in the RAM under $D800. Each play call counts it up
+      // there and hands the count to the sink.
+      const init = [...bankTo(0x34), ...store(0xab, 0xd800)];
+      const play = [
+        ...bankTo(0x34),
+        0xee, // INC $D800
+        0x00,
+        0xd8,
+        ...load(0xd800),
+        ...save(0x1200),
+        ...bankTo(0x37),
+        ...report(0x1200, 0),
+      ];
+      const counting = (): SidFile => chipTune(init, play);
+      const sink = new RecordingSink();
+      const machine = createC64Machine(counting(), sink);
+      machine.initSubtune(1);
+      runFrames(machine, 2);
+      const snapshot = machine.snapshot();
+      const fromSnapshot = sink.writes.length;
+      runFrames(machine, 3);
+      const expected = sink.writes.slice(fromSnapshot);
+      const otherSink = new RecordingSink();
+      const other = createC64Machine(counting(), otherSink);
+      other.initSubtune(1);
+      runFrames(other, 6);
+
+      machine.restore(snapshot);
+      const fromRestore = sink.writes.length;
+      runFrames(machine, 3);
+      other.restore(structuredClone(snapshot));
+      otherSink.writes.length = 0;
+      runFrames(other, 3);
+
+      expect(expected.map((write) => write.value)).toEqual([0xae, 0xaf, 0xb0]);
+      expect(sink.writes.slice(fromRestore)).toEqual(expected);
+      expect(otherSink.writes).toEqual(expected);
     });
   });
 

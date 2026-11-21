@@ -126,7 +126,7 @@ tune loaded after, until the application hands them back.
 
 A tune is a program, and a program's next frames are decided by its state: so the player can keep that
 state and come back to it. `saveState` copies into storage `createSavedState` sized ahead of time, so
-a host can keep a restore point every frame for about the cost of one 64 KB machine image;
+a host can keep a restore point every frame for about the cost of one 68 KB machine image;
 `restoreState` puts every part back from it. A restored player plays exactly the frames, with the same
 frame numbers and due times, as one that never left: a restore owes the stream no gate-off and queues
 no resync, because the far end is handed the same deltas it would have been.

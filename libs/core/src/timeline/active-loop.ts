@@ -159,7 +159,7 @@ export interface LoopChange {
  *
  * The loops, `QueuedNext` and `LoopChange` are values nothing mutates once made, held by
  * reference. The three images are held by reference too, and are NOT copied: the tracker never owns
- * an image, its caller does, and an image may be 64 KB the caller has already placed (the
+ * an image, its caller does, and an image may be 68 KB the caller has already placed (the
  * loop-entry buffer, a prepared image). So a restore finds an image where it left it only while its
  * owner has not refilled it since the save — a caller that refills the loop-entry buffer or recycles
  * a slot between save and restore must save that content itself, or restore a different image

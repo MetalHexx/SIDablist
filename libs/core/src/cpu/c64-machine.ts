@@ -21,6 +21,8 @@ import {
   INTERRUPT_STATUS_BYTE,
   IO_FIRST_PAGE,
   IO_LAST_PAGE,
+  IO_SIZE,
+  IO_START,
   IRQ_ACKNOWLEDGE_STUB,
   IRQ_HANDLER_STUB,
   IRQ_RESTORE_STUB,
@@ -28,6 +30,7 @@ import {
   IRQ_VECTOR_KERNAL,
   KERNAL_STUB_ADDRESSES,
   LAST_RELOCATABLE_PAGE,
+  MACHINE_MEMORY_SIZE,
   MAX_CALLS_PER_FRAME,
   MEMORY_SIZE,
   NTSC_CYCLES_PER_FRAME,
@@ -47,8 +50,17 @@ import {
   PAL_CYCLES_PER_RASTER_LINE,
   PAL_RASTER_LINES,
   PLAY_BUDGET_FRAMES,
+  PORT_BANK_MASK,
+  PORT_CHAREN_BIT,
+  PORT_DATA,
+  PORT_DATA_DEFAULT,
+  PORT_DDR,
+  PORT_DDR_DEFAULT,
+  PORT_HIRAM_LORAM_MASK,
+  PORT_PULLUPS,
   PSID_DEFAULT_TIMER_A_LATCH_NTSC,
   PSID_DEFAULT_TIMER_A_LATCH_PAL,
+  psidBankFor,
   RELOC_NO_ROOM_PAGE,
   RESET_VECTOR,
   SID_LAST_AUDIBLE_REGISTER,
@@ -158,10 +170,11 @@ export interface WritableMachineSnapshot {
 }
 
 /** An image holding nothing yet, for `snapshotInto` or `copyMachineImage` to fill. Allocates the
- *  64 KB address space and the chip state, so call it off the frame path and keep what it returns. */
+ *  68 KB address space (the 64 KB plus the 4 KB under I/O) and the chip state, so call it off the frame
+ *  path and keep what it returns. */
 export function createMachineImage(): WritableMachineSnapshot {
   return {
-    memory: new Uint8Array(MEMORY_SIZE),
+    memory: new Uint8Array(MACHINE_MEMORY_SIZE),
     cpu: createCpuStateRecord(),
     trampoline: 0,
     idleAddress: 0,
@@ -192,9 +205,10 @@ export function copyMachineImage(source: MachineSnapshot, target: WritableMachin
 }
 
 /**
- * A 64 KB address space with just enough faked C64 hardware — a VIC raster flag, both CIAs' timers,
- * a moving raster counter and ROM vector stubs — for a tune's `init` and `play` routines to run to
- * completion. Every write the tune makes to the SID's address range is handed to the sink.
+ * A 64 KB address space, and the 4 KB of RAM under I/O, with just enough faked C64 hardware — the
+ * 6510's port, a VIC raster flag, both CIAs' timers, a moving raster counter and ROM vector stubs —
+ * for a tune's `init` and `play` routines to run to completion. Every write the tune makes to the
+ * SID's address range is handed to the sink, while the port has the chips in.
  */
 export interface C64Machine {
   /**
@@ -252,8 +266,8 @@ export interface C64Machine {
   readonly illegalOpcodeCount: number;
 
   /**
-   * A complete, detached copy of the machine's mutable state: 64 KB of address space, the CPU's
-   * execution state, and this class's own bookkeeping.
+   * A complete, detached copy of the machine's mutable state: 68 KB of memory (the 64 KB address
+   * space and the 4 KB under I/O), the CPU's execution state, and this class's own bookkeeping.
    *
    * The point of it is `restore` — a position captured here can be returned to in constant time
    * rather than by re-emulating the tune from `init`, which is what makes a cue hop free of the
@@ -278,8 +292,9 @@ export interface C64Machine {
   restore(snapshot: MachineSnapshot): void;
 
   /**
-   * Resets the address space, reloads the tune and runs its init routine for the given 1-based
-   * subtune, then resolves the play address an RSID installs during init.
+   * Resets the address space and the 6510's port, reloads the tune and runs its init routine for
+   * the given 1-based subtune, then resolves the play address an RSID installs during init. A PSID
+   * starts with `$01` set to the bank value for its init address, as a PSID driver would leave it.
    *
    * @throws {RangeError} when `song` is outside the tune's subtune range.
    * @throws {UnplayableTuneError} when init finished but left no play address to call.
@@ -288,7 +303,8 @@ export interface C64Machine {
 
   /**
    * Runs the play routine exactly once. Batching several calls into one frame would collapse them
-   * downstream, which is precisely the data a multispeed tune exists to deliver.
+   * downstream, which is precisely the data a multispeed tune exists to deliver. A PSID with a play
+   * address has `$01` set to the bank value for it first, whatever the last call left there.
    *
    * The returned result is the machine's own, refilled by the next call to this or `initSubtune`.
    *
@@ -305,6 +321,12 @@ export function createC64Machine(file: SidFile, sink: SidWriteSink): C64Machine 
 class C64MachineImpl implements C64Machine {
   private readonly file: SidFile;
   private readonly sink: SidWriteSink;
+  /**
+   * The 64 KB address space, then the 4 KB of RAM under I/O. `memory[$D000-$DFFF]` is the I/O view —
+   * what the chips are given and what a tune that never banks them out reads — and the RAM under it
+   * lives at `MEMORY_SIZE + (address - IO_START)`, reached only while the port banks the chips out.
+   * `memory[0]` and `memory[1]` are the 6510's port.
+   */
   private readonly memory: Uint8Array;
   private readonly cpu: Cpu6502;
 
@@ -339,6 +361,8 @@ class C64MachineImpl implements C64Machine {
   private readonly modelsChipReads: boolean;
   /** A PSID with header play address 0: the play call enters the tune's own handler as an interrupt. */
   private readonly entersAsInterrupt: boolean;
+  /** A PSID with a play address: the driver writes the bank value for that address to `$01` before every call. */
+  private readonly rebanksEveryCall: boolean;
   /** What `$FFFE` holds until a tune installs its own handler. */
   private readonly defaultHardwareVector: number;
 
@@ -359,8 +383,9 @@ class C64MachineImpl implements C64Machine {
   constructor(file: SidFile, sink: SidWriteSink) {
     this.file = file;
     this.sink = sink;
-    this.memory = new Uint8Array(MEMORY_SIZE);
+    this.memory = new Uint8Array(MACHINE_MEMORY_SIZE);
     this.entersAsInterrupt = file.format === 'PSID' && file.playAddress === 0;
+    this.rebanksEveryCall = file.format === 'PSID' && file.playAddress !== 0;
     this.defaultHardwareVector = file.format === 'PSID' ? BRK_HANDLER_STUB : IRQ_HANDLER_STUB;
 
     this.modelsChipReads = file.format === 'PSID';
@@ -512,6 +537,7 @@ class C64MachineImpl implements C64Machine {
     this.installRomStubs();
     this.loadTune();
     this.writeTrampoline(song);
+    this.resetPort();
 
     const result = this.runRoutine(
       this.trampoline + TRAMPOLINE_INIT_OFFSET,
@@ -533,6 +559,9 @@ class C64MachineImpl implements C64Machine {
   runFrame(): FrameResult {
     if (this.playAddress === 0) {
       throw new UnplayableTuneError('no play address has been resolved — run initSubtune first');
+    }
+    if (this.rebanksEveryCall) {
+      this.memory[PORT_DATA] = psidBankFor(this.playAddress);
     }
     this.chips.beginCall(this.timerAGovernsRate() ? CALL_CIA : CALL_RASTER);
     const result = this.runRoutine(
@@ -569,11 +598,10 @@ class C64MachineImpl implements C64Machine {
   /**
    * The read side of the CPU's bus.
    *
-   * The `$01` banking register is stored as ordinary RAM and ignored for decoding: the ranges below
-   * always decode as I/O whatever a tune banks in. That is a deliberate simplification, not an
-   * oversight — no KERNAL or BASIC ROM image ships here. It has a cost since the chips went live:
-   * a tune that banks the I/O out to read the RAM under `$D019`–`$DD0F` reads the chips instead.
-   * `Snow_Strike` is the known case.
+   * The 6510's port decides what `$D000`–`$DFFF` is (see `ioVisible`): with the chips banked out the
+   * read is the RAM under them. Only that overlay is modelled. No KERNAL, BASIC or character ROM image
+   * ships here, so `$A000`–`$BFFF` and `$E000`–`$FFFF` always read RAM whatever the port selects, and
+   * the character ROM, which the port can bring in over `$D000`–`$DFFF`, reads the RAM under I/O too.
    */
   private read(address: number): number {
     const fetchingOpcode = this.expectingOpcodeFetch;
@@ -604,16 +632,41 @@ class C64MachineImpl implements C64Machine {
   }
 
   private readBus(address: number): number {
-    switch (address) {
-      case VIC_CONTROL_REGISTER:
-        return VIC_CONTROL_IDLE_BITS | ((this.rasterLine() & 0x100) >> 1);
-      case VIC_RASTER_REGISTER:
-        return this.rasterLine() & 0xff;
-    }
-    if (address >= CHIP_REGISTERS_FIRST && address <= CHIP_REGISTERS_LAST) {
-      return this.readChipRegister(address);
+    if (address >= IO_START) {
+      if (address < IO_START + IO_SIZE) {
+        if (!this.ioVisible()) {
+          return this.memory[MEMORY_SIZE + address - IO_START];
+        }
+        switch (address) {
+          case VIC_CONTROL_REGISTER:
+            return VIC_CONTROL_IDLE_BITS | ((this.rasterLine() & 0x100) >> 1);
+          case VIC_RASTER_REGISTER:
+            return this.rasterLine() & 0xff;
+        }
+        if (address >= CHIP_REGISTERS_FIRST && address <= CHIP_REGISTERS_LAST) {
+          return this.readChipRegister(address);
+        }
+      }
+    } else if (address === PORT_DATA) {
+      return this.readPortData();
     }
     return this.memory[address & 0xffff];
+  }
+
+  /**
+   * Whether `$D000`–`$DFFF` is the chips rather than RAM or the character ROM: CHAREN high with
+   * LORAM or HIRAM high. An input line is pulled up, so it reads 1 whatever `$01` holds for it.
+   * Allocates nothing, since every bus access in that range asks.
+   */
+  private ioVisible(): boolean {
+    const pins = (this.memory[PORT_DATA] | ~this.memory[PORT_DDR]) & PORT_BANK_MASK;
+    return (pins & PORT_CHAREN_BIT) !== 0 && (pins & PORT_HIRAM_LORAM_MASK) !== 0;
+  }
+
+  /** `$01` reads the data bits of the output lines and the pulled-up level of the input lines. */
+  private readPortData(): number {
+    const direction = this.memory[PORT_DDR];
+    return (this.memory[PORT_DATA] & direction) | (PORT_PULLUPS & ~direction);
   }
 
   /**
@@ -633,13 +686,19 @@ class C64MachineImpl implements C64Machine {
   }
 
   /**
-   * The write side of the CPU's bus. See `read` for why banking is ignored.
+   * The write side of the CPU's bus. A write to `$D000`–`$DFFF` with the chips banked out lands in the
+   * RAM under them and reaches no chip and no sink; see `read` for what else the port does not model.
+   * A write under a ROM's addresses lands in RAM, as on hardware.
    *
    * Every register the machine reacts to lies between `$D019` and `$DD0F`, so one range test lets an
    * ordinary RAM store skip the rest.
    */
   private write(address: number, value: number): void {
     const byte = value & 0xff;
+    if (address >= IO_START && address < IO_START + IO_SIZE && !this.ioVisible()) {
+      this.memory[MEMORY_SIZE + address - IO_START] = byte;
+      return;
+    }
     this.memory[address & 0xffff] = byte;
 
     if (address < CHIP_REGISTERS_FIRST || address > CHIP_REGISTERS_LAST) {
@@ -709,11 +768,26 @@ class C64MachineImpl implements C64Machine {
     this.memory[BRK_HANDLER_STUB] = OPCODE_RTI;
   }
 
-  /** Copies the payload over the stubs, so the tune wins any overlap. */
+  /**
+   * Copies the payload over the stubs, so the tune wins any overlap. A payload that reaches
+   * `$D000`–`$DFFF` is the RAM under I/O as well as the I/O view, so it is seeded into both.
+   */
   private loadTune(): void {
     const available = MEMORY_SIZE - this.file.loadAddress;
     const length = Math.min(this.file.data.length, Math.max(0, available));
     this.memory.set(this.file.data.subarray(0, length), this.file.loadAddress);
+    this.memory.copyWithin(MEMORY_SIZE, IO_START, IO_START + IO_SIZE);
+  }
+
+  /**
+   * The port as init finds it: the KERNAL's reset direction, and for a PSID the bank value its driver
+   * writes before calling init. An RSID starts from the KERNAL's `$37` and is left alone. Written
+   * after the payload, which may cover `$00`/`$01`.
+   */
+  private resetPort(): void {
+    this.memory[PORT_DDR] = PORT_DDR_DEFAULT;
+    this.memory[PORT_DATA] =
+      this.file.format === 'PSID' ? psidBankFor(this.file.initAddress) : PORT_DATA_DEFAULT;
   }
 
   /**
