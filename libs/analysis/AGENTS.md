@@ -75,7 +75,15 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   rounded `PlayRate` literal, not its exact one — the loop guard's job is telling a real repeat from
   a played-out buffer, and a threshold a few frames either way changes nothing about that. Sizing
   rungs off the exact rate instead is not a precision improvement; it is a deviation from the
-  baseline the ladder's depths were measured against.
+  baseline the ladder's depths were measured against. A timer slower than a frame rounds to 1, so
+  such a tune's rungs and guards are counted at one call a frame — more seconds of music than named,
+  never fewer calls.
+- **`exactCallsPerFrame` can be below 1, and what reads it is meant to stand that.** `indexTune`
+  times the beat grid off `1e6 / nominalIntervalUs × exactCallsPerFrame`, which falls with the rate
+  and leaves `detectBeatGrid` searching beats in the tune's own, longer frames, and stores the exact
+  rate in the record as it is. `computePulse` scales its two-second histogram cap by it, so the cap
+  shrinks with the tune, and `impliedTempo` stretches an interval in frames into longer seconds. A
+  new reader that floors the rate at 1 reads a slow tune's music too fast.
 - **The zero-frame probe is load-bearing, not an optimisation to skip.** It is what tells the ladder
   a multispeed tune's real `callsPerFrame` before committing to a rung depth — guessing single-speed
   instead sizes every rung wrong for any tune that is not.
@@ -95,8 +103,10 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   `TUNE_INDEX_FORMAT_VERSION`?** `libs/tunes`'s resolver reads a tune's cached scan by comparing
   this version on every hit, and the consuming application stores the record itself — a bump
   invalidates every stored scan. Confirm the new shape and version are what the resolver and the
-  application's storage migration actually expect before shipping the bump. Detail:
-  [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
+  application's storage migration actually expect before shipping the bump. The version also moves
+  when `libs/core`'s engine changes what a tune plays (interrupt exits, play rate, the VIC and CIA
+  stubs): a stored scan is then of a stream the engine no longer makes, and keeping it is silent.
+  `index-tune.spec.ts` pins the number. Detail: [`libs/tunes/AGENTS.md`](../tunes/AGENTS.md).
 - **Changed `TuneScan.recordControls` (`scan-tune.ts`) or `toRegisterRecord` (`register-record.ts`)?**
   Both build the record from how core's `RegisterFrame` snapshots a doubled voice control write —
   the first write, plus one retrigger entry carrying the last byte — and `libs/core`'s `feed`

@@ -25,4 +25,27 @@ describe('FakeSink', () => {
     expect(Array.from(second.frame.registers)).toEqual([24]);
     expect(Array.from(second.frame.values)).toEqual([0xff]);
   });
+
+  it('holds nothing: every delivery has passed, replaceFrom answers the count and is recorded, and begin and reset restart it', () => {
+    const sink = new FakeSink();
+    const frame: SidFrame = {
+      count: 0,
+      registers: new Uint8Array(0),
+      values: new Uint8Array(0),
+      offsetsUs: new Int32Array(0),
+    };
+    sink.deliver(frame, frames(0), milliseconds(0), false);
+    sink.deliver(frame, frames(1), milliseconds(20), false);
+    sink.deliverNow(frame);
+
+    expect(sink.passedCount()).toBe(2);
+    expect(sink.replaceFrom(0)).toBe(2);
+    expect(sink.replaceFromCalls).toEqual([0]);
+
+    sink.reset();
+    expect(sink.passedCount()).toBe(0);
+    sink.deliver(frame, frames(0), milliseconds(0), false);
+    sink.begin({ chipModel: 'mos6581' });
+    expect(sink.passedCount()).toBe(0);
+  });
 });

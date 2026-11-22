@@ -14,6 +14,7 @@ interface CodeBlock {
 interface TuneOptions {
   playAddress?: number;
   songs?: number;
+  speedFlags?: number;
   blocks: readonly CodeBlock[];
 }
 
@@ -37,7 +38,7 @@ function tune(options: TuneOptions): SidFile {
     playAddress: options.playAddress ?? 0x1010,
     songs: options.songs ?? 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags: options.speedFlags ?? 0,
     name: '',
     author: '',
     released: '',
@@ -133,7 +134,7 @@ describe('replayToFrame', () => {
     expect(replayed.machine.memory).toEqual(live.machine.memory);
     expect(replayed.machine.cpu).toEqual(live.machine.cpu);
     expect(replayed.machine.playAddress).toBe(live.machine.playAddress);
-    expect(replayed.machine.timerALatch).toBe(live.machine.timerALatch);
+    expect(replayed.machine.chips).toEqual(live.machine.chips);
   });
 
   it('is deterministic: the same request twice gives the same answer', () => {
@@ -200,9 +201,10 @@ describe('replayToFrame', () => {
   });
 });
 
-/** init programs CIA 1 timer A for exactly two play calls per frame. */
+/** init programs CIA 1 timer A for exactly two play calls per frame, and the header says CIA-timed. */
 function doubleSpeedTune(): SidFile {
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },
@@ -214,6 +216,7 @@ function doubleSpeedTune(): SidFile {
  *  that does not divide the frame evenly. */
 function fractionalSpeedTune(): SidFile {
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },

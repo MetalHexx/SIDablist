@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { PAL_FRAME_INTERVAL_US } from '../registers/sid-constants.js';
 import { createC64Machine } from '../cpu/c64-machine.js';
+import { PAL_CYCLES_PER_FRAME } from '../cpu/cpu-constants.js';
 import type { C64Machine } from '../cpu/c64-machine.js';
 import { createRegisterFrame } from '../registers/register-frame.js';
 import type { SidFile } from '../sid/sid-file.model.js';
@@ -20,7 +21,7 @@ interface CodeBlock {
   readonly bytes: readonly number[];
 }
 
-function tune(blocks: readonly CodeBlock[]): SidFile {
+function tune(blocks: readonly CodeBlock[], speedFlags = 0): SidFile {
   const loadAddress = 0x1000;
   const codeEnd = blocks.reduce(
     (end, block) => Math.max(end, block.at + block.bytes.length),
@@ -38,7 +39,7 @@ function tune(blocks: readonly CodeBlock[]): SidFile {
     playAddress: 0x1010,
     songs: 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags,
     name: '',
     author: '',
     released: '',
@@ -54,12 +55,30 @@ const RTS = 0x60;
 
 /** Programs CIA 1 timer A for a latch giving exactly 2.4 calls per frame at PAL — a rate that does
  *  not divide the frame evenly, unlike a rate that could never expose a rounding defect. Latch
- *  `$1FFD`, 8190 cycles per call; 19656 (PAL cycles per frame) / 8190 is exactly 2.4. */
+ *  `$1FFD`, 8190 cycles per call; 19656 (PAL cycles per frame) / 8190 is exactly 2.4. The header's
+ *  speed bit says CIA-timed, as a play address's rate needs. */
 function multispeedMachine(): C64Machine {
-  const file = tune([
-    { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
-    { at: 0x1010, bytes: [RTS] },
-  ]);
+  const file = tune(
+    [
+      { at: 0x1000, bytes: [0xa9, 0xfd, 0x8d, 0x04, 0xdc, 0xa9, 0x1f, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+    1,
+  );
+  const machine = createC64Machine(file, createRegisterFrame());
+  machine.initSubtune(1);
+  return machine;
+}
+
+/** CIA-timed with a latch of `$7FFF`: 32768 cycles a call, 0.6 calls per PAL frame. */
+function slowTimerMachine(): C64Machine {
+  const file = tune(
+    [
+      { at: 0x1000, bytes: [0xa9, 0xff, 0x8d, 0x04, 0xdc, 0xa9, 0x7f, 0x8d, 0x05, 0xdc, RTS] },
+      { at: 0x1010, bytes: [RTS] },
+    ],
+    1,
+  );
   const machine = createC64Machine(file, createRegisterFrame());
   machine.initSubtune(1);
   return machine;
@@ -114,6 +133,32 @@ describe('playRateFor', () => {
       roundedCallsPerFrame: 1,
       mode: 'rounded',
     });
+  });
+});
+
+describe('a timer slower than a frame', () => {
+  it('stretches every conversion in exact mode and leaves the rounded rate at one', () => {
+    const machine = slowTimerMachine();
+    const exact = playRateFor(machine, 'exact');
+    const rounded = playRateFor(machine, 'rounded');
+    const callsPerFrame = PAL_CYCLES_PER_FRAME / 0x8000;
+
+    expect(exact.callsPerFrame).toBeCloseTo(callsPerFrame, 10);
+    expect(exact.callsPerFrame).toBeLessThan(1);
+    expect(rounded.callsPerFrame).toBe(1);
+    expect(playCallIntervalUs(PAL_FRAME_INTERVAL_US, exact)).toBeCloseTo(
+      PAL_FRAME_INTERVAL_US / callsPerFrame,
+      6,
+    );
+    expect(playCallIntervalUs(PAL_FRAME_INTERVAL_US, exact)).toBeGreaterThan(PAL_FRAME_INTERVAL_US);
+    expect(playCallsPerSecond(PAL_FRAME_INTERVAL_US, exact)).toBeCloseTo(
+      (1_000_000 / PAL_FRAME_INTERVAL_US) * callsPerFrame,
+      6,
+    );
+    // Fewer calls fit in a second of music, so the same second is fewer calls, never more.
+    expect(msToPlayCalls(milliseconds(1000), PAL_FRAME_INTERVAL_US, exact)).toBeLessThan(
+      msToPlayCalls(milliseconds(1000), PAL_FRAME_INTERVAL_US, rounded),
+    );
   });
 });
 

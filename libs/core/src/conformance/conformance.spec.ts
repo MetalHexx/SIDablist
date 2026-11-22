@@ -2,7 +2,8 @@ import { describe, it } from 'vitest';
 import type { FarEndConsumption, SidSink, SinkCapabilities } from '../ports/sink.js';
 import type { SidFrame } from '../registers/sid-frame.js';
 import type { Frames, Milliseconds } from '../units.js';
-import { SINK_CONFORMANCE_CASES, type ConformanceHarness } from './index.js';
+import { FakeSink } from '../testing/fake-sink.js';
+import { SINK_CONFORMANCE_CASES, SINK_REPLACE_CASES, type ConformanceHarness } from './index.js';
 
 const REFERENCE_CAPABILITIES: SinkCapabilities = {
   perWriteOffsets: false,
@@ -38,6 +39,10 @@ class SchedulingFakeSink implements SidSink {
   private readonly pending: { writes: readonly Write[]; dueAtMs: number }[] = [];
   private readonly wire: Write[] = [];
   private now = 0;
+  /** Deliveries since the last `begin` or `reset`; `passed` of them have been released to the wire,
+   *  and `pending` holds the rest. */
+  private delivered = 0;
+  private passed = 0;
 
   private began = 0;
   private ended = 0;
@@ -50,6 +55,9 @@ class SchedulingFakeSink implements SidSink {
 
   begin(): void {
     this.began++;
+    this.pending.length = 0;
+    this.delivered = 0;
+    this.passed = 0;
   }
 
   end(): void {
@@ -66,6 +74,7 @@ class SchedulingFakeSink implements SidSink {
 
   deliver(sidFrame: SidFrame, frameNumber: Frames, dueAtMs: Milliseconds): void {
     this.pending.push({ writes: unroll(sidFrame), dueAtMs });
+    this.delivered++;
     this.release();
   }
 
@@ -81,6 +90,19 @@ class SchedulingFakeSink implements SidSink {
 
   reset(): void {
     this.pending.length = 0;
+    this.delivered = 0;
+    this.passed = 0;
+  }
+
+  passedCount(): number {
+    return this.passed;
+  }
+
+  replaceFrom(fromCount: number): number {
+    const begin = Math.min(Math.max(fromCount, this.passed), this.delivered);
+    this.pending.length = begin - this.passed;
+    this.delivered = begin;
+    return begin;
   }
 
   readAt(): FarEndConsumption {
@@ -101,6 +123,7 @@ class SchedulingFakeSink implements SidSink {
     while (this.pending.length > 0 && this.pending[0].dueAtMs <= this.now) {
       const next = this.pending.shift();
       if (next) this.wire.push(...next.writes);
+      this.passed++;
     }
   }
 }
@@ -117,5 +140,22 @@ function makeReferenceHarness(): ConformanceHarness {
 describe('SINK_CONFORMANCE_CASES', () => {
   for (const conformanceCase of SINK_CONFORMANCE_CASES) {
     it(conformanceCase.name, () => conformanceCase.run(makeReferenceHarness));
+  }
+});
+
+/** `FakeSink` holds nothing and has no clock, so only the cases about what it has passed apply: what it
+ *  emits is what it was delivered, and time does not move. */
+function makeFakeSinkHarness(): ConformanceHarness {
+  const sink = new FakeSink();
+  return {
+    sink,
+    emitted: () => sink.deliveredFrames.flatMap((delivered) => unroll(delivered.frame)),
+    advanceMs: () => undefined,
+  };
+}
+
+describe('SINK_REPLACE_CASES against FakeSink', () => {
+  for (const conformanceCase of SINK_REPLACE_CASES) {
+    it(conformanceCase.name, () => conformanceCase.run(makeFakeSinkHarness));
   }
 });

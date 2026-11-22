@@ -1,4 +1,5 @@
-import { describe, it, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, beforeEach } from 'vitest';
+import { milliseconds } from '@sidablist/core';
 import { SINK_CONFORMANCE_CASES, type ConformanceHarness } from '@sidablist/core/conformance';
 import {
   ASID_MANUFACTURER_ID,
@@ -115,7 +116,7 @@ let mockNow = 0;
 
 function makeHarness(supportsCancel: boolean): ConformanceHarness {
   const port = new FakeMidiOutputPort(supportsCancel, () => mockNow);
-  const sink = createAsidSink(port);
+  const sink = createAsidSink(port, { time: { now: () => milliseconds(mockNow) } });
 
   return {
     sink,
@@ -151,11 +152,6 @@ describe.each([
 ] as const)('ASID sink conformance, %s', (_label, supportsCancel) => {
   beforeEach(() => {
     mockNow = 0;
-    vi.spyOn(performance, 'now').mockImplementation(() => mockNow);
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
   });
 
   for (const c of SINK_CONFORMANCE_CASES) {

@@ -81,6 +81,24 @@ describe('pulse analysis', () => {
       expect(atMultispeedRate.confidence).toBe('strong');
     });
 
+    it('shrinks the cap for a timer slower than a frame, so it still spans about two seconds of music', () => {
+      // At 0.6 calls a frame a 70-frame interval is 3.5 s — past the 2 s cap — though it is well inside
+      // the ~101-frame cap at nominal PAL 1×.
+      const candidates: Candidate[] = [
+        { frame: 0, strength: 0.8, contributors: [] },
+        { frame: 70, strength: 0.8, contributors: [] },
+        { frame: 140, strength: 0.8, contributors: [] },
+      ];
+
+      const atNominalRate = computePulse(candidates);
+      const atSlowRate = computePulse(candidates, 0.6);
+
+      expect(atNominalRate.dominantInterval).toBe(70);
+      expect(atSlowRate.histogram.length).toBe(Math.ceil((2_000_000 / 19_950) * 0.6));
+      expect(atSlowRate.dominantInterval).toBe(null);
+      expect(atSlowRate.confidence).toBe('none');
+    });
+
     it('defaults to the nominal-PAL-1× cap when callsPerFrame is omitted', () => {
       const candidates: Candidate[] = [
         { frame: 0, strength: 0.8, contributors: [] },
@@ -201,6 +219,13 @@ describe('pulse analysis', () => {
       expect(result1.native).not.toBeNull();
       expect(result2.native).not.toBeNull();
       expect(result2.native).toBeCloseTo((result1.native ?? 0) * 2, 0);
+    });
+
+    it('halves the tempo for a timer slower than a frame, where a play call lasts longer than a frame', () => {
+      const atOneCallPerFrame = impliedTempo(30, 19_950, 1, 1.0);
+      const atHalfACallPerFrame = impliedTempo(30, 19_950, 0.5, 1.0);
+
+      expect(atHalfACallPerFrame.native).toBeCloseTo((atOneCallPerFrame.native ?? 0) / 2, 6);
     });
 
     it('combines speed multiplier and multispeed correctly', () => {

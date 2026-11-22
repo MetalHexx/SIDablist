@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { SidFile, SidClock } from '../sid/sid-file.model.js';
 import type { C64Machine } from '../cpu/c64-machine.js';
 import type { RegisterFrame } from '../registers/register-frame.js';
@@ -74,6 +74,7 @@ function tune(options: {
   songs?: number;
   clock?: SidClock;
   playAddress?: number;
+  speedFlags?: number;
   blocks: readonly CodeBlock[];
 }): SidFile {
   const loadAddress = 0x1000;
@@ -93,7 +94,7 @@ function tune(options: {
     playAddress: options.playAddress ?? 0x1010,
     songs: options.songs ?? 1,
     startSong: 1,
-    speedFlags: 0,
+    speedFlags: options.speedFlags ?? 0,
     name: '',
     author: '',
     released: '',
@@ -133,10 +134,12 @@ function counterTune(songs = 1): SidFile {
   });
 }
 
-/** init programs CIA 1 timer A for exactly two play calls per frame; play still writes nothing. */
+/** init programs CIA 1 timer A for exactly two play calls per frame, and the header's speed bit
+ *  says CIA-timed; play still writes nothing. */
 function doubleSpeedTune(): SidFile {
   // LDA #$63 / STA $DC04 / LDA #$26 / STA $DC05 / RTS — a latch of 9827, half a PAL frame.
   return tune({
+    speedFlags: 1,
     blocks: [
       { at: 0x1000, bytes: [0xa9, 0x63, 0x8d, 0x04, 0xdc, 0xa9, 0x26, 0x8d, 0x05, 0xdc, RTS] },
       { at: 0x1010, bytes: [RTS] },
@@ -172,12 +175,16 @@ function unplayableTune(): SidFile {
  * can assert on `ceilingFrames` staying current across a subtune init with no override needed. */
 function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
   readonly failures: string[];
+  readonly warnings: string[];
   readonly resyncCount: { count: number };
   readonly dirtyCount: { count: number };
+  readonly followCount: { count: number };
 } {
   const failures: string[] = [];
+  const warnings: string[] = [];
   const resyncCount = { count: 0 };
   const dirtyCount = { count: 0 };
+  const followCount = { count: 0 };
   let machineRates: { exact: number; rounded: number } = { exact: 1, rounded: 1 };
   const playRate = (): PlayRate => ({
     callsPerFrame: machineRates.exact,
@@ -194,9 +201,13 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
         rounded: machine?.callsPerFrame ?? 1,
       };
     },
+    followPlayRate: () => {
+      followCount.count++;
+    },
     effectiveMutes: () => [false, false, false],
     clearError: () => undefined,
     fail: (reason: string) => failures.push(reason),
+    warn: (message: string) => warnings.push(message),
     queueResync: () => {
       resyncCount.count++;
     },
@@ -208,18 +219,15 @@ function fakeHost(overrides: Partial<TuneSessionHost> = {}): TuneSessionHost & {
     },
     ...overrides,
     failures,
+    warnings,
     resyncCount,
     dirtyCount,
+    followCount,
   };
 }
 
 describe('TuneSession', () => {
   let replay: FakeReplayRunner;
-
-  beforeEach(() => {
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.spyOn(console, 'error').mockImplementation(() => undefined);
-  });
 
   describe('load and subtune init', () => {
     it('builds a machine and frame, and clamps the subtune count to at least 1', () => {
@@ -229,6 +237,18 @@ describe('TuneSession', () => {
 
       expect(session.machine).not.toBeNull();
       expect(session.subtuneCount).toBe(1);
+    });
+
+    it('counts every load, and no subtune init', () => {
+      const session = createTuneSession(new FakeReplayRunner(), fakeHost());
+      expect(session.loadGeneration).toBe(0);
+
+      session.load(silentTune(2));
+      session.initSubtune(2);
+      expect(session.loadGeneration).toBe(1);
+
+      session.load(silentTune(2));
+      expect(session.loadGeneration).toBe(2);
     });
 
     it('resets the position counter, records a fresh anchor, adopts the subtune and clears the error on success', () => {
@@ -503,6 +523,7 @@ describe('TuneSession', () => {
 
       expect(await session.replayImage(frames(1))).toBeNull();
       expect(host.failures).toHaveLength(0);
+      expect(host.warnings).toEqual([expect.stringMatching(/^SID player: /)]);
     });
 
     it('takes no part in the jump gating: a scrub issued alongside it still lands, under an id of its own', async () => {
@@ -583,6 +604,30 @@ describe('TuneSession', () => {
 
       expect(session.framesRendered).toBe(42);
       expect(host.resyncCount.count).toBe(1);
+    });
+
+    it('has the host follow the rate only once the image is on the machine', () => {
+      const source = createTuneSession(new FakeReplayRunner(), fakeHost());
+      source.load(doubleSpeedTune());
+      source.initSubtune(1);
+      const image = (source.machine as C64Machine).snapshot();
+      const registers = (source.frame as RegisterFrame).snapshotValues();
+      const ratesSeenByHost: number[] = [];
+      const session = createTuneSession(
+        new FakeReplayRunner(),
+        fakeHost({
+          followPlayRate: () => {
+            ratesSeenByHost.push(session.machine?.exactCallsPerFrame ?? 0);
+          },
+        }),
+      );
+      session.load(silentTune());
+      session.initSubtune(1);
+
+      session.restoreState(image, registers, frames(10));
+      session.adoptState(image, registers, frames(11));
+
+      expect(ratesSeenByHost).toEqual([2, 2]);
     });
   });
 

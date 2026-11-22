@@ -8,7 +8,7 @@ import type { Microseconds, Milliseconds } from '../units.js';
  * and needs only a correct average rate.
  */
 export interface FrameClock {
-  /** `dueAtMs` is when the frame fell due on the `performance.now()` timeline, which is
+  /** `dueAtMs` is when the frame fell due on the host's `TimeSource` timeline, which is
    *  *before* the tick that releases it — a callback releases every frame that fell inside
    *  the span it credits, so frames arrive in bursts carrying due times one interval apart.
    *  `catchUpClamped` marks a frame released from a span crediting less than the time really

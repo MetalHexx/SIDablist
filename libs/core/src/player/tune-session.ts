@@ -25,7 +25,7 @@ export const JUMP_CEILING_SECONDS = 300;
  */
 export interface TuneSessionHost {
   nominalIntervalUs(): number;
-  /** The rate in force — mirrors `machineRates()`, never a direct read of
+  /** The rate in force — mirrors the machine's two rates, never a direct read of
    *  `machine.exactCallsPerFrame`/`callsPerFrame`, so `ceilingFrames` stays current after a subtune
    *  init that leaves the nominal interval unchanged. */
   playRate(): PlayRate;
@@ -33,11 +33,16 @@ export interface TuneSessionHost {
    *  latch is only meaningful once init has run, so this is called from `initSubtune`, not from
    *  `load`. */
   syncPlayRate(machine: C64Machine | null): void;
+  /** Called once the live machine has been restored from an image, which carries the rate it was
+   *  taken at: re-times the running clock if the machine's rate no longer matches the mirror. */
+  followPlayRate(): void;
   effectiveMutes(): readonly boolean[];
   /** Clears the engine's error state — the tell that a subtune init succeeded. */
   clearError(): void;
   /** Marks the engine's failure state and logs why. */
   fail(reason: string): void;
+  /** Reports input the session rejected; goes nowhere when the host supplied no log. */
+  warn(message: string): void;
   /** Queues the chip resync a restore owes the stream. */
   queueResync(): void;
   /** Drops the marker state's anchor ring — its entries describe a machine a subtune re-init has
@@ -84,6 +89,10 @@ export interface TuneSession {
   readonly frame: RegisterFrame | null;
   framesRendered: Frames;
 
+  /** Counts the loads: every `load` builds a new machine and frame and bumps it. What a saved state
+   *  is stamped with, since two loads of the same file are two machines. */
+  readonly loadGeneration: number;
+
   /** Rebuilds the machine and register frame for `file`. Does not initialise a subtune — the
    *  coordinator calls `initSubtune()` once it has decided what else a fresh load resets. */
   load(file: SidFile): void;
@@ -95,6 +104,10 @@ export interface TuneSession {
    *  number greater than zero is stored as null instead — a zero or negative basis would divide the
    *  playhead by nothing — which makes `positionBasisFrames` fall back to `ceilingFrames`. */
   setIndexedLengthFrames(lengthFrames: Frames | null): void;
+
+  /** `setIndexedLengthFrames` without the notification, for a restore that puts the track structure
+   *  back and notifies once itself, after everything is in place. */
+  adoptIndexedLengthFrames(lengthFrames: Frames | null): void;
 
   /** Re-inits the machine and marks every register dirty, so the chip cannot inherit the old state. */
   initSubtune(song: number): boolean;
@@ -172,9 +185,9 @@ export interface TuneSession {
   ): void;
 
   /**
-   * `restoreState` without the resync: puts the image on the live pair and adopts its frame number
-   * and nothing else. For a caller whose stream already holds the chip state the image describes,
-   * so a resync would only repeat it.
+   * `restoreState` without the resync: puts the image on the live pair, adopts its frame number and
+   * has the host follow the rate the image carries — nothing else. For a caller whose stream already
+   * holds the chip state the image describes, so a resync would only repeat it.
    */
   adoptState(
     machine: MachineSnapshot,
@@ -233,6 +246,7 @@ class TuneSessionImpl implements TuneSession {
   private _machine: C64Machine | null = null;
   private _frame: RegisterFrame | null = null;
   private _framesRendered: Frames = frames(0);
+  private _loadGeneration = 0;
   /** Stamped onto every request this session hands the runner, so responses can be told apart by age.
    *  Shared with `replayImage` rather than counted separately: the runner is one shared worker, and
    *  two counters could stamp two live requests with the same id. */
@@ -267,8 +281,13 @@ class TuneSessionImpl implements TuneSession {
     this._framesRendered = value;
   }
 
+  get loadGeneration(): number {
+    return this._loadGeneration;
+  }
+
   load(file: SidFile): void {
     this._file = file;
+    this._loadGeneration++;
     this._frame = createRegisterFrame();
     this._machine = createC64Machine(file, this._frame);
     this._subtuneCount = Math.max(1, file.songs);
@@ -283,8 +302,12 @@ class TuneSessionImpl implements TuneSession {
   }
 
   setIndexedLengthFrames(lengthFrames: Frames | null): void {
-    this._indexedLengthFrames = sanitizePositiveFrame(lengthFrames);
+    this.adoptIndexedLengthFrames(lengthFrames);
     this.host.markDirty();
+  }
+
+  adoptIndexedLengthFrames(lengthFrames: Frames | null): void {
+    this._indexedLengthFrames = sanitizePositiveFrame(lengthFrames);
   }
 
   initSubtune(song: number): boolean {
@@ -298,7 +321,7 @@ class TuneSessionImpl implements TuneSession {
     try {
       const result = machine.initSubtune(clamped);
       if (!result.completed) {
-        console.warn(
+        this.host.warn(
           `SID player: subtune ${clamped} init ran out of cycles (${result.cyclesUsed}) — playing it anyway.`,
         );
       }
@@ -410,7 +433,7 @@ class TuneSessionImpl implements TuneSession {
     }
 
     if (!response.ok) {
-      console.warn(`SID player: ${response.error}`);
+      this.host.warn(`SID player: ${response.error}`);
       return null;
     }
     return response.result;
@@ -477,6 +500,7 @@ class TuneSessionImpl implements TuneSession {
     this._machine.restore(machine);
     this._frame.restoreValues(registers);
     this._framesRendered = frameNumber;
+    this.host.followPlayRate();
   }
 
   discardOutstandingJump(): void {

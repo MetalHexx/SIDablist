@@ -53,6 +53,8 @@ export { describeError } from './common/errors.js';
 export { type SinkCapabilities, type FarEndConsumption, type SidSink } from './ports/sink.js';
 export { type Transport } from './ports/transport.js';
 export { type FrameClock, type FrameClockStats } from './ports/clock.js';
+export { type TimeSource } from './ports/time.js';
+export { type EngineLog } from './ports/log.js';
 export {
   type FrameAccumulator,
   MAX_CATCH_UP_US,
@@ -105,7 +107,11 @@ export {
 } from './timeline/active-loop.js';
 export { type CountedLoop, type ShadowCount, countAfter } from './timeline/shadow-position.js';
 export { type CrossingLines } from './timeline/crossing-captures.js';
-export { type SidPlayer, type VarispeedRateSource } from './player/sid-player.js';
+export {
+  type SavedPlayerState,
+  type SidPlayer,
+  type VarispeedRateSource,
+} from './player/sid-player.js';
 export { type DeliveryBatch, createDeliveryBatch } from './player/delivery-history.js';
 export {
   type JumpSettings,

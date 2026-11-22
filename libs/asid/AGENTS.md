@@ -16,10 +16,11 @@ The public surface is `src/index.ts`. Browser-only code is exported separately t
 DOM type.
 
 - `wire/` — pure byte layout, no I/O: `asid-constants.ts` (the protocol values, transcribed from
-  firmware), `slot-map.ts` (`packFrame`, mapping a frame's writes onto the 28 ASID slots) and
-  `encoder.ts` (the SysEx packet builders).
-- `sink/` — `createAsidSink` (`asid-sink.ts`), `core`'s `SidSink` plus the ASID-specific
-  `showText`/`setScheduleAhead`/`stats`; `midi-output-port.ts` (`MidiOutputPort`, the injected
+  firmware), `slot-map.ts` (`packFrameInto`, mapping a frame's writes onto the 28 ASID slots; `packFrame`
+  is its allocating form) and `encoder.ts` (the SysEx packet builders; `writeSidDataPacket` is the
+  into-buffer form of `buildSidDataPacket`).
+- `sink/` — `createAsidSink` (`asid-sink.ts`, taking `{ time, scheduleAheadMs?, log? }`), `core`'s
+  `SidSink` plus the ASID-specific `showText`/`setScheduleAhead`/`stats`; `midi-output-port.ts` (`MidiOutputPort`, the injected
   transport this sink schedules against); `delivery-stats.ts` (the counters `AsidSink.stats`
   reports).
 - `web-midi/` — `midiOutputPortFrom`, the one file in this library that touches a browser global:
@@ -31,6 +32,17 @@ DOM type.
   I/O belong in `sink/`.
 - Anything that touches a browser global belongs only under `web-midi/`, exported through the
   `./web-midi` subpath — never re-exported from the package root.
+- The sink reads no clock and writes no console: time comes from the `TimeSource` and the two
+  schedule-ahead warnings go to the `EngineLog` passed to `createAsidSink`, silent when absent.
+  `eslint.config.mjs` restricts `performance` and `console` here, except under `web-midi/`.
+- `deliver` allocates nothing. It packs into a preallocated ring slot with `writeSidDataPacket` and
+  never builds a packet, a record or an array; `asid-sink.allocation.spec.ts` measures it. Anything
+  that grows the ring runs off the tick (`setScheduleAhead`, `retime`). The ring is sized for the
+  engine's floor of 1 ms between frames (16 calls a frame is about 1.25 ms), not for a typical
+  tune: the sink is never told a tune's rate, so a 16x tune must not overflow it. A full ring
+  recycles its oldest slot, so that send stops being tracked and a later `retime()` does not
+  re-send it; the first time that happens after `begin()` or `reset()` the sink says so to the
+  `EngineLog`.
 - A member `core`'s `SidSink` has no concept of (`showText`, `setScheduleAhead`, `stats`) goes on
   `AsidSink`, not smuggled onto the shared contract.
 
@@ -41,9 +53,13 @@ DOM type.
   `ASIDidToReg[]` (`IOH_ASID.c`). A wrong entry is a wrong register on the wire with no local way
   to prove it — re-transcribe from the firmware source, do not renumber it by inference.
 - **The gate double-write must reach both slots.** Registers 4, 11 and 18's second write in a
-  frame is a deliberate retrigger, not noise; `slot-map.ts`'s `packFrame` routes it to that
+  frame is a deliberate retrigger, not noise; `slot-map.ts`'s `packFrameInto` routes it to that
   register's secondary slot (25/26/27) rather than overwriting the primary one. Losing that
   routing silently drops the retrigger — the far end plays one gate event instead of two.
+- **Each committed send owns its buffer until it is pruned.** `retime()` re-sends exactly those bytes,
+  so one shared scratch buffer would re-send the wrong packet. The specs' fake ports copy on `send`,
+  which hides it; `asid-sink.spec.ts`'s port that keeps the reference is what shows it. A
+  `MidiOutputPort` is given bytes valid only during `send`, and must copy to keep them.
 - **The uncancellable-port schedule-ahead ceiling is ear-derived.** `sink/asid-sink.ts`'s
   `UNCANCELLABLE_SCHEDULE_AHEAD_CEILING_MS` (two PAL frames) was settled by listening on real
   hardware, not derived from a test — it is what keeps a stale-tempo frame a tempo change could no

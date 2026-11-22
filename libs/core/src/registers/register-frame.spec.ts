@@ -2504,3 +2504,129 @@ function insid3Out(): SidFile {
   }
   return parseSidFile(decodeBundledTune(entry.base64));
 }
+
+describe('saving and restoring a register frame', () => {
+  /** Every setting in play, a consumed one-shot or two, and a frame half built. */
+  function everythingInPlay(frame: RegisterFrame): void {
+    frame.setTargetClock(PAL_PHI2_HZ, NTSC_PHI2_HZ);
+    frame.setVoicePitch(1, 1.5);
+    frame.setRatePitch(0.75);
+    frame.setRegisterScale('cutoff', 0.25);
+    frame.setFieldOffset({ name: 'pulseWidth', voice: 2 }, 100);
+    frame.holdField({ name: 'resonance' }, 9, 0.5);
+    frame.holdField({ name: 'filterType' }, 1);
+    frame.setRegisterScale('volume', 0.5);
+    frame.setVoiceMuted(1, true);
+    frame.onSidWrite(24, 0x0f);
+    frame.onSidWrite(1, 0x20);
+    frame.takeSnapshot();
+
+    frame.setRegisterScale('volume', 1); // brings it home: a restoring write is owed
+    frame.releaseField({ name: 'filterType' }); // a release is owed
+
+    frame.onSidWrite(4, 0x11);
+    frame.onSidWrite(4, 0x10); // a retrigger
+    frame.onSidWrite(0, 5);
+    frame.onSidWrite(0, 6); // folded in and counted
+    frame.onSidWrite(11, 0x41); // the muted voice drops it
+    frame.markAllDirty();
+  }
+
+  /** A mute's zeroing owed to the next frame and nothing else. */
+  function aMuteOwed(frame: RegisterFrame): void {
+    frame.onSidWrite(11, 0x41);
+    frame.takeSnapshot();
+    frame.setVoiceMuted(1, true);
+  }
+
+  /** Changes every kind of state and sends a frame, so a restore has something to undo. */
+  function wanderOff(frame: RegisterFrame): void {
+    frame.takeSnapshot();
+    frame.setVoiceMuted(1, false);
+    frame.setRegisterScale('cutoff', 1);
+    frame.setFieldOffset({ name: 'pulseWidth', voice: 2 }, 0);
+    frame.holdField({ name: 'resonance' }, 2);
+    frame.releaseField({ name: 'resonance' });
+    frame.setRatePitch(1);
+    frame.setVoicePitch(1, 1);
+    frame.setTargetClock(NTSC_PHI2_HZ, PAL_PHI2_HZ);
+    for (let register = 0; register < SID_REGISTER_COUNT; register++)
+      frame.onSidWrite(register, 0x77);
+    frame.takeSnapshot();
+    frame.onSidWrite(4, 0x33);
+    frame.onSidWrite(4, 0x34);
+    frame.setVoiceMuted(0, true);
+  }
+
+  /** The next frames out, and what a read of the registers says between them. */
+  function whatComesNext(frame: RegisterFrame) {
+    const out: unknown[] = [];
+    const read = (): void => {
+      const written = new Uint8Array(SID_REGISTER_COUNT);
+      const sent = new Uint8Array(SID_REGISTER_COUNT);
+      frame.readRegisters(written, sent);
+      out.push({ written: Array.from(written), sent: Array.from(sent) });
+    };
+    read();
+    out.push(writesOf(frame.takeSnapshot()));
+    frame.onSidWrite(4, 0x21);
+    frame.onSidWrite(4, 0x20);
+    frame.onSidWrite(1, 0x44);
+    frame.onSidWrite(24, 0x0a);
+    out.push(writesOf(frame.takeSnapshot()));
+    frame.setVoiceMuted(1, false);
+    frame.onSidWrite(11, 0x11);
+    frame.onSidWrite(11, 0x10);
+    frame.onSidWrite(8, 0x12);
+    out.push(writesOf(frame.takeSnapshot()));
+    out.push(frame.suppressedWriteCount);
+    read();
+    return out;
+  }
+
+  it.each([
+    { name: 'every setting in play with a frame half built', prepare: everythingInPlay, owes: 25 },
+    { name: 'a mute whose zeroing is still owed', prepare: aMuteOwed, owes: 1 },
+  ])('sends the same frames from $name as a frame that never left', ({ prepare, owes }) => {
+    const never = createRegisterFrame();
+    prepare(never);
+    const left = createRegisterFrame();
+    prepare(left);
+    const state = left.createState();
+    left.saveInto(state);
+    wanderOff(left);
+    left.restoreFrom(state);
+
+    const expected = whatComesNext(never);
+    const restored = whatComesNext(left);
+
+    expect(restored).toEqual(expected);
+    expect((expected[1] as Write[]).length).toBeGreaterThanOrEqual(owes);
+  });
+
+  it('keeps a pending resync that restoreValues drops, and puts back a muted voice it would keep', () => {
+    const frame = createRegisterFrame();
+    frame.setVoiceMuted(2, true);
+    frame.markAllDirty();
+    const state = frame.createState();
+    frame.saveInto(state);
+    frame.takeSnapshot();
+    frame.setVoiceMuted(2, false);
+
+    frame.restoreFrom(state);
+
+    expect(registersOf(frame.takeSnapshot())).toHaveLength(SID_REGISTER_COUNT);
+    frame.onSidWrite(18, 0x41);
+    expect(frame.emittedValues().written[18]).toBe(0);
+  });
+
+  it('restores a state never saved into as a frame at home', () => {
+    const frame = createRegisterFrame();
+    everythingInPlay(frame);
+
+    frame.restoreFrom(frame.createState());
+
+    const home = createRegisterFrame();
+    expect(whatComesNext(frame)).toEqual(whatComesNext(home));
+  });
+});

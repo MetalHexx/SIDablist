@@ -131,4 +131,22 @@ describe('createAnchorRing', () => {
     recordAt(0);
     expect(ring.select(frames(100))?.frame).toBe(0);
   });
+
+  it('keeps only the seed when asked, and records on from it', () => {
+    recordAt(0, 25, 50);
+
+    ring.keepSeedOnly();
+
+    expect(ring.select(frames(100))?.frame).toBe(0);
+    recordAt(75);
+    expect(ring.select(frames(130))?.frame).toBe(75);
+    ring.keepSeedOnly();
+    expect(ring.select(frames(130))?.frame).toBe(0);
+  });
+
+  it('keeps nothing when there was nothing to keep', () => {
+    ring.keepSeedOnly();
+
+    expect(ring.select(frames(100))).toBeNull();
+  });
 });

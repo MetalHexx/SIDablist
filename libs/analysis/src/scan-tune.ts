@@ -16,10 +16,12 @@ export interface ScanOutput {
   /** Registers written during each frame — the density signal. One entry per frame. */
   readonly writeCounts: Uint8Array;
   readonly frames: number;
-  /** Play-routine calls per video frame, read off the machine. 1 for most tunes, 2+ for multispeed. */
+  /** Play-routine calls per video frame, read off the machine once, when the output is built. 1 for
+   *  most tunes, 2+ for multispeed, and never below 1. */
   readonly callsPerFrame: number;
-  /** The un-rounded rate the machine's timer actually measured — the ladder's zero-frame probe reads
-   *  this to size its rungs precisely, rather than off the rounded integer above. */
+  /** The un-rounded rate the machine's timer actually measured — what `indexTune` stores and times
+   *  the beat grid by, where the ladder sizes its rungs off the rounded integer above. Below 1 for a
+   *  CIA timer slower than a frame. */
   readonly exactCallsPerFrame: number;
   /** The chip's voice control bytes after each frame: frame f's voice v at f * 3 + v. Unlike
    *  `registerValues`, which keeps the first byte of a doubled write, this is the byte the chip

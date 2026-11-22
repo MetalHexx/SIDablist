@@ -1,3 +1,4 @@
+import type { Saveable } from '../common/saveable.js';
 import { frames, type Frames } from '../units.js';
 import {
   REENTRY_GATE_OFF_FRAMES,
@@ -126,11 +127,31 @@ function countAlternating(from: ShadowCount, ticks: number, loop: CountedLoop): 
 export type ShadowTrack = Pick<TrackStructure, 'trackEndFrame' | 'loopStartFrame'>;
 
 /**
+ * Everything a `ShadowPosition` counts from: all nine of its fields, none derived from another, so
+ * every one is in. `running` and `ticks` are the count's own; `frame` and `held` are where it
+ * stands; `lapped`, `lapStart` and `lapEnd` are the lap it wraps at (with `lapped` false, the
+ * track's, read live); `alternatingLength` and `lapPhase` carry a loop of alternating lap lengths,
+ * where each lap ends at a different `lapEnd`: leaving either out restores a count that wraps a
+ * frame off from the next lap on.
+ */
+export interface ShadowPositionState {
+  running: boolean;
+  frame: number;
+  held: boolean;
+  ticks: number;
+  lapped: boolean;
+  lapStart: number;
+  lapEnd: number;
+  alternatingLength: number;
+  lapPhase: number;
+}
+
+/**
  * The counter behind `SidPlayer.startShadow`: a frame, a phase and a tick count, moved one tick at a
  * time by the coordinator while the transport is playing. Allocates nothing on `tick`, which runs on
  * the frame path.
  */
-export class ShadowPosition {
+export class ShadowPosition implements Saveable<ShadowPositionState> {
   private running = false;
   private frame = 0;
   private held = false;
@@ -188,6 +209,44 @@ export class ShadowPosition {
   /** Ticks counted since the last start, or null when stopped. */
   tickCount(): number | null {
     return this.running ? this.ticks : null;
+  }
+
+  createState(): ShadowPositionState {
+    return {
+      running: false,
+      frame: 0,
+      held: false,
+      ticks: 0,
+      lapped: false,
+      lapStart: 0,
+      lapEnd: 0,
+      alternatingLength: 0,
+      lapPhase: 0,
+    };
+  }
+
+  saveInto(target: ShadowPositionState): void {
+    target.running = this.running;
+    target.frame = this.frame;
+    target.held = this.held;
+    target.ticks = this.ticks;
+    target.lapped = this.lapped;
+    target.lapStart = this.lapStart;
+    target.lapEnd = this.lapEnd;
+    target.alternatingLength = this.alternatingLength;
+    target.lapPhase = this.lapPhase;
+  }
+
+  restoreFrom(source: ShadowPositionState): void {
+    this.running = source.running;
+    this.frame = source.frame;
+    this.held = source.held;
+    this.ticks = source.ticks;
+    this.lapped = source.lapped;
+    this.lapStart = source.lapStart;
+    this.lapEnd = source.lapEnd;
+    this.alternatingLength = source.alternatingLength;
+    this.lapPhase = source.lapPhase;
   }
 
   /** Counts one clock tick, as the player's own position would move on it. */

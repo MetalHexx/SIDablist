@@ -241,6 +241,195 @@ const reportsInFlightDepthRegardlessOfKind: ConformanceCase = {
   },
 };
 
+/** One write per frame, so which frame a write came from is readable off `emitted()`: `value` is the
+ *  frame's own tag and nothing else in a case reuses it. */
+function taggedFrame(tag: number): SidFrame {
+  return frame([{ register: 0, value: tag }]);
+}
+
+const ORIGINAL_TAG = 0x10;
+const REPLACEMENT_TAG = 0x40;
+const FRAME_COUNT = 5;
+const FIRST_DUE_MS = 100;
+const FRAME_INTERVAL_MS = 20;
+
+function dueAt(position: number) {
+  return milliseconds(FIRST_DUE_MS + FRAME_INTERVAL_MS * position);
+}
+
+/** Begins a run and delivers `FRAME_COUNT` tagged frames, then advances time far enough that a sink
+ *  holding frames until they fall due has passed the first few and still holds the rest. */
+function deliverOriginals(harness: ConformanceHarness): void {
+  harness.sink.begin({ chipModel: 'mos6581' });
+  for (let position = 0; position < FRAME_COUNT; position++) {
+    harness.sink.deliver(
+      taggedFrame(ORIGINAL_TAG + position),
+      frames(position),
+      dueAt(position),
+      false,
+    );
+  }
+  harness.advanceMs(FIRST_DUE_MS + 2 * FRAME_INTERVAL_MS - 10);
+}
+
+function emittedValues(harness: ConformanceHarness): number[] {
+  return harness.emitted().map((write) => write.value);
+}
+
+const passedCountNeverExceedsDeliveries: ConformanceCase = {
+  name: 'passedCount starts at 0, never exceeds the deliveries and never decreases',
+  run(makeHarness) {
+    const harness = makeHarness();
+    harness.sink.begin({ chipModel: 'mos6581' });
+    assertEqual(harness.sink.passedCount(), 0, 'nothing has been delivered after begin');
+    let previous = 0;
+    const check = (delivered: number): void => {
+      const passed = harness.sink.passedCount();
+      assertEqual(
+        passed >= previous && passed <= delivered,
+        true,
+        `passedCount was ${passed} after ${delivered} deliveries, and ${previous} before`,
+      );
+      previous = passed;
+    };
+    for (let position = 0; position < FRAME_COUNT; position++) {
+      harness.sink.deliver(
+        taggedFrame(ORIGINAL_TAG + position),
+        frames(position),
+        dueAt(position),
+        false,
+      );
+      check(position + 1);
+    }
+    for (let step = 0; step < 20; step++) {
+      harness.advanceMs(10);
+      check(FRAME_COUNT);
+    }
+  },
+};
+
+const replaceFromReturnsWhereReplacementsBegin: ConformanceCase = {
+  name: 'replaceFrom returns min(max(fromCount, passedCount), delivered) and leaves what passed alone',
+  run(makeHarness) {
+    for (const fromCount of [0, 1, 3, FRAME_COUNT, FRAME_COUNT + 4]) {
+      const harness = makeHarness();
+      deliverOriginals(harness);
+      const passedBefore = harness.sink.passedCount();
+      const returned = harness.sink.replaceFrom(fromCount);
+      assertEqual(
+        returned,
+        Math.min(Math.max(fromCount, passedBefore), FRAME_COUNT),
+        `replaceFrom(${fromCount}) with ${passedBefore} passed of ${FRAME_COUNT}`,
+      );
+      assertEqual(
+        harness.sink.passedCount(),
+        passedBefore,
+        'replaceFrom must not change how many frames have passed',
+      );
+    }
+  },
+};
+
+const replacedFramesNeverReachTheWire: ConformanceCase = {
+  name: 'every frame replaceFrom dropped stays off the wire and every replacement reaches it',
+  run(makeHarness) {
+    for (const fromCount of [0, 1, 3]) {
+      const harness = makeHarness();
+      deliverOriginals(harness);
+      const begin = harness.sink.replaceFrom(fromCount);
+      for (let position = begin; position < FRAME_COUNT; position++) {
+        harness.sink.deliver(
+          taggedFrame(REPLACEMENT_TAG + position),
+          frames(position),
+          dueAt(position),
+          false,
+        );
+      }
+      harness.advanceMs(1000);
+      const values = emittedValues(harness);
+      for (let position = 0; position < FRAME_COUNT; position++) {
+        const original = values.includes(ORIGINAL_TAG + position);
+        const replacement = values.includes(REPLACEMENT_TAG + position);
+        assertEqual(
+          original,
+          position < begin,
+          `replaceFrom(${fromCount}) returned ${begin}: original ${position} ${original ? 'was' : 'was not'} emitted`,
+        );
+        assertEqual(
+          replacement,
+          position >= begin,
+          `replaceFrom(${fromCount}) returned ${begin}: replacement ${position} ${replacement ? 'was' : 'was not'} emitted`,
+        );
+      }
+    }
+  },
+};
+
+const replaceFromPastTheEndChangesNothing: ConformanceCase = {
+  name: 'replaceFrom past the last delivery changes nothing and returns the delivery count',
+  run(makeHarness) {
+    const harness = makeHarness();
+    harness.sink.begin({ chipModel: 'mos6581' });
+    for (let position = 0; position < 3; position++) {
+      harness.sink.deliver(
+        taggedFrame(ORIGINAL_TAG + position),
+        frames(position),
+        dueAt(position),
+        false,
+      );
+    }
+    const passedBefore = harness.sink.passedCount();
+    assertEqual(harness.sink.replaceFrom(3), 3, 'replaceFrom at the delivery count');
+    assertEqual(harness.sink.replaceFrom(100), 3, 'replaceFrom well past the delivery count');
+    assertEqual(harness.sink.passedCount(), passedBefore, 'nothing was dropped or passed');
+    harness.sink.deliver(taggedFrame(ORIGINAL_TAG + 3), frames(3), dueAt(3), false);
+    harness.advanceMs(1000);
+    assertEqual(
+      emittedValues(harness),
+      [ORIGINAL_TAG, ORIGINAL_TAG + 1, ORIGINAL_TAG + 2, ORIGINAL_TAG + 3],
+      'every frame delivered must still reach the wire, in order',
+    );
+  },
+};
+
+const resetAndBeginRestartTheCounts: ConformanceCase = {
+  name: 'reset and begin restart both counts',
+  run(makeHarness) {
+    const harness = makeHarness();
+    deliverOriginals(harness);
+    harness.sink.reset();
+    assertEqual(harness.sink.passedCount(), 0, 'passedCount after reset');
+    assertEqual(harness.sink.replaceFrom(FRAME_COUNT), 0, 'no deliveries are counted after reset');
+    harness.sink.deliver(taggedFrame(REPLACEMENT_TAG), frames(0), dueAt(0), false);
+    harness.sink.deliver(taggedFrame(REPLACEMENT_TAG + 1), frames(1), dueAt(1), false);
+    assertEqual(
+      harness.sink.replaceFrom(FRAME_COUNT),
+      2,
+      'deliveries are counted from 0 after reset',
+    );
+
+    harness.sink.begin({ chipModel: 'mos6581' });
+    assertEqual(harness.sink.passedCount(), 0, 'passedCount after begin');
+    assertEqual(harness.sink.replaceFrom(FRAME_COUNT), 0, 'no deliveries are counted after begin');
+    harness.sink.deliver(taggedFrame(REPLACEMENT_TAG), frames(0), dueAt(0), false);
+    assertEqual(
+      harness.sink.replaceFrom(FRAME_COUNT),
+      1,
+      'deliveries are counted from 0 after begin',
+    );
+  },
+};
+
+/** The cases for `passedCount` and `replaceFrom`, also exported alone so a sink that cannot be run
+ *  through the whole suite (a recorder with no notion of time) can still be held to them. */
+export const SINK_REPLACE_CASES: readonly ConformanceCase[] = [
+  passedCountNeverExceedsDeliveries,
+  replaceFromReturnsWhereReplacementsBegin,
+  replacedFramesNeverReachTheWire,
+  replaceFromPastTheEndChangesNothing,
+  resetAndBeginRestartTheCounts,
+];
+
 export const SINK_CONFORMANCE_CASES: readonly ConformanceCase[] = [
   preservesWriteOrdering,
   drainsGateOffAheadOfResync,
@@ -249,4 +438,5 @@ export const SINK_CONFORMANCE_CASES: readonly ConformanceCase[] = [
   honorsNoPerWriteOffsetsOnDeliver,
   resetDropsOutstandingAndReopens,
   reportsInFlightDepthRegardlessOfKind,
+  ...SINK_REPLACE_CASES,
 ];

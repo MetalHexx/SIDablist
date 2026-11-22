@@ -19,6 +19,15 @@ import type { JumpSettings, PlayerSnapshot, PlayerStats, QueuedJump } from './sn
 export type VarispeedRateSource = (position: number, intervalUs: number) => number;
 
 /**
+ * Everything that decides a player's next frames, held in storage made once by
+ * `SidPlayer.createSavedState`. Opaque: a host makes one, fills it with `saveState` and hands it
+ * back to `restoreState`, and reads nothing out of it.
+ */
+export interface SavedPlayerState {
+  readonly __savedPlayerState: unique symbol;
+}
+
+/**
  * The shape a consumer sees, decided once and in isolation from the coordinator that populates it
  * (`createSidPlayer`). Every operation a consumer needs has a route: through here, to the
  * application, or to the sink — nothing is dropped silently.
@@ -164,6 +173,48 @@ export interface SidPlayer {
    *  changing nothing, where `land` would be, or with the shadow stopped. The shadow keeps running: the
    *  host stops it. */
   landOnShadow(settings?: JumpSettings): boolean;
+
+  // Restore points
+  /**
+   * Space for one saved state, sized for the tune loaded now and the crossing lines declared now.
+   * Allocates (about 68 KB for the machine, 68 KB for the loop-entry image, and the same again for
+   * every image the crossing pool can hold): call it off the tick, after `loadTune` and
+   * `setCrossingCaptures`. A state is for the load it was saved from and can be saved into again
+   * for as long as the crossing lines it was made for stay declared.
+   */
+  createSavedState(): SavedPlayerState;
+  /**
+   * Copies everything that decides the next frames into `into`: the machine and the register
+   * frame's whole output stage, the position, tempo, mutes, output settings, field holds and
+   * offsets, the running loop with its queued jump, pending change and entry images, the track
+   * structure, the crossing pool, the shadow and the hand (varispeed, handback and the gate-off
+   * owed). Not what only reports (stats, the delivery history, snapshots), what the host owns (its
+   * clock, sink, rate source's own state and the transport) or what the tune alone determines (the
+   * prepared images and the declared jump frames).
+   *
+   * Allocates nothing and costs about one machine image copy, so it is safe every frame. Call it
+   * between ticks, never from a sink or a listener a tick reaches. Ignored, with a warning, with no
+   * tune loaded, for a state this player did not make, or one made for other crossing lines.
+   */
+  saveState(into: SavedPlayerState): void;
+  /**
+   * Puts the player back exactly as it was at `saveState`: playing on gives the same frames, with
+   * the same frame numbers and due times, as a player that never left. Synchronous, allocating
+   * nothing outside a handback still waiting on its image, and calling no listener from inside:
+   * listeners are told after it, and only when something a snapshot publishes differs.
+   *
+   * It owes the stream no gate-off and queues no resync, since a rewound player sends what the
+   * undisturbed one would have. It keeps the transport, so a host rewinding while playing keeps
+   * playing; re-times the clock when the restored rate or tempo differs, and the sink only when the
+   * tempo does; resets the anchor ring to its seed; and drops a jump still being replayed.
+   *
+   * Ignored, with a warning and no change, for a state from another file, subtune or load, one made
+   * for other crossing lines, one this player did not make, one taken in varispeed while the player
+   * is not playing (nothing can start the clock from here), and any state into a `stopped` or
+   * `ended` player: it keeps the transport, and `play()` from there begins again at frame 0, not at
+   * the restored position.
+   */
+  restoreState(from: SavedPlayerState): void;
 
   // Rate
   setTempo(multiplier: number): void;

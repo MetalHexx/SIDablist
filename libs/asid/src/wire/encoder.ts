@@ -6,27 +6,54 @@ import {
   ASID_MSG_SID_TYPE,
   ASID_MSG_START,
   ASID_MSG_STOP,
+  ASID_SLOT_COUNT,
   ASID_SYSEX_END,
   ASID_SYSEX_START,
 } from './asid-constants.js';
-import { packFrame } from './slot-map.js';
+import { createPackScratch, packFrameInto } from './slot-map.js';
 
 /** Pure ASID SysEx packet builders — byte layouts only, no I/O. See `asid-constants.ts` for the
  *  transcribed protocol values these assemble and `slot-map.ts` for how a frame's writes land in
  *  the 28 slots. */
 
-/** `F0 2D 4E <present masks> <MSB masks> <values> F7`, `12 + values.length` bytes total. */
+/** The shortest SID_DATA packet: `F0 2D 4E`, the two masks, no values, `F7`. A packet is this plus one
+ *  byte per slot the frame wrote. */
+export const SID_DATA_PACKET_MIN_LENGTH = 12;
+/** The longest: every one of the 28 slots written. */
+export const SID_DATA_PACKET_MAX_LENGTH = SID_DATA_PACKET_MIN_LENGTH + ASID_SLOT_COUNT;
+
+const packScratch = createPackScratch();
+const allocatingPacketBuffer = new Uint8Array(SID_DATA_PACKET_MAX_LENGTH);
+
+/**
+ * Writes `F0 2D 4E <present masks> <MSB masks> <values> F7` into the front of `into` and returns its
+ * length, `12 + values.length`. Allocates nothing: this is the form the frame path uses. `into` must
+ * hold `SID_DATA_PACKET_MAX_LENGTH` bytes, since the length is not known until the frame is packed.
+ */
+export function writeSidDataPacket(frame: SidFrame, into: Uint8Array): number {
+  if (into.length < SID_DATA_PACKET_MAX_LENGTH) {
+    throw new RangeError(
+      `a SID data packet needs a ${SID_DATA_PACKET_MAX_LENGTH}-byte buffer, got ${into.length}`,
+    );
+  }
+  packFrameInto(frame, packScratch);
+  const length = SID_DATA_PACKET_MIN_LENGTH + packScratch.valueCount;
+  into[0] = ASID_SYSEX_START;
+  into[1] = ASID_MANUFACTURER_ID;
+  into[2] = ASID_MSG_SID_DATA;
+  into.set(packScratch.presentMask, 3);
+  into.set(packScratch.msbMask, 7);
+  for (let i = 0; i < packScratch.valueCount; i++) {
+    into[11 + i] = packScratch.values[i];
+  }
+  into[length - 1] = ASID_SYSEX_END;
+  return length;
+}
+
+/** `F0 2D 4E <present masks> <MSB masks> <values> F7`, `12 + values.length` bytes total — the
+ *  allocating form of `writeSidDataPacket`, for callers off the frame path. */
 export function buildSidDataPacket(frame: SidFrame): Uint8Array {
-  const { presentMask, msbMask, values } = packFrame(frame);
-  const packet = new Uint8Array(12 + values.length);
-  packet[0] = ASID_SYSEX_START;
-  packet[1] = ASID_MANUFACTURER_ID;
-  packet[2] = ASID_MSG_SID_DATA;
-  packet.set(presentMask, 3);
-  packet.set(msbMask, 7);
-  packet.set(values, 11);
-  packet[packet.length - 1] = ASID_SYSEX_END;
-  return packet;
+  return allocatingPacketBuffer.slice(0, writeSidDataPacket(frame, allocatingPacketBuffer));
 }
 
 export function buildStartPacket(): Uint8Array {

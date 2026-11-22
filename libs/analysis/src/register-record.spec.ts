@@ -207,7 +207,12 @@ describe('the record played under varispeed', () => {
   function rig() {
     const sink = new FakeSink();
     const clock = new FakeClock();
-    const player = createSidPlayer({ sink, clock, replayRunner: new ReplayAnswers() });
+    const player = createSidPlayer({
+      sink,
+      clock,
+      replayRunner: new ReplayAnswers(),
+      time: { now: () => milliseconds(performance.now()) },
+    });
     return { sink, clock, player };
   }
 

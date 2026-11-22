@@ -41,6 +41,8 @@ export class FakeSink implements SidSink {
   private endCallsRecorded = 0;
   private readonly retimeCallsRecorded: Microseconds[] = [];
   private resetCallsRecorded = 0;
+  private deliveriesSinceReset = 0;
+  private readonly replaceFromCallsRecorded: number[] = [];
   private consumption: FarEndConsumption = { kind: 'unknown', inFlight: 0 };
 
   constructor(capabilities: SinkCapabilities = DEFAULT_CAPABILITIES) {
@@ -59,6 +61,7 @@ export class FakeSink implements SidSink {
 
   begin(tune: { readonly chipModel: SidModel }): void {
     this.beginCallsRecorded.push(tune);
+    this.deliveriesSinceReset = 0;
   }
 
   end(): void {
@@ -71,6 +74,7 @@ export class FakeSink implements SidSink {
     dueAtMs: Milliseconds,
     catchUpClamped: boolean,
   ): void {
+    this.deliveriesSinceReset++;
     this.deliveredFramesRecorded.push({
       frame: copyFrame(frame),
       frameNumber,
@@ -89,6 +93,18 @@ export class FakeSink implements SidSink {
 
   reset(): void {
     this.resetCallsRecorded++;
+    this.deliveriesSinceReset = 0;
+  }
+
+  /** Holds nothing, so every frame it was handed has passed. */
+  passedCount(): number {
+    return this.deliveriesSinceReset;
+  }
+
+  /** Holds nothing, so there is nothing to drop: records the call and answers the delivery count. */
+  replaceFrom(fromCount: number): number {
+    this.replaceFromCallsRecorded.push(fromCount);
+    return this.deliveriesSinceReset;
   }
 
   readAt(): FarEndConsumption {
@@ -119,6 +135,10 @@ export class FakeSink implements SidSink {
 
   get retimeCalls(): readonly Microseconds[] {
     return this.retimeCallsRecorded;
+  }
+
+  get replaceFromCalls(): readonly number[] {
+    return this.replaceFromCallsRecorded;
   }
 
   get resetCallCount(): number {
