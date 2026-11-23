@@ -152,18 +152,20 @@ export class DeckLoops {
 
   /**
    * Stops everything looping and plays straight on: with slip on, the deck lands on the outermost
-   * departure's line first, unless that is the hand's.
+   * departure's line first, unless that is the hand's. It lands before the live loop is dropped,
+   * which ends the live loop's own departure with no landing.
    */
   stopLoop(): void {
-    this.dropLive();
     this.slip.landOutermost();
+    this.dropLive();
     this.letGo();
   }
 
   /**
    * The DJ lets go of the running loop: with slip on and the loop a departure, the deck lands on
    * the count slip kept first, then the loop is released as `drop` does. Returns whether a loop
-   * was running.
+   * was running. A live loop is dropped with no landing: only `live-loop-end` and `stop-loop` land
+   * one.
    */
   letGo(): boolean {
     this.slip.land('loop');
@@ -341,9 +343,10 @@ export class DeckLoops {
     this.slip.loopLanded();
   }
 
-  /** Names the queued target to the engine again, which `setActiveLoop` dropped. */
-  reassertQueue(): void {
-    this.requeue();
+  /** The engine drops the queue whenever the loop is set again, so a caller that does so names it again. */
+  requeue(): void {
+    const queued = this.state.queued;
+    if (queued !== null) this.player.queueJump(queuedOf(queued, this.state.queuedSettings));
   }
 
   /**
@@ -472,12 +475,6 @@ export class DeckLoops {
     this.player.queueJump(null);
     this.state.queued = null;
     this.state.queuedSettings = null;
-  }
-
-  /** The engine drops the queue whenever the loop is set again, so a caller that does so names it again. */
-  private requeue(): void {
-    const queued = this.state.queued;
-    if (queued !== null) this.player.queueJump(queuedOf(queued, this.state.queuedSettings));
   }
 
   private seek(target: JumpTarget, settings: JumpSettings | null): void {

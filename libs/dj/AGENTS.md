@@ -23,8 +23,8 @@ supplies everything environmental.
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
   the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
   on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
-  (`DeckLiveLoop`: the grid's crossing lines, the live loop's start, resizing, end back into the loop
-  underneath and adoption; `loops.ts` ends it when a loop lands over it).
+  (`DeckLiveLoop`: the grid's crossing lines, the live loop's start, resizing and end back into the
+  loop underneath; `loops.ts` adopts it as the running loop and ends it when a loop lands over it).
 - `src/heavy-work/inline.ts` — `createInlineHeavyWork`, replay and scan on the calling thread, for Node,
   tests and the bench.
 - `src/index.ts` — the main path's public surface. Browser-only files live under `src/browser/` and

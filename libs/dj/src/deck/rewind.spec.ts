@@ -860,6 +860,33 @@ describe('a deck rewound with a live loop', () => {
   });
 });
 
+describe('a deck rewound with a live loop that is slip’s only departure', () => {
+  it('lands on slip’s count when the loop is stopped, through rewinds', async () => {
+    const { difference, rewound } = await compareRewound({
+      load: { grid: LIVE_GRID },
+      prepare: LIVE_TARGETS,
+      presses: [
+        press(100, slipOn(true)),
+        press(300, liveStart),
+        ...rewindsEvery(310, 440, 17),
+        press(460, (deck) => ({ kind: 'stop-loop', deck })),
+        ...rewindsEvery(470, 640, 19),
+      ],
+      runMs: 700,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({
+      loop: null,
+      liveLoop: null,
+      slip: { departed: false },
+    });
+    const pictures = rewound.ofKind('picture');
+    expect(pictures.some((picture) => picture.liveLoop?.overLoop === false)).toBe(true);
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
 describe('a deck rewound by live loop presses at random moments', () => {
   for (let seed = 1; seed <= 12; seed++) {
     it(`gives what a straight deck gives (seed ${seed})`, async () => {

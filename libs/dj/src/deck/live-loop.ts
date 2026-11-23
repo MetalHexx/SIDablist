@@ -167,7 +167,7 @@ export class DeckLiveLoop {
     const phase = phaseCell(lapPhaseAt(grid, period, start));
     player.setActiveLoop(loopOf(start, start + length, phase));
     state.startLive(start, start + length, phase);
-    this.loops.reassertQueue();
+    this.loops.requeue();
   }
 
   /**
@@ -200,11 +200,6 @@ export class DeckLiveLoop {
     }
     this.foldIn(entry, underneath);
     return false;
-  }
-
-  /** The live loop becomes the running loop, with nothing to return to. */
-  adopt(): void {
-    this.loops.adoptLive();
   }
 
   /**
@@ -279,7 +274,7 @@ export class DeckLiveLoop {
     const cell = phaseCell(phase);
     this.player.setActiveLoop(loopOf(start, end, cell));
     this.state.setLiveBounds(end, cell);
-    this.loops.reassertQueue();
+    this.loops.requeue();
   }
 
   /**

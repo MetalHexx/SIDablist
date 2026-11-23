@@ -783,7 +783,7 @@ export class Deck {
         endedLoop = this.live.end(entry);
         break;
       case 'live-loop-adopt':
-        this.live.adopt();
+        this.loops.adoptLive();
         break;
       default:
         // The rest never get here.

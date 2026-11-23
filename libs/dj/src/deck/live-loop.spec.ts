@@ -583,6 +583,42 @@ describe('dropping a live loop', () => {
     });
   }
 
+  it('lands on slip’s count on stop-loop when the live loop is its only departure, as the end does', async () => {
+    for (const command of ['stop-loop', 'live-loop-end'] as const) {
+      const rig = new Rig();
+      for (const id of ['a', 'c']) {
+        rig.addDeck(id, { lookaheadMs: 60 });
+        await rig.load(id, 'still-time', {
+          ends: 'playing',
+          ...(id === 'a' ? { grid: GRID } : {}),
+        });
+      }
+      await rig.settle();
+      rig.send({ kind: 'slip', deck: 'a', on: true });
+      rig.advance(300);
+      rig.send({ kind: 'live-loop-size', deck: 'a', lengthFrames: 20 });
+      rig.send({ kind: 'live-loop', deck: 'a' });
+      await rig.microtasks();
+      rig.advance(600);
+      expect(rig.picture('a')).toMatchObject({
+        liveLoop: { overLoop: false },
+        slip: { departed: true },
+      });
+
+      rig.send({ kind: command, deck: 'a' });
+      await rig.microtasks();
+      rig.advance(300);
+      const landed = rig.landed(command)[0].frame;
+      const mine = playheads(rig, 'a');
+      const theirs = playheads(rig, 'c');
+      for (let frame = landed + 1; frame < landed + 16; frame++) {
+        expect(mine.get(frame)).toBe(theirs.get(frame));
+      }
+      expect(rig.picture('a').slip.departed).toBe(false);
+      rig.dispose();
+    }
+  });
+
   it('drops with the load that has no grid', async () => {
     const { rig, deck, seen } = await playing();
     await push({ rig, deck, seen }, 20);
