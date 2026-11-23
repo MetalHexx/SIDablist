@@ -6,10 +6,28 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.js"
+    },
+    "./browser/wake.worker": {
+      "types": "./dist/browser/wake.worker.d.ts",
+      "import": "./dist/browser/wake.worker.js"
     }
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "browser": [
+        "./dist/browser/index.d.ts"
+      ],
+      "browser/wake.worker": [
+        "./dist/browser/wake.worker.d.ts"
+      ]
+    }
+  },
   "files": [
     "dist"
   ],

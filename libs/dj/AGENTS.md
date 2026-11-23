@@ -29,6 +29,7 @@ supplies everything environmental.
   tests and the bench.
 - `src/index.ts` — the main path's public surface. Browser-only files live under `src/browser/` and
   reach the host through their own subpath, never through this one.
+- `src/browser/` — the only code that touches a browser, exported through `@sidablist/dj/browser` (and `./browser/wake.worker`) and never from the root: `time.ts` (`createBrowserTime`), `wake.ts` and `wake.worker.ts` (`createBrowserWake`, a worker-timer or silent-audio wake with `readings` for late wakes), `heavy-work.ts` (`createBrowserHeavyWork`: core’s worker replay runners and a worker-backed scanner over workers the app builds) and `carry.ts` (`serveDj` on the package’s side, `connectDj` on the host’s, over any `PortLike`: a `MessagePort`, a `Worker` or a worker’s global).
 - `src/testing/` — helpers for specs, never exported; typechecked with the DOM, excluded from the
   main-path check. `harness.ts` (fake time, a manual wake, a `Rig` over `createDj`), `holding-sink.ts`
   (a sink that holds frames until its time passes them), `compare.ts` (a straight deck against a
@@ -41,6 +42,9 @@ supplies everything environmental.
 - Messages are plain data: no classes, functions, `Map`, `Set`, `Date` or `undefined`-only meaning, so
   they survive structured clone and `postMessage`. Frames in a command are tune frames unless the field
   says stream frame.
+- Browser globals are allowed only under `src/browser/` (lint ignores it). Nothing outside it imports from it, and the root index never re-exports it. The adapter never requests MIDI access: the permission and the output picker are the application’s.
+- A module worker gets no import map: a worker script that imports a bare `@sidablist/*` specifier needs the app’s bundler, so the app builds core’s `replay.worker` and analysis’s `scan.worker` and passes factories. `wake.worker.ts` imports nothing so it loads as it is, and declares a local shape for `self` because `DedicatedWorkerGlobalScope` is not in the DOM lib.
+- The carry’s wire is plain data (`inbound`, `report`, `fetch-tune`, `tune-bytes`, `tune-failed`); a message added to it joins both `serveDj` and `connectDj`. `connectDj` transfers the bytes `fetchTune` returns, which detaches them on the host.
 - The main path takes the clock, the log, workers and the wake-up through plugs. It reads no clock,
   writes no console and builds no worker.
 - Nothing here names an application, a screen or a product; vocabulary is the DJ's.
@@ -175,7 +179,7 @@ supplies everything environmental.
   that kind, the sample in `testing/samples.ts` and the browser adapter all read the same shape; a
   field one of them misses compiles in the adapter and then fails at the boundary or drops silently
   across `postMessage`. Update `messages/validate.ts`, run `messages/validate.spec.ts` and
-  `messages/round-trip.spec.ts`, and update the adapter once it exists. Detail:
+  `messages/round-trip.spec.ts`, and update the adapter (`src/browser/carry.ts`). Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
   `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
