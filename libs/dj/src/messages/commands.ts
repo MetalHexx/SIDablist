@@ -127,7 +127,10 @@ export type DeckCommand = CommandBase &
     | { readonly kind: 'repeat'; readonly on: boolean }
     /** Sets one numbered setting on the deck's main settings. */
     | { readonly kind: 'setting'; readonly setting: number; readonly value: number }
-    /** Names the tune frames the deck keeps ready so a jump to one lands without delay. */
+    /**
+     * Names the tune frames the deck keeps ready so a jump to one lands without delay. At most 256
+     * frames: a longer list is refused at the door.
+     */
     | { readonly kind: 'targets'; readonly frames: readonly number[] }
     /** Jumps to a loop or cue, in tune frames, when the command lands. */
     | { readonly kind: 'jump'; readonly target: JumpTarget }

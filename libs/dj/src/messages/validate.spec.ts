@@ -89,6 +89,12 @@ describe('validateInbound', () => {
     ['a negative target frame', variant('targets', { frames: [0, -1] }), 'targets', 'frames[1]'],
     ['targets that are not a list', variant('targets', { frames: 5 }), 'targets', 'frames'],
     [
+      'more than 256 targets',
+      variant('targets', { frames: Array.from({ length: 257 }, (_, i) => i) }),
+      'targets',
+      'frames',
+    ],
+    [
       'a jump target starting below zero',
       variant('jump', { target: { startFrame: -1, endFrame: null } }),
       'jump',
@@ -201,6 +207,11 @@ describe('validateInbound', () => {
     const reason = reasonFor(message);
     expect(reason).toContain(kind);
     expect(reason).toContain(field);
+  });
+
+  it('accepts exactly 256 targets', () => {
+    const frames = Array.from({ length: 256 }, (_, i) => i);
+    expect(validateInbound(variant('targets', { frames })).ok).toBe(true);
   });
 
   it('words the jump target refusal as the contract shows', () => {

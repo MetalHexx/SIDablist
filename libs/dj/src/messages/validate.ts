@@ -77,6 +77,9 @@ function record(kind: string, field: string, v: unknown, allowed: readonly strin
 
 const SETTING_NUMBERS: readonly number[] = Object.values(SETTING);
 
+/** The most frames one `targets` command may declare: double the 128 markers a tune is given. */
+const MAX_TARGET_FRAMES = 256;
+
 function settingNumber(kind: string, field: string, v: unknown): number {
   oneOf(kind, field, v, SETTING_NUMBERS);
   return v as number;
@@ -206,6 +209,9 @@ const COMMANDS = {
     fields: ['frames'],
     check(o, kind) {
       if (!Array.isArray(o.frames)) fail(kind, 'frames', 'must be an array');
+      if (o.frames.length > MAX_TARGET_FRAMES) {
+        fail(kind, 'frames', `must hold at most ${MAX_TARGET_FRAMES} entries`);
+      }
       o.frames.forEach((f: unknown, i) => atLeast(kind, `frames[${i}]`, f, 0));
     },
   },
