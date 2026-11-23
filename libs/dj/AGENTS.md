@@ -33,7 +33,9 @@ supplies everything environmental.
 - `src/testing/` — helpers for specs, never exported; typechecked with the DOM, excluded from the
   main-path check. `harness.ts` (fake time, a manual wake, a `Rig` over `createDj`), `holding-sink.ts`
   (a sink that holds frames until its time passes them), `compare.ts` (a straight deck against a
-  rewound one), `measure-allocation.ts` (a copy of core's, which core does not export).
+  rewound one; it cannot express a `play` after a `pause` or `stop`, or a seek to a frame with no
+  prepared image, because the straight deck is sent every command up front and only advanced:
+  `deck/deck.spec.ts` exercises them, though not frame for frame), `measure-allocation.ts` (a copy of core's, which core does not export).
   `src/__fixtures__/` holds the tunes cleared for redistribution (`still-time`, `insid3-out`); no
   other HVSC tune goes in the repo.
 - `src/proof/` — specs only, across the whole package: `equivalence.spec.ts` (a deck against a bare
@@ -126,13 +128,20 @@ supplies everything environmental.
   list drops such frames with a warning (`Deck.receive`). The engine clamps nothing there and replays
   from the start of the tune at a cost linear in the frame, which with the inline heavy work blocks
   the caller and with workers holds the deck (`settling`) until the replay ends. `validateInbound`
-  is stateless and knows no tune, so the bound cannot live there.
-- **The command log holds 256 entries, and a flood loses what is not sweepable.** An entry goes
+  is stateless and knows no tune, so the bound cannot live there. The bound is the greatest of the
+  engine's jump ceiling (a fixed 300 s of play calls, `JUMP_CEILING_SECONDS` in
+  `libs/core/src/player/tune-session.ts`), the position basis (the indexed length when the tune has
+  one, else that same ceiling) and the tune's own length; so a tune loaded with no indexed length
+  refuses a cue, seek or loop start past about 300 s with a logged reason, and a host that wants
+  cues further out indexes the tune first.
+- **The command log holds 256 entries, and a flood past it refuses commands.** An entry goes
   once the sink has passed its frame, so a sustained control stream never reaches the cap; a burst of
   more than 256 in one turn, or automation laid out ahead, does. At the cap a `speed`, `nudge`,
-  `speed-jump`, `loop-wraps` or `setting` (same setting number) landing on the same frame as the
-  newest entry, not yet flushed, replaces it so the latest value survives; any other command is
-  refused with a warning to the log plug, which a host with no `log` plug never sees.
+  `speed-jump`, `loop-wraps` or `setting` folds only into the newest entry, when it is of the same
+  kind (and, for `setting`, the same setting number), not yet flushed, and on the same frame: the
+  latest value replaces it and survives. Sweepable commands interleaved past the cap (`speed` and
+  `nudge` alternating, say) are refused like any other command, with a warning to the log plug, which
+  a host with no `log` plug never sees. A command folded away never gets its own `landed` report.
 - **Seeks never replay off-thread while playing.** A seek to a frame the engine holds no image for is
   declared and waited for, because a replay's landing time would depend on the worker and break
   determinism.

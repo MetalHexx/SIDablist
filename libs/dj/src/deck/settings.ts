@@ -44,7 +44,7 @@ export function mutesAsSettings(mutes: Int32Array): NumberedSetting[] {
  * settings do not name sounds, as in a load's.
  */
 export function mutesOfSettings(settings: readonly NumberedSetting[]): boolean[] {
-  const muted = [false, false, false];
+  const muted = new Array<boolean>(VOICE_COUNT).fill(false);
   for (const { setting, value } of settings) {
     if (isMainSetting(setting)) muted[voiceOf(setting)] = value === 1;
   }
@@ -53,5 +53,5 @@ export function mutesOfSettings(settings: readonly NumberedSetting[]): boolean[]
 
 /** `mutes` (one 0 or 1 a voice) as one boolean a voice. */
 export function mutesAsBooleans(mutes: Int32Array): boolean[] {
-  return [mutes[0] === 1, mutes[1] === 1, mutes[2] === 1];
+  return Array.from(mutes.subarray(0, VOICE_COUNT), (m) => m === 1);
 }

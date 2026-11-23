@@ -52,7 +52,7 @@ export async function measureAllocation(
   if (typeof gc !== 'function') {
     throw new Error(
       'measureAllocation needs globalThis.gc: start the process with --expose-gc ' +
-        '(libs/core/vitest.config.ts sets it for the test workers).',
+        '(libs/dj/vitest.config.ts sets it for the test workers).',
     );
   }
 
