@@ -76,6 +76,10 @@ DOM type.
   rather than a workaround local to this one. Add or extend a case there and re-run
   `sink/conformance.spec.ts` here to confirm it now passes. Detail:
   [`libs/core/AGENTS.md`](../core/AGENTS.md).
+- **Changed the sink's `passedCount`, `replaceFrom`, `deliver` or `reset` (`sink/asid-sink.ts`)?**
+  `libs/dj` rewinds a deck on those counts and runs one spec against this sink, so a deck can redo
+  or lose frames on the wire with no compile error. Run `pnpm --filter @sidablist/dj test`, which
+  includes `src/proof/asid-sink.spec.ts`. Detail: [`libs/dj/AGENTS.md`](../dj/AGENTS.md).
 
 ## Commands
 
