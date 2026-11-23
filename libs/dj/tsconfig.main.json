@@ -1,12 +1,13 @@
 {
   // The main path's guard: the same sources typechecked with no DOM lib, and without the
-  // browser adapter, the testing helpers and the specs. A main-path file that names `setTimeout`,
-  // `MessagePort`, `Worker`, `performance` or `window`, or imports from `browser/`, fails here.
+  // browser adapter, the testing helpers, the spec fixtures and the specs. A main-path file that
+  // names `setTimeout`, `MessagePort`, `Worker`, `performance` or `window`, or imports from
+  // `browser/`, fails here.
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "lib": ["ES2022"],
     "noEmit": true
   },
   "include": ["src"],
-  "exclude": ["src/browser/**", "src/testing/**", "src/**/*.spec.ts"]
+  "exclude": ["src/browser/**", "src/testing/**", "src/__fixtures__/**", "src/**/*.spec.ts"]
 }

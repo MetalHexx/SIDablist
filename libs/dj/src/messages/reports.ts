@@ -171,7 +171,11 @@ export interface DeckRegisters {
   readonly sent: Uint8Array;
 }
 
-/** Every delivery since the last drain, in core's `DeliveryBatch` shape (plain typed arrays). */
+/**
+ * Every delivery since the last drain, in core's `DeliveryBatch` shape (plain typed arrays). It is
+ * the engine's own history of what it delivered, not of what the sink passed: a rewind leaves it
+ * alone, so a drained batch can hold a frame a rewind replaced and then its replacement.
+ */
 export interface DeckDeliveries {
   readonly kind: 'deliveries';
   readonly deck: DeckId;
