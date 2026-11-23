@@ -33,7 +33,13 @@ export const HAND_RATE = 12;
 export const SLIP_CELLS_AT = 13;
 export const SLIP_DEPARTURES = 2;
 export const SLIP_CELL_STRIDE = 5;
-const CELL_COUNT = SLIP_CELLS_AT + SLIP_DEPARTURES * SLIP_CELL_STRIDE;
+/** The live loop's doubles; each holds `NaN` while it has nothing to say. */
+const LIVE_START = SLIP_CELLS_AT + SLIP_DEPARTURES * SLIP_CELL_STRIDE;
+const LIVE_END = LIVE_START + 1;
+const LIVE_LAP_PHASE = LIVE_END + 1;
+const LIVE_PENDING_END = LIVE_LAP_PHASE + 1;
+const LIVE_SIZE = LIVE_PENDING_END + 1;
+const CELL_COUNT = LIVE_SIZE + 1;
 
 /** Slots in `DeckState.ints`. */
 const STREAM = 0;
@@ -52,7 +58,10 @@ const SLIP_ON = HAND_THROW_STARTED + 1;
 /** Where the slip departures' ints begin: `SLIP_DEPARTURES` runs of `SLIP_INT_STRIDE`. */
 export const SLIP_INTS_AT = SLIP_ON + 1;
 export const SLIP_INT_STRIDE = 4;
-const INT_COUNT = SLIP_INTS_AT + SLIP_DEPARTURES * SLIP_INT_STRIDE;
+const LIVE_ON = SLIP_INTS_AT + SLIP_DEPARTURES * SLIP_INT_STRIDE;
+const INT_COUNT = LIVE_ON + 1;
+
+type RunningLoop = Exclude<ActiveLoop, null>;
 
 /** The hand's states, as `DeckState.handState` holds them. */
 export const HAND_UP = 0;
@@ -77,7 +86,8 @@ export interface DeckStateImage {
   queuedSettings: JumpSettings | null;
   waiting: JumpTarget | null;
   waitingSettings: JumpSettings | null;
-  pending: Exclude<ActiveLoop, null> | null;
+  pending: RunningLoop | null;
+  underneath: RunningLoop | null;
 }
 
 /**
@@ -99,6 +109,8 @@ export interface DeckStateImage {
  * - the hand: its state, anchor, the position it expects, travel, samples with their count and head,
  *   release speed, grip, rate and whether the throw has started. The rate source runs inside the
  *   tick and changes these, so a rewind replays it from the numbers the slot holds;
+ * - the live loop: whether it runs, its bounds, lap phase and any shrink waiting, the loop
+ *   underneath (by reference) and the size the next one starts at;
  * - slip: whether it is on, and the departure running and the one outside it, each held as numbers
  *   (kind, queued, the lap it returns into, the count it left) so a save copies and builds nothing;
  * - whether the slot was saved in varispeed, which decides whether a restore into a paused engine
@@ -126,10 +138,19 @@ export class DeckState implements Saveable<DeckStateImage> {
   waiting: JumpTarget | null = null;
   waitingSettings: JumpSettings | null = null;
   /** The loop the engine was told to run from the end of the lap in progress, until it does. */
-  pending: Exclude<ActiveLoop, null> | null = null;
+  pending: RunningLoop | null = null;
+  /**
+   * The loop that ran when the live loop started. It, the queued target and the pending change
+   * (the fields above) are kept as they were and reach the engine only when the live loop ends
+   * back into it. It also stays across the wait for a fold-in landing, once the live loop is over.
+   */
+  underneath: RunningLoop | null = null;
 
   constructor() {
     this.cells[SPEED] = 1;
+    this.cells[LIVE_LAP_PHASE] = Number.NaN;
+    this.cells[LIVE_PENDING_END] = Number.NaN;
+    this.cells[LIVE_SIZE] = Number.NaN;
     this.ints[WAITING_FRAME] = NOT_WAITING;
     this.ints[WAITING_SEQ] = NOT_WAITING;
   }
@@ -251,6 +272,57 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.ints[SLIP_ON] = on ? 1 : 0;
   }
 
+  /** Whether a live loop is running. */
+  get liveOn(): boolean {
+    return this.ints[LIVE_ON] === 1;
+  }
+  get liveStart(): number {
+    return this.cells[LIVE_START];
+  }
+  get liveEnd(): number {
+    return this.cells[LIVE_END];
+  }
+  /** The live loop's lap phase as it was set, `NaN` for none. */
+  get liveLapPhase(): number {
+    return this.cells[LIVE_LAP_PHASE];
+  }
+  /** Where the shrink the engine was told to make ends the live loop, `NaN` for none. */
+  get livePendingEnd(): number {
+    return this.cells[LIVE_PENDING_END];
+  }
+  set livePendingEnd(frame: number) {
+    this.cells[LIVE_PENDING_END] = frame;
+  }
+  /** The size the next live loop starts at, `NaN` while unset. */
+  get liveSize(): number {
+    return this.cells[LIVE_SIZE];
+  }
+  set liveSize(lengthFrames: number) {
+    this.cells[LIVE_SIZE] = lengthFrames;
+  }
+  /** Starts a live loop's record: its bounds and lap phase (`NaN` for none), no shrink pending. */
+  startLive(start: number, end: number, lapPhase: number): void {
+    this.ints[LIVE_ON] = 1;
+    this.cells[LIVE_START] = start;
+    this.setLiveBounds(end, lapPhase);
+  }
+  /** Gives the live loop its end and lap phase, and drops a shrink waiting. */
+  setLiveBounds(end: number, lapPhase: number): void {
+    this.cells[LIVE_END] = end;
+    this.cells[LIVE_LAP_PHASE] = lapPhase;
+    this.cells[LIVE_PENDING_END] = Number.NaN;
+  }
+  /** Ends the live loop's record, keeping the loop underneath for the caller to put back. */
+  endLive(): void {
+    this.ints[LIVE_ON] = 0;
+    this.cells[LIVE_PENDING_END] = Number.NaN;
+  }
+  /** Ends the live loop's record, and with it the loop underneath. The kept size stays. */
+  clearLive(): void {
+    this.endLive();
+    this.underneath = null;
+  }
+
   get lastHandOffs(): number {
     return this.ints[LAST_HAND_OFFS];
   }
@@ -271,6 +343,7 @@ export class DeckState implements Saveable<DeckStateImage> {
       waiting: null,
       waitingSettings: null,
       pending: null,
+      underneath: null,
     };
   }
 
@@ -286,6 +359,7 @@ export class DeckState implements Saveable<DeckStateImage> {
     target.waiting = this.waiting;
     target.waitingSettings = this.waitingSettings;
     target.pending = this.pending;
+    target.underneath = this.underneath;
   }
 
   restoreFrom(source: DeckStateImage): void {
@@ -300,5 +374,6 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.waiting = source.waiting;
     this.waitingSettings = source.waitingSettings;
     this.pending = source.pending;
+    this.underneath = source.underneath;
   }
 }

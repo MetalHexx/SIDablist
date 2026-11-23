@@ -37,19 +37,15 @@ describe('the desk', () => {
     rig.dispose();
   });
 
-  it('refuses a command it cannot carry out yet, and changes nothing', async () => {
+  it('refuses a live loop on a deck with no grid, and changes nothing', async () => {
     const rig = new Rig();
     rig.addDeck('a');
     await rig.load('a', 'still-time', { ends: 'paused' });
 
     rig.send({ kind: 'live-loop', deck: 'a' });
-    rig.send({ kind: 'live-loop-size', deck: 'a', lengthFrames: 16 });
     await rig.microtasks();
 
-    expect(rig.warnings).toEqual([
-      'dj: refused live-loop: live-loop is not available yet',
-      'dj: refused live-loop-size: live-loop-size is not available yet',
-    ]);
+    expect(rig.warnings).toEqual(['dj: refused live-loop: live-loop on a deck with no grid']);
     expect(rig.landed().map((event) => event.command.kind)).toEqual(['load']);
     rig.dispose();
   });

@@ -21,8 +21,10 @@ supplies everything environmental.
   `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
   jumps, the four-way key press, letting go, edits to the running loop and the loop's own settings),
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
-  the deck's own speed) and `slip.ts` (`DeckSlip`: the departures, the second count and the landing
-  on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends).
+  the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
+  on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
+  (`DeckLiveLoop`: the grid's crossing lines, the live loop's start, resizing, end back into the loop
+  underneath and adoption; `loops.ts` ends it when a loop lands over it).
 - `src/heavy-work/inline.ts` — `createInlineHeavyWork`, replay and scan on the calling thread, for Node,
   tests and the bench.
 - `src/index.ts` — the main path's public surface. Browser-only files live under `src/browser/` and
@@ -119,6 +121,22 @@ supplies everything environmental.
 - **Ring memory grows with lookahead, tempo and crossing lines.** About 136 KB a slot, one per frame
   the deck can hold at the fastest tempo, plus one; a ring is made off the frame path and rebuilt, not
   grown.
+- **Crossing lines rebuild the ring.** The grid and the kept live-loop size decide which lines the
+  engine saves images at (`setCrossingCaptures`), and a restore point is only good for the lines it
+  was saved under, so declaring new ones makes the restore ring again, between ticks and after the
+  command's own engine calls (the ring is seeded with the state the command leaves). Lines already
+  declared change nothing.
+- **A live loop's start is found one frame past the playhead.** A wrap falls due a frame before the
+  end, so a line at the playhead's own frame could never be met by a loop ending there; the search
+  is for the last line at or behind `floor(position) + 1`. A start behind the playhead with no image
+  held and no register record moves to the next line.
+- **The loop underneath is put back before slip lands, or its count starts again.** A landing
+  gives the loop running at it the lap its count is in, and a loop set after it starts from its own
+  lap 0. Under a live loop the loop underneath, its queued target and its pending change stay in
+  `DeckState` and reach the engine only on return; an edit to it waits. Folding into it with no
+  register record to land on plays on with no loop, never replays off-thread, and sets the loop
+  again as the folded frame's seek lands, so the deck's own `seek` command (whose hooks would clear
+  the loop underneath) is never used for it.
 - **The hand's rate source runs inside the engine's tick.** `VarispeedRateSource` is called by the
   tick before it moves the record, so it may read the hand's numbers in `DeckState` and the engine's
   snapshot and nothing else: no allocation, no engine command. The throw reaching the deck's speed
@@ -160,7 +178,7 @@ supplies everything environmental.
   `messages/round-trip.spec.ts`, and update the adapter once it exists. Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
-  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`)?** The rewind must still give exactly the frames a
+  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)

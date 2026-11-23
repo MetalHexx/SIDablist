@@ -76,6 +76,10 @@ function canRun(target: JumpTarget): boolean {
  * queued and what it carries, the change named, whose settings are in play) in `DeckState`, so a
  * rewind puts it back with the engine. It tells slip where a loop begins, lands and ends.
  *
+ * A live loop counts as a loop running: a key queues behind it and a jump lands at its end of pass,
+ * ending it. The loop under a live loop is kept in `DeckState` with its queue and pending change,
+ * and an edit to it waits.
+ *
  * Every engine call here is made between ticks and from a command that lands through the log. A
  * landing the engine makes inside a tick is learnt afterwards, from the hand-offs it counts.
  */
@@ -151,6 +155,7 @@ export class DeckLoops {
    * departure's line first, unless that is the hand's.
    */
   stopLoop(): void {
+    this.dropLive();
     this.slip.landOutermost();
     this.letGo();
   }
@@ -174,6 +179,7 @@ export class DeckLoops {
   drop(): boolean {
     const player = this.player;
     const state = this.state;
+    this.dropLive();
     const looping = player.getSnapshot().loop !== null;
     if (looping || state.queued !== null) {
       player.setActiveLoop(null);
@@ -188,10 +194,15 @@ export class DeckLoops {
 
   /**
    * Gives the running loop new bounds from the end of the lap in progress. No end lets it go at
-   * once; the bounds already playing cancel a change still pending. Returns whether it ended the loop.
+   * once; the bounds already playing cancel a change still pending. Under a live loop the edit is the
+   * loop underneath's and waits for it. Returns whether it ended the loop.
    */
   loopBounds(entry: LogEntry, command: LoopBoundsCommand): boolean {
     const end = command.endFrame;
+    if (this.state.liveOn) {
+      this.editUnderneath(command);
+      return false;
+    }
     if (end === null) return this.letGo();
     const player = this.player;
     const state = this.state;
@@ -233,9 +244,13 @@ export class DeckLoops {
    * keeps the lap in progress and drops the queue and the change, so both are named again.
    */
   loopWraps(wraps: boolean): void {
+    const varispeedStart = wraps ? 'wrap' : 'stop';
+    if (this.state.liveOn) {
+      this.rewrapUnderneath(varispeedStart);
+      return;
+    }
     const loop = this.player.getSnapshot().loop;
     if (loop === null) return;
-    const varispeedStart = wraps ? 'wrap' : 'stop';
     if ((loop.varispeedStart ?? 'stop') === varispeedStart) return;
     const pending = this.state.pending;
     this.player.setActiveLoop({ ...loop, varispeedStart });
@@ -272,6 +287,8 @@ export class DeckLoops {
     }
     const looping = this.player.getSnapshot().loop !== null;
     const isLoop = target.endFrame !== null;
+    // The jump replaces the live loop and the loop underneath; slip's count goes on as the loop's.
+    this.state.clearLive();
     if (isLoop) this.slip.begin('loop');
     this.player.setActiveLoop(loopOf(target));
     this.state.queued = null;
@@ -294,12 +311,78 @@ export class DeckLoops {
     const target = state.queued;
     if (target === null) return;
     const settings = state.queuedSettings;
+    state.clearLive();
     state.queued = null;
     state.queuedSettings = null;
     this.swapIn(target, settings);
     if (target.endFrame === null) this.slip.cueLanded();
     else this.slip.loopLanded();
     this.host.jumpLanded(frame, target);
+  }
+
+  /**
+   * Ends the live loop's record and the loop underneath with it, and slip's live-loop departure with
+   * no landing. The engine's loop is the caller's: `drop` clears it. Nothing with no live loop.
+   */
+  dropLive(): void {
+    const state = this.state;
+    const live = state.liveOn;
+    state.clearLive();
+    if (live) this.slip.release('live-loop');
+  }
+
+  /**
+   * The running live loop becomes the running loop with no return: nothing underneath is put back,
+   * the engine and the sound are untouched, and slip's count carries on as the loop's.
+   */
+  adoptLive(): void {
+    if (!this.state.liveOn) return;
+    this.state.clearLive();
+    this.slip.loopLanded();
+  }
+
+  /** Names the queued target to the engine again, which `setActiveLoop` dropped. */
+  reassertQueue(): void {
+    this.requeue();
+  }
+
+  /**
+   * Puts the loop underneath back in the engine as it was, the live loop's engine loop replaced:
+   * its queued target named again and its pending bounds from the end of the lap in progress. It
+   * starts again from its own lap 0. Whether the engine took the change is the entry's first
+   * answer; with no entry it is asked. The record of the loop underneath stays for the caller to
+   * clear.
+   */
+  resumeUnderneath(entry: LogEntry | null): void {
+    const state = this.state;
+    const loop = state.underneath;
+    if (loop === null) return;
+    this.player.setActiveLoop(loop);
+    this.requeue();
+    const pending = state.pending;
+    if (pending === null) return;
+    if (entry !== null && entry.ready === ANSWER_NO) {
+      state.pending = null;
+      return;
+    }
+    const named = this.player.changeLoopAt(loop.endFrame, pending);
+    if (entry !== null && entry.ready === ANSWER_UNASKED) {
+      entry.ready = named ? ANSWER_YES : ANSWER_NO;
+    }
+    if (!named) {
+      state.pending = null;
+      this.host.warn('lost the loop change it had named: the engine took it no more');
+    }
+  }
+
+  /** With no loop left to wrap at, the target queued behind it is jumped to now. */
+  engageQueued(entry: LogEntry): void {
+    const state = this.state;
+    const queued = state.queued;
+    if (queued === null) return;
+    state.queued = null;
+    state.queuedSettings = null;
+    this.start(entry, queued);
   }
 
   /** The loop change the engine was holding has landed: the bounds it named are the bounds playing. */
@@ -320,6 +403,7 @@ export class DeckLoops {
     const loop = this.player.getSnapshot().loop;
     const settings = this.carriedBy(target);
     if (loop !== null && target.endFrame !== null && sameBounds(loop, target)) {
+      this.adoptLive();
       this.slip.begin('loop');
       this.swapIn(target, settings);
       this.seek(target, settings);
@@ -333,6 +417,42 @@ export class DeckLoops {
     if (target.endFrame !== null) this.slip.begin('loop', true);
     this.host.wait(tuneFrameOf(target.startFrame), entry.seq, target, settings);
     return false;
+  }
+
+  /** An edit to the loop underneath a live loop: held as pending, or the loop itself let go. */
+  private editUnderneath(command: LoopBoundsCommand): void {
+    const state = this.state;
+    const loop = state.underneath;
+    if (loop === null) return;
+    const end = command.endFrame;
+    if (end === null) {
+      state.underneath = null;
+      state.pending = null;
+      return;
+    }
+    if (
+      loop.startFrame === command.startFrame &&
+      loop.endFrame === end &&
+      loop.lapPhase === command.lapPhase
+    ) {
+      state.pending = null;
+      return;
+    }
+    state.pending = {
+      startFrame: frames(command.startFrame),
+      endFrame: frames(end),
+      ...(loop.varispeedStart === undefined ? {} : { varispeedStart: loop.varispeedStart }),
+      ...(command.lapPhase === undefined ? {} : { lapPhase: command.lapPhase }),
+    };
+  }
+
+  /** Whether the loop underneath a live loop wraps a thrown record; its pending change follows. */
+  private rewrapUnderneath(varispeedStart: 'wrap' | 'stop'): void {
+    const state = this.state;
+    const loop = state.underneath;
+    if (loop === null || (loop.varispeedStart ?? 'stop') === varispeedStart) return;
+    state.underneath = { ...loop, varispeedStart };
+    if (state.pending !== null) state.pending = { ...state.pending, varispeedStart };
   }
 
   /** Queues `target` in the engine to land at the first wrap whose image is ready; replaces any queued. */

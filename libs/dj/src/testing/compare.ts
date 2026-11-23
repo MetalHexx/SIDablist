@@ -19,6 +19,8 @@ export interface ComparisonOptions {
   readonly tune?: string;
   /** How far ahead the deck renders into its holding sink. Default 60. */
   readonly lookaheadMs?: number;
+  /** More of the load both decks are sent, such as a `grid`. */
+  readonly load?: Partial<Extract<DeckCommand, { kind: 'load' }>>;
   /** Sent to both decks, paused after their load, before they play: targets, settings. */
   readonly prepare?: (deck: DeckId) => readonly DeckCommand[];
   readonly presses: readonly Press[];
@@ -43,7 +45,7 @@ const DECK: DeckId = 'a';
 /** Adds, loads and starts a rig's deck, paused first so `prepare` can finish before frames run. */
 async function start(rig: Rig, options: ComparisonOptions): Promise<void> {
   rig.addDeck(DECK, { lookaheadMs: options.lookaheadMs ?? 60 });
-  await rig.load(DECK, options.tune ?? 'still-time', { ends: 'paused' });
+  await rig.load(DECK, options.tune ?? 'still-time', { ...options.load, ends: 'paused' });
   for (const command of options.prepare?.(DECK) ?? []) rig.send(command);
   await rig.settle();
   rig.send({ kind: 'play', deck: DECK });

@@ -735,3 +735,183 @@ describe('a deck rewound by hand and slip presses at random moments', () => {
     });
   }
 });
+
+/** The grid the live looper runs on, and a loop for it to run over, inside the register record. */
+const LIVE_GRID = { beatFrames: 20, beatOneFrame: 0 };
+const LIVE_UNDER: JumpTarget = { startFrame: 200, endFrame: 240, wraps: true };
+const LIVE_QUEUED: JumpTarget = { startFrame: 300, endFrame: 310 };
+const LIVE_TARGETS = (deck: DeckId): DeckCommand[] => [
+  { kind: 'targets', deck, frames: [200, 300] },
+  { kind: 'live-loop-size', deck, lengthFrames: 40 },
+];
+const liveSize =
+  (lengthFrames: number) =>
+  (deck: DeckId): DeckCommand => ({ kind: 'live-loop-size', deck, lengthFrames });
+const liveStart = (deck: DeckId): DeckCommand => ({ kind: 'live-loop', deck });
+const liveEnd = (deck: DeckId): DeckCommand => ({ kind: 'live-loop-end', deck });
+const keyUnder = (deck: DeckId): DeckCommand => ({ kind: 'key', deck, target: LIVE_UNDER });
+
+describe('a deck rewound with a live loop', () => {
+  it('runs a live loop through rewinds, with a shrink pending, a grown size and its end', async () => {
+    const { difference, rewound } = await compareRewound({
+      load: { grid: LIVE_GRID },
+      prepare: LIVE_TARGETS,
+      presses: [
+        press(400, liveStart),
+        ...rewindsEvery(410, 640, 23),
+        press(700, liveSize(8)),
+        ...rewindsEvery(710, 820, 17),
+        press(840, liveSize(30)),
+        ...rewindsEvery(850, 950, 19),
+        press(970, liveEnd),
+        ...rewindsEvery(980, 1150, 23),
+      ],
+      runMs: 1200,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({ loop: null, liveLoop: null, liveLoopSize: 30 });
+    const pictures = rewound.ofKind('picture');
+    expect(pictures.some((picture) => picture.liveLoop?.pendingEndFrame != null)).toBe(true);
+    expect(pictures.some((picture) => picture.loop?.live === true)).toBe(true);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('runs a live loop over a loop through rewinds and lands on slip’s count at its end', async () => {
+    const { difference, rewound } = await compareRewound({
+      load: { grid: LIVE_GRID },
+      prepare: LIVE_TARGETS,
+      presses: [
+        press(100, slipOn(true)),
+        press(150, keyUnder),
+        ...rewindsEvery(160, 300, 23),
+        press(320, liveStart),
+        press(330, (deck) => ({ kind: 'key', deck, target: LIVE_QUEUED })),
+        ...rewindsEvery(340, 480, 19),
+        press(500, (deck) => ({
+          kind: 'loop-bounds',
+          deck,
+          startFrame: 200,
+          endFrame: 230,
+        })),
+        ...rewindsEvery(510, 640, 19),
+        press(660, liveEnd),
+        ...rewindsEvery(670, 900, 23),
+      ],
+      runMs: 1000,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().liveLoop).toBeNull();
+    const pictures = rewound.ofKind('picture');
+    expect(pictures.some((picture) => picture.liveLoop?.overLoop === true)).toBe(true);
+    expect(pictures.some((picture) => picture.pendingBounds !== null)).toBe(true);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('folds into the loop underneath through rewinds with slip off', async () => {
+    const { difference, rewound } = await compareRewound({
+      load: { grid: LIVE_GRID },
+      prepare: LIVE_TARGETS,
+      presses: [
+        press(150, keyUnder),
+        ...rewindsEvery(160, 300, 23),
+        press(320, liveStart),
+        ...rewindsEvery(330, 560, 19),
+        press(580, liveEnd),
+        ...rewindsEvery(590, 800, 23),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({
+      liveLoop: null,
+      loop: { startFrame: 200, endFrame: 240 },
+    });
+    expect(rewound.ofKind('picture').some((picture) => picture.liveLoop?.overLoop === true)).toBe(
+      true,
+    );
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('adopts a live loop and drops one through rewinds', async () => {
+    const { difference, rewound } = await compareRewound({
+      load: { grid: LIVE_GRID },
+      prepare: LIVE_TARGETS,
+      presses: [
+        press(150, keyUnder),
+        press(300, liveStart),
+        ...rewindsEvery(310, 440, 17),
+        press(460, (deck) => ({ kind: 'live-loop-adopt', deck })),
+        ...rewindsEvery(470, 560, 17),
+        press(580, (deck) => ({ kind: 'stop-loop', deck })),
+        press(620, liveStart),
+        ...rewindsEvery(630, 760, 17),
+        press(780, (deck) => ({ kind: 'seek', deck, frame: 300 })),
+        ...rewindsEvery(790, 900, 17),
+      ],
+      runMs: 1000,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({ loop: null, liveLoop: null });
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
+describe('a deck rewound by live loop presses at random moments', () => {
+  for (let seed = 1; seed <= 12; seed++) {
+    it(`gives what a straight deck gives (seed ${seed})`, async () => {
+      const next = random(seed * 15485863);
+      const presses: Press[] = [];
+      const sizes = [8, 12, 20, 31.5, 40, 60];
+      for (let i = 0, count = 8 + Math.floor(next() * 10); i < count; i++) {
+        const atMs = 100 + Math.floor(next() * 800);
+        const kind = Math.floor(next() * 12);
+        const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
+        const size = sizes[Math.floor(next() * sizes.length)];
+        const on = next() < 0.5;
+        presses.push(
+          press(atMs, (deck, rig): DeckCommand => {
+            const when =
+              ahead < 0 ? {} : { when: { at: 'frame' as const, frame: nextUnsent(rig) + ahead } };
+            switch (kind) {
+              case 0:
+              case 1:
+                return { ...liveStart(deck), ...when };
+              case 2:
+              case 3:
+                return { ...liveEnd(deck), ...when };
+              case 4:
+              case 5:
+                return { ...liveSize(size)(deck), ...when };
+              case 6:
+                return { kind: 'live-loop-adopt', deck, ...when };
+              case 7:
+                return { kind: 'slip', deck, on, ...when };
+              case 8:
+                return { ...keyUnder(deck), ...when };
+              case 9:
+                return { kind: 'key', deck, target: LIVE_QUEUED, ...when };
+              case 10:
+                return { kind: 'stop-loop', deck, ...when };
+              default:
+                return { kind: 'nudge', deck, amount: 0, ...when };
+            }
+          }),
+        );
+      }
+
+      const { difference } = await compareRewound({
+        lookaheadMs: 60 + Math.floor(next() * 3) * 30,
+        load: { grid: LIVE_GRID },
+        prepare: LIVE_TARGETS,
+        presses,
+        runMs: 1400,
+      });
+
+      expect(difference).toBeNull();
+    });
+  }
+});
