@@ -80,8 +80,11 @@ async function run(
  * the frames it holds, so every press rewinds. The second never rewinds: it is given every command
  * up front at the frame the first one landed it on, and renders straight through. Because the
  * second is sent every command up front and only advanced, it cannot express a command that
- * restarts a halted deck (a `play` after a `pause` or `stop`) or a seek to a frame with no prepared
- * image. `deck/deck.spec.ts` exercises both, though not frame for frame against a straight deck.
+ * restarts a halted deck (a `play` after a `pause` or `stop`); `deck/deck.spec.ts` exercises that,
+ * though not frame for frame against a straight deck. A seek to a frame with no prepared image
+ * compares equal only while no other rewind lands before the image is ready, because a ready
+ * landing is fixed when a deck first sees the image ready, so the two decks fix it on different
+ * frames.
  */
 export async function compareRewound(options: ComparisonOptions): Promise<Comparison> {
   const rewound = new Rig(options.rig);

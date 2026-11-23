@@ -77,7 +77,10 @@ function record(kind: string, field: string, v: unknown, allowed: readonly strin
 
 const SETTING_NUMBERS: readonly number[] = Object.values(SETTING);
 
-/** The most frames one `targets` command may declare: double the 128 markers a tune is given. */
+/**
+ * The most frames one `targets` command may declare. Core holds about 68 KB per declared frame
+ * (`libs/core/AGENTS.md`), so 256 frames are about 17 MB a deck.
+ */
 const MAX_TARGET_FRAMES = 256;
 
 function settingNumber(kind: string, field: string, v: unknown): number {
