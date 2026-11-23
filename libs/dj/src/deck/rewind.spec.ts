@@ -114,22 +114,42 @@ describe('a deck rewound against a deck that ran straight', () => {
   });
 
   it('stops on the frame it lands on, alone and after a speed change', async () => {
+    let unsent = -1;
     const alone = await compareRewound({
-      presses: [press(300, (deck) => ({ kind: 'stop', deck }))],
+      presses: [
+        press(300, (deck, rig) => {
+          unsent = nextUnsent(rig);
+          return { kind: 'stop', deck };
+        }),
+      ],
       runMs: 600,
     });
     expect(alone.difference).toBeNull();
+    expect(alone.landings[0]).toBe(unsent);
+    expect(alone.rewound.picture().timing.rewinds).toBeGreaterThan(0);
+    expect(alone.straight.picture().timing.rewinds).toBe(0);
+    const aloneDelivered = alone.rewound.frames();
+    expect(aloneDelivered[aloneDelivered.length - 1].frameNumber).toBe(alone.landings[0] - 1);
     expect(alone.rewound.picture().transport).toBe('stopped');
 
+    let unsentAtStop = -1;
     const afterSpeed = await compareRewound({
       tune: 'insid3-out',
       presses: [
         press(200, (deck) => ({ kind: 'speed', deck, value: 1.25 })),
-        press(400, (deck) => ({ kind: 'stop', deck })),
+        press(400, (deck, rig) => {
+          unsentAtStop = nextUnsent(rig);
+          return { kind: 'stop', deck };
+        }),
       ],
       runMs: 600,
     });
     expect(afterSpeed.difference).toBeNull();
+    expect(afterSpeed.landings[1]).toBe(unsentAtStop);
+    expect(afterSpeed.rewound.picture().timing.rewinds).toBeGreaterThan(0);
+    expect(afterSpeed.straight.picture().timing.rewinds).toBe(0);
+    const speedDelivered = afterSpeed.rewound.frames();
+    expect(speedDelivered[speedDelivered.length - 1].frameNumber).toBe(afterSpeed.landings[1] - 1);
     expect(afterSpeed.rewound.picture().transport).toBe('stopped');
   });
 
