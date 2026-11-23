@@ -42,12 +42,12 @@ describe('the desk', () => {
     rig.addDeck('a');
     await rig.load('a', 'still-time', { ends: 'paused' });
 
-    rig.send({ kind: 'jump', deck: 'a', target: { startFrame: 10, endFrame: 20 } });
+    rig.send({ kind: 'live-loop', deck: 'a' });
     rig.send({ kind: 'slip', deck: 'a', on: true });
     await rig.microtasks();
 
     expect(rig.warnings).toEqual([
-      'dj: refused jump: jump is not available yet',
+      'dj: refused live-loop: live-loop is not available yet',
       'dj: refused slip: slip is not available yet',
     ]);
     expect(rig.landed().map((event) => event.command.kind)).toEqual(['load']);

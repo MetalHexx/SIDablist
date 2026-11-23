@@ -38,3 +38,20 @@ export function readMutes(
 export function mutesAsSettings(mutes: Int32Array): NumberedSetting[] {
   return MAIN_SETTINGS.map((setting) => ({ setting, value: mutes[voiceOf(setting)] }));
 }
+
+/**
+ * `settings`' mutes as one boolean a voice, the shape `JumpSettings.voiceMutes` takes. A voice the
+ * settings do not name sounds, as in a load's.
+ */
+export function mutesOfSettings(settings: readonly NumberedSetting[]): boolean[] {
+  const muted = [false, false, false];
+  for (const { setting, value } of settings) {
+    if (isMainSetting(setting)) muted[voiceOf(setting)] = value === 1;
+  }
+  return muted;
+}
+
+/** `mutes` (one 0 or 1 a voice) as one boolean a voice. */
+export function mutesAsBooleans(mutes: Int32Array): boolean[] {
+  return [mutes[0] === 1, mutes[1] === 1, mutes[2] === 1];
+}

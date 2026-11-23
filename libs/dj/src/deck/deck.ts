@@ -8,6 +8,7 @@ import {
   parseSidFile,
 } from '@sidablist/core';
 import type {
+  JumpSettings,
   PlayerSnapshot,
   RegisterRecord,
   ReplayRunner,
@@ -43,12 +44,23 @@ import { DeckState, JUMP, LAST_POSITION, NOT_WAITING, NUDGE, SPEED } from './dec
 import { DrivenClock } from './driven-clock.js';
 import {
   EventQueue,
+  KIND_CAPTURED,
   KIND_JUMP_LANDED,
   KIND_LANDED,
   KIND_LOADED,
   KIND_LOAD_FAILED,
   type QueuedEvent,
 } from './event-queue.js';
+import {
+  DeckLoops,
+  RESOLVED_CANCEL,
+  RESOLVED_LET_GO,
+  RESOLVED_NONE,
+  RESOLVED_QUEUE,
+  RESOLVED_START,
+  tuneFrameOf,
+  type LoopsHost,
+} from './loops.js';
 import { NOTHING_APPLIED, RestoreRing, type RestoreSlot } from './restore-ring.js';
 import { isMainSetting, mutesAsSettings, readMutes, voiceOf, VOICE_COUNT } from './settings.js';
 import { SinkTap } from './sink-tap.js';
@@ -66,18 +78,22 @@ export interface DeckHost {
 type LoadCommand = Extract<DeckCommand, { kind: 'load' }>;
 type LandedEvent = Extract<DeckEvent, { kind: 'landed' }>;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+type KeyResolution = NonNullable<LandedEvent['resolved']>;
 type Phase = 'empty' | 'loading' | 'failed' | 'ready';
 type Ends = 'playing' | 'paused' | 'stopped';
+
+/** A `key` press's resolution, by the code the event queue carries it as. */
+const RESOLUTIONS: Readonly<Record<number, KeyResolution>> = {
+  [RESOLVED_START]: 'start',
+  [RESOLVED_QUEUE]: 'queue',
+  [RESOLVED_CANCEL]: 'cancel',
+  [RESOLVED_LET_GO]: 'let-go',
+};
 
 const NO_FRAME = Number.MAX_SAFE_INTEGER;
 
 /** Commands the package does not carry out yet: refused, as a deck refuses what it cannot do. */
 const NOT_AVAILABLE: ReadonlySet<string> = new Set([
-  'jump',
-  'key',
-  'loop-bounds',
-  'loop-wraps',
-  'capture',
   'hand-touch',
   'hand-move',
   'slip',
@@ -92,9 +108,6 @@ const WORST_LATE_MS = 0;
 const LAST_REWIND_MS = 1;
 const WORST_REWIND_MS = 2;
 
-/** The largest tune frame a seek keeps waiting for: it is stored in the deck state's 32-bit slots. */
-const MAX_TUNE_FRAME = 0x7fffffff;
-
 /** Seek frames kept declared beside the host's targets: each holds a prepared image of about 68 KB. */
 const SEEK_FRAMES_KEPT = 8;
 const LANDINGS_KEPT = 8;
@@ -108,7 +121,11 @@ function halts(entry: LogEntry): boolean {
   return kind === 'pause' || kind === 'stop' || kind === 'load';
 }
 
-/** Whether applying `command` ends the loop that is running, and with it the pass in progress. */
+/**
+ * Whether applying `command` always ends the loop that is running, and with it the pass in
+ * progress. The commands that end it only sometimes (a jump over a loop, a key, a let-go) say so
+ * when they land.
+ */
 function endsLoop(command: DeckCommand): boolean {
   const kind = command.kind;
   return kind === 'seek' || kind === 'stop' || kind === 'load' || kind === 'stop-loop';
@@ -142,6 +159,7 @@ export class Deck {
   private readonly events = new EventQueue();
   private readonly replayRunner: ReplayRunner;
   private readonly prepareRunner: ReplayRunner | undefined;
+  private readonly loops: DeckLoops;
 
   private ring: RestoreRing | null = null;
   private output: DeckOutput | null = null;
@@ -192,8 +210,11 @@ export class Deck {
 
   private readonly update: Mutable<DeckUpdate>;
   private lastPictureSnapshot: PlayerSnapshot | null = null;
-  private readonly pictureKey = new Float64Array(8);
+  private readonly pictureKey = new Float64Array(9);
   private pictureError: string | null = null;
+  private pictureQueued: JumpTarget | null = null;
+  private pictureWaiting: JumpTarget | null = null;
+  private picturePending: object | null = null;
 
   /** Keeps the queued events a rewind to `rewindLanding` does not undo; one closure, made once. */
   private readonly retainAfterRewind = (event: QueuedEvent): boolean => {
@@ -225,6 +246,7 @@ export class Deck {
       ...(plugs.log === undefined ? {} : { log: plugs.log }),
     });
     this.player.setRepeatTrack(true);
+    this.loops = new DeckLoops(this.player, this.state, this.loopsHost());
     this.update = {
       kind: 'update',
       deck: id,
@@ -582,9 +604,11 @@ export class Deck {
   /**
    * The package's logic between ticks, for the frame that just rendered. The engine's snapshot is
    * read first (by identity: nothing published changed when it is the one last read), then what
-   * the frame showed: a hand-off or a wrap ends the running loop's pass, and a waiting seek whose
-   * target became ready is fixed to land on the next frame. The restore point is saved after.
-   * The wrap is seen as the playhead moving back; a lap's phase moves only with it.
+   * the frame showed: a hand-off or a wrap ends the running loop's pass, a hand-off is the queued
+   * target running now (the only way a landing from the queue is learnt), a loop change that is no
+   * longer pending has landed, and a waiting seek or jump whose target became ready is fixed to land
+   * on the next frame. The restore point is saved after. The wrap is seen as the playhead moving
+   * back; a lap's phase moves only with it.
    */
   private afterTick(frame: number): void {
     const state = this.state;
@@ -595,7 +619,12 @@ export class Deck {
       state.snapshot = snapshot;
       const tune = snapshot.tune;
       if (tune !== null) {
-        if (tune.handOffs > state.lastHandOffs) passEnded = true;
+        if (tune.handOffs > state.lastHandOffs) {
+          passEnded = true;
+          this.loops.handedOff(frame);
+        } else if (state.pending !== null && tune.loopChange === null) {
+          this.loops.changeLanded();
+        }
         state.lastHandOffs = tune.handOffs;
         this.watchWaiting(frame, tune.preparedFrames);
       }
@@ -610,8 +639,17 @@ export class Deck {
   // ---------------------------------------------------------------------------------------------
   // Applying commands
 
-  /** Applies one entry on `frame`, reusing the answers it got the first time, and queues its `landed`. */
+  /**
+   * Applies one entry on `frame`, reusing the answers it got the first time, and queues its
+   * `landed`. A press that starts a target on a deck that is not playing asks the engine to play
+   * and returns: the deck settles, and the same entry is applied again once it has.
+   */
   private apply(entry: LogEntry, frame: number): void {
+    if (this.startsFirst(entry)) {
+      entry.started = true;
+      this.settleOn(this.player.play());
+      return;
+    }
     const dueMs = this.clock.nextDueMs;
     entry.applied = true;
     if (entry.seq > this.watermark) this.watermark = entry.seq;
@@ -621,6 +659,7 @@ export class Deck {
       return;
     }
     const player = this.player;
+    let endedLoop = endsLoop(command);
     switch (command.kind) {
       case 'play':
         if (player.getSnapshot().transport !== 'playing') this.settleOn(player.play());
@@ -630,6 +669,7 @@ export class Deck {
         break;
       case 'stop':
         this.clearWaiting();
+        this.loops.letGo();
         player.stop();
         break;
       case 'seek':
@@ -649,8 +689,7 @@ export class Deck {
         break;
       case 'setting':
         if (isMainSetting(command.setting)) {
-          this.state.setMuted(voiceOf(command.setting), command.value === 1);
-          player.setVoiceMuted(voiceOf(command.setting), command.value === 1);
+          this.loops.setSetting(voiceOf(command.setting), command.value === 1);
         }
         break;
       case 'targets':
@@ -660,18 +699,51 @@ export class Deck {
       case 'load':
         this.applyLoad(command);
         break;
+      case 'jump':
+        endedLoop = this.loops.jump(entry, command.target);
+        break;
+      case 'key':
+        endedLoop = this.loops.key(entry, command.target);
+        break;
       case 'cancel-queued':
-        player.queueJump(null);
+        this.loops.cancelQueued();
+        break;
+      case 'let-go':
+        endedLoop = this.loops.letGo();
         break;
       case 'stop-loop':
-        player.setActiveLoop(null);
+        if (this.state.waiting !== null) this.clearWaiting();
+        this.loops.letGo();
+        break;
+      case 'loop-bounds':
+        endedLoop = this.loops.loopBounds(entry, command);
+        break;
+      case 'loop-wraps':
+        this.loops.loopWraps(command.wraps);
+        break;
+      case 'capture':
+        this.queueCaptured(entry, frame, player.capturePosition());
         break;
       default:
-        // let-go and hand-lift are releases with nothing to release yet; the rest never get here.
+        // hand-lift is a release with nothing to release yet; the rest never get here.
         break;
     }
     this.queueLanded(entry, frame, dueMs);
-    if (endsLoop(command)) this.endPass(frame, entry.seq);
+    if (endedLoop) this.endPass(frame, entry.seq);
+  }
+
+  /**
+   * Whether `entry` is a press that starts or queues a target on a deck that is not playing: the
+   * deck plays first. It never pauses, and never jumps while `play()` is still settling.
+   */
+  private startsFirst(entry: LogEntry): boolean {
+    const command = entry.command;
+    if (command === null || entry.started) return false;
+    if (command.kind !== 'jump' && command.kind !== 'key') return false;
+    if (this.player.getSnapshot().transport === 'playing') return false;
+    if (command.kind === 'jump') return true;
+    const resolved = this.loops.resolve(command.target);
+    return resolved === RESOLVED_START || resolved === RESOLVED_QUEUE;
   }
 
   private queueLanded(entry: LogEntry, frame: number, dueMs: number): void {
@@ -684,7 +756,25 @@ export class Deck {
     event.entry = entry.index;
     event.seq = entry.seq;
     event.dueMs = dueMs;
+    event.a = entry.command?.kind === 'key' ? this.loops.resolved : RESOLVED_NONE;
+    event.b = this.state.ownInPlay ? 2 : 1;
     entry.eventState = EVENT_QUEUED;
+  }
+
+  /**
+   * Queues a `captured` beside the `landed` of the entry that captured the playhead, which a
+   * rewind keeps or discards with it. Nothing is reported with nothing loaded.
+   */
+  private queueCaptured(entry: LogEntry, frame: number, position: number | null): void {
+    if (position === null || entry.eventState !== EVENT_NONE) return;
+    const event = this.events.push(KIND_CAPTURED, frame);
+    if (event === null) {
+      this.plugs.log?.warn(`dj: deck ${this.id} dropped an event: its queue is full`);
+      return;
+    }
+    event.entry = entry.index;
+    event.seq = entry.seq;
+    event.a = position;
   }
 
   /** Changes one tempo layer, and the engine's tempo when the effective tempo moved. */
@@ -697,15 +787,6 @@ export class Deck {
   }
 
   /**
-   * Drops the loop and the queued jump (and, in later tasks, the hand and slip): a seek, a stop and
-   * a load all begin by leaving them.
-   */
-  private dropLoops(): void {
-    this.player.setActiveLoop(null);
-    this.player.queueJump(null);
-  }
-
-  /**
    * A seek, in tune frames. While playing, a target the engine holds an image for lands at once;
    * any other is declared and waited for, playing on, and lands on the frame after the one that
    * first shows it ready. The engine would replay an unprepared seek off-thread, whose landing time
@@ -715,9 +796,9 @@ export class Deck {
   private applySeek(entry: LogEntry, asked: number): void {
     const player = this.player;
     // Rounded and bounded as the engine rounds a seek, so a frame is the same one wherever it is kept.
-    const tuneFrame = Math.min(Math.max(0, Math.round(asked)), MAX_TUNE_FRAME);
+    const tuneFrame = tuneFrameOf(asked);
     const target = frames(tuneFrame);
-    this.dropLoops();
+    this.loops.letGo();
     this.clearWaiting();
     if (!this.clock.started || player.getSnapshot().transport !== 'playing') {
       if (!this.supersededSeek(entry)) this.settleOn(player.seek(target));
@@ -757,16 +838,71 @@ export class Deck {
     }
   }
 
-  /** Lands a waiting seek on the frame its readiness fixed. */
+  /**
+   * Lands a waiting seek or jump on the frame its readiness fixed. A jump that replaced a running
+   * loop ends that loop's pass.
+   */
   private landReady(index: number, frame: number): void {
-    const tuneFrame = this.landingTune[index];
-    this.state.stopWaiting();
-    this.seekPrepared(frames(tuneFrame));
+    const state = this.state;
+    const target = state.waiting;
+    const settings = state.waitingSettings;
+    const seq = state.waitingSeq;
+    state.stopWaiting();
+    let endedLoop = false;
+    if (target === null) {
+      this.seekPrepared(frames(this.landingTune[index]));
+    } else {
+      endedLoop = this.loops.land(target, settings);
+    }
     const event = this.events.push(KIND_JUMP_LANDED, frame);
-    if (event === null) return;
-    event.a = tuneFrame;
-    event.b = -1;
-    event.c = 1;
+    if (event !== null) {
+      event.a = target === null ? this.landingTune[index] : target.startFrame;
+      event.b = target === null || target.endFrame === null ? -1 : target.endFrame;
+      event.c = 1;
+    }
+    if (endedLoop) this.endPass(frame, seq);
+  }
+
+  /**
+   * Makes `target` the one waiting for `tuneFrame`, declared like a seek's so a landing a rewind
+   * re-renders finds its image.
+   */
+  private waitOn(
+    tuneFrame: number,
+    seq: number,
+    target: JumpTarget,
+    settings: JumpSettings | null,
+  ): void {
+    this.clearWaiting();
+    this.rememberSeek(tuneFrame);
+    this.state.wait(tuneFrame, seq, target, settings);
+    this.declare();
+  }
+
+  /** What the part that holds the loops asks of this deck. Made once, so a call allocates no closure. */
+  private loopsHost(): LoopsHost {
+    return {
+      wait: (tuneFrame, seq, target, settings) => this.waitOn(tuneFrame, seq, target, settings),
+      stopWaiting: () => this.clearWaiting(),
+      jumpLanded: (frame, target) => this.queueHandOff(frame, target),
+      warn: (message) => this.plugs.log?.warn(`dj: deck ${this.id}: ${message}`),
+    };
+  }
+
+  /**
+   * Queues the `jump-landed` of a hand-off made in the tick that rendered `frame`. The event is
+   * tagged with that frame, so a rewind to the frame after keeps what its restore point already
+   * holds; the landing it reports is the frame after, the first the new loop plays.
+   */
+  private queueHandOff(frame: number, target: JumpTarget): void {
+    const event = this.events.push(KIND_JUMP_LANDED, frame);
+    if (event === null) {
+      this.plugs.log?.warn(`dj: deck ${this.id} dropped an event: its queue is full`);
+      return;
+    }
+    event.a = target.startFrame;
+    event.b = target.endFrame === null ? -1 : target.endFrame;
+    event.c = 0;
   }
 
   /**
@@ -810,17 +946,20 @@ export class Deck {
     this.landingCount--;
   }
 
-  /** A seek's frame stays declared beside the host's, so a landing a rewind re-renders finds its image. */
+  /**
+   * A seek's or a jump's frame stays declared beside the host's, so a landing a rewind re-renders
+   * finds its image.
+   */
   private rememberSeek(tuneFrame: number): void {
     if (this.recentSeeks.includes(tuneFrame)) return;
     this.recentSeeks.push(tuneFrame);
     if (this.recentSeeks.length > SEEK_FRAMES_KEPT) this.recentSeeks.shift();
   }
 
-  /** Declares the host's targets and the recent seeks' frames to the engine. */
+  /** Declares the host's targets and the frames recently waited for, sorted and unique. */
   private declare(): void {
     const set = new Set<number>([...this.hostTargets, ...this.recentSeeks]);
-    this.player.setJumpTargets([...set].map((frame) => frames(frame)));
+    this.player.setJumpTargets([...set].sort((a, b) => a - b).map((frame) => frames(frame)));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -828,7 +967,9 @@ export class Deck {
 
   /**
    * Fixes, at the start of its `from` frame, whether a loop runs there. With none, a `pass-end`
-   * entry lands on that frame; with one, it waits for the end of the pass.
+   * entry lands on that frame; with one, it waits for the end of the pass. A `jump` is the
+   * exception: it lands on `from` either way, and with a loop running it queues in the engine,
+   * which makes the end of the pass its own.
    */
   private determinePassEnds(frame: number): void {
     for (let i = 0; i < this.log.size; i++) {
@@ -839,6 +980,7 @@ export class Deck {
         entry.frame = frame;
       } else {
         entry.loopAtFrom = LOOP_YES;
+        if (entry.command?.kind === 'jump') entry.frame = frame;
       }
     }
   }
@@ -1054,7 +1196,7 @@ export class Deck {
     this.ring = null;
     this.runStart = -1;
     if (this.hasTune) {
-      this.dropLoops();
+      this.loops.letGo();
       player.stop();
       const state = this.state;
       state.cells[SPEED] = 1;
@@ -1276,7 +1418,8 @@ export class Deck {
           frame: event.frame,
           waitMs: Number.isNaN(entry.pressedAtMs) ? null : event.dueMs - entry.pressedAtMs,
         };
-        if (command.kind === 'setting') landed.settingsIn = 'main';
+        if (command.kind === 'setting') landed.settingsIn = event.b === 2 ? 'loop' : 'main';
+        if (command.kind === 'key') landed.resolved = RESOLUTIONS[event.a];
         return landed;
       }
       case KIND_LOADED:
@@ -1294,11 +1437,13 @@ export class Deck {
         return {
           kind: 'jump-landed',
           deck: this.id,
-          frame: event.frame,
+          frame: event.c === 1 ? event.frame : event.frame + 1,
           via: event.c === 1 ? 'ready' : 'pass-end',
           startFrame: event.a,
           endFrame: event.b < 0 ? null : event.b,
         };
+      case KIND_CAPTURED:
+        return { kind: 'captured', deck: this.id, frame: event.frame, position: event.a };
       default:
         return null;
     }
@@ -1335,6 +1480,12 @@ export class Deck {
     const snapshot = this.player.getSnapshot();
     const key = this.pictureKey;
     const mutes = (state.muted(0) ? 1 : 0) | (state.muted(1) ? 2 : 0) | (state.muted(2) ? 4 : 0);
+    const own = state.ownInPlay
+      ? 8 |
+        (state.loopMuted(0) ? 1 : 0) |
+        (state.loopMuted(1) ? 2 : 0) |
+        (state.loopMuted(2) ? 4 : 0)
+      : 0;
     const phase =
       this.phase === 'empty' ? 0 : this.phase === 'loading' ? 1 : this.phase === 'failed' ? 2 : 3;
     const slots = this.ring === null ? 0 : this.ring.capacity;
@@ -1348,7 +1499,11 @@ export class Deck {
       key[5] === phase &&
       key[6] === slots &&
       key[7] === this.lookaheadMs &&
-      this.pictureError === this.error
+      key[8] === own &&
+      this.pictureError === this.error &&
+      this.pictureQueued === state.queued &&
+      this.pictureWaiting === state.waiting &&
+      this.picturePending === state.pending
     ) {
       return;
     }
@@ -1361,7 +1516,11 @@ export class Deck {
     key[5] = phase;
     key[6] = slots;
     key[7] = this.lookaheadMs;
+    key[8] = own;
     this.pictureError = this.error;
+    this.pictureQueued = state.queued;
+    this.pictureWaiting = state.waiting;
+    this.picturePending = state.pending;
     this.plugs.report(this.buildPicture());
   }
 
@@ -1370,11 +1529,12 @@ export class Deck {
     const snapshot = this.player.getSnapshot();
     const tuneSnapshot = this.phase === 'ready' ? snapshot.tune : null;
     const loop = snapshot.loop;
-    const queued = tuneSnapshot?.queuedJump ?? null;
     const waiting: JumpTarget | null =
-      state.waitingFrame === NOT_WAITING
+      state.waiting ??
+      (state.waitingFrame === NOT_WAITING
         ? null
-        : { startFrame: state.waitingFrame, endFrame: null };
+        : { startFrame: state.waitingFrame, endFrame: null });
+    const pending = state.pending;
     const transport: DeckPicture['transport'] =
       this.phase !== 'ready'
         ? this.phase
@@ -1414,22 +1574,19 @@ export class Deck {
               ...(loop.lapPhase === undefined ? {} : { lapPhase: loop.lapPhase }),
               live: false,
             },
-      queued:
-        queued === null
-          ? null
-          : {
-              startFrame: queued.startFrame,
-              endFrame: queued.endFrame,
-              ...(queued.lapPhase === undefined ? {} : { lapPhase: queued.lapPhase }),
-            },
+      queued: state.queued,
       waiting,
-      pendingBounds: null,
+      pendingBounds:
+        pending === null ? null : { startFrame: pending.startFrame, endFrame: pending.endFrame },
       liveLoop: null,
       liveLoopSize: null,
       slip: { on: false, departed: false },
       hand: 'up',
-      settingsInPlay: 'main',
-      settings: { main: mutesAsSettings(state.mutes), loop: null },
+      settingsInPlay: state.ownInPlay ? 'loop' : 'main',
+      settings: {
+        main: mutesAsSettings(state.mutes),
+        loop: state.ownInPlay ? mutesAsSettings(state.loopMutes) : null,
+      },
       readyFrames: [...(tuneSnapshot?.preparedFrames ?? [])],
       grid: this.grid,
       rate:

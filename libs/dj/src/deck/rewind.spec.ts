@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DeckCommand, DeckId } from '../messages/commands.js';
+import type { DeckCommand, DeckId, JumpTarget } from '../messages/commands.js';
 import { compareRewound, type Press } from '../testing/compare.js';
 import type { Rig } from '../testing/harness.js';
 
@@ -256,6 +256,233 @@ describe('a deck rewound by presses at random moments', () => {
 
       expect(difference).toBeNull();
       expect(rewound.warnings).toEqual([]);
+    });
+  }
+});
+
+const LOOP_A: JumpTarget = { startFrame: 500, endFrame: 520 };
+const LOOP_B: JumpTarget = { startFrame: 1000, endFrame: 1010 };
+const CUE: JumpTarget = { startFrame: 1500, endFrame: null };
+const TARGETS = (deck: DeckId): DeckCommand[] => [
+  { kind: 'targets', deck, frames: [500, 1000, 1500, 200, 300] },
+];
+
+/** `jump-landed` events as (frame, via, start) so two decks' can be compared. */
+const landings = (rig: Rig): string[] =>
+  rig.ofKind('jump-landed').map((event) => `${event.frame} ${event.via} ${event.startFrame}`);
+
+/** A press every `everyMs` from `fromMs`, each a nudge of 0: it lands, rewinds and changes nothing. */
+function rewindsEvery(fromMs: number, toMs: number, everyMs: number): Press[] {
+  const presses: Press[] = [];
+  for (let at = fromMs; at < toMs; at += everyMs) {
+    presses.push(press(at, (deck) => ({ kind: 'nudge', deck, amount: 0 })));
+  }
+  return presses;
+}
+
+describe('a deck rewound with loops in play', () => {
+  it('runs a loop through rewinds inside its laps', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        ...rewindsEvery(200, 700, 23),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().timing.rewinds).toBeGreaterThan(10);
+    expect(rewound.picture().loop).toMatchObject({ startFrame: 500, endFrame: 520 });
+    expect(straight.picture().loop).toMatchObject({ startFrame: 500, endFrame: 520 });
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('lands a queued jump at the wrap through rewinds across the hand-off', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(250, (deck) => ({ kind: 'key', deck, target: LOOP_B })),
+        ...rewindsEvery(260, 700, 17),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(landings(rewound)).toHaveLength(1);
+    expect(landings(rewound)).toEqual(landings(straight));
+    expect(rewound.picture()).toMatchObject({
+      queued: null,
+      loop: { startFrame: 1000, endFrame: 1010 },
+    });
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('waits for a target that is not ready, and lands it where a straight deck does', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(250, (deck) => ({
+          kind: 'jump',
+          deck,
+          target: { startFrame: 2500, endFrame: null },
+        })),
+        ...rewindsEvery(260, 700, 19),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(landings(rewound)).toHaveLength(1);
+    expect(landings(rewound)).toEqual(landings(straight));
+    expect(rewound.ofKind('jump-landed')[0].via).toBe('ready');
+    expect(rewound.picture()).toMatchObject({ waiting: null, loop: null });
+  });
+
+  it('plays a loop change from the wrap through rewinds across it', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(250, (deck) => ({ kind: 'loop-bounds', deck, startFrame: 500, endFrame: 510 })),
+        ...rewindsEvery(260, 700, 17),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({
+      pendingBounds: null,
+      loop: { startFrame: 500, endFrame: 510 },
+    });
+    expect(straight.picture().loop).toMatchObject({ endFrame: 510 });
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('names a pending change and a queued jump again after a change of wrap, through rewinds', async () => {
+    const { difference, rewound } = await compareRewound({
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(250, (deck) => ({ kind: 'loop-bounds', deck, startFrame: 500, endFrame: 510 })),
+        press(300, (deck) => ({ kind: 'loop-wraps', deck, wraps: true })),
+        ...rewindsEvery(310, 600, 21),
+        press(620, (deck) => ({ kind: 'key', deck, target: CUE })),
+        press(650, (deck) => ({ kind: 'loop-wraps', deck, wraps: false })),
+        ...rewindsEvery(660, 900, 21),
+      ],
+      runMs: 1100,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({ pendingBounds: null, queued: null, loop: null });
+    expect(landings(rewound)).toHaveLength(1);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('holds the main settings aside while a loop plays its own, and puts them back', async () => {
+    const own: JumpTarget = {
+      startFrame: 200,
+      endFrame: 230,
+      settings: [{ setting: 2, value: 1 }],
+    };
+    const shared: JumpTarget = { startFrame: 300, endFrame: 330 };
+    const { difference, rewound, straight } = await compareRewound({
+      tune: 'insid3-out',
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: own })),
+        press(260, (deck) => ({ kind: 'setting', deck, setting: 1, value: 1 })),
+        press(330, (deck) => ({ kind: 'key', deck, target: shared })),
+        press(360, (deck) => ({ kind: 'loop-wraps', deck, wraps: true })),
+        ...rewindsEvery(370, 800, 19),
+        press(850, (deck) => ({ kind: 'key', deck, target: own })),
+        press(1000, (deck) => ({ kind: 'let-go', deck })),
+      ],
+      runMs: 1200,
+    });
+
+    expect(difference).toBeNull();
+    expect(landings(rewound)).toEqual(landings(straight));
+    expect(rewound.picture()).toMatchObject({ settingsInPlay: 'main', loop: null });
+    expect(rewound.picture().settings.main[0]).toEqual({ setting: 1, value: 0 });
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
+describe('a deck rewound by loop presses at random moments', () => {
+  const OWN: JumpTarget = { startFrame: 200, endFrame: 230, settings: [{ setting: 2, value: 1 }] };
+  const SHARED: JumpTarget = { startFrame: 300, endFrame: 330 };
+  const OWN_WRAPS: JumpTarget = { startFrame: 1000, endFrame: 1020, wraps: true, settings: [] };
+  const TARGET_LIST = [LOOP_A, LOOP_B, CUE, OWN, SHARED, OWN_WRAPS];
+
+  for (let seed = 1; seed <= 16; seed++) {
+    it(`gives what a straight deck gives (seed ${seed})`, async () => {
+      const next = random(seed * 7919);
+      const presses: Press[] = [];
+      for (let i = 0, count = 6 + Math.floor(next() * 8); i < count; i++) {
+        const atMs = 100 + Math.floor(next() * 800);
+        const kind = Math.floor(next() * 12);
+        const target = TARGET_LIST[Math.floor(next() * TARGET_LIST.length)];
+        const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
+        const on = next() < 0.5;
+        presses.push(
+          press(atMs, (deck, rig): DeckCommand => {
+            const when =
+              ahead < 0 ? {} : { when: { at: 'frame' as const, frame: nextUnsent(rig) + ahead } };
+            switch (kind) {
+              case 0:
+              case 1:
+              case 2:
+                return { kind: 'key', deck, target, ...when };
+              case 3:
+                return { kind: 'jump', deck, target, ...when };
+              case 4:
+                return { kind: 'let-go', deck, ...when };
+              case 5:
+                return { kind: 'cancel-queued', deck, ...when };
+              case 6:
+                return { kind: 'stop-loop', deck, ...when };
+              case 7:
+                return {
+                  kind: 'loop-bounds',
+                  deck,
+                  startFrame: target.startFrame,
+                  endFrame: on ? target.startFrame + 12 : null,
+                  ...when,
+                };
+              case 8:
+                return { kind: 'loop-wraps', deck, wraps: on, ...when };
+              case 9:
+                return {
+                  kind: 'setting',
+                  deck,
+                  setting: 1 + Math.floor(next() * 3),
+                  value: on ? 1 : 0,
+                  ...when,
+                };
+              case 10:
+                return { kind: 'speed', deck, value: 0.8 + Math.floor(next() * 6) / 10, ...when };
+              default:
+                return { kind: 'nudge', deck, amount: 0, ...when };
+            }
+          }),
+        );
+      }
+
+      const { difference, rewound } = await compareRewound({
+        tune: 'insid3-out',
+        lookaheadMs: 60 + Math.floor(next() * 3) * 30,
+        prepare: (deck) => [{ kind: 'targets', deck, frames: [200, 300, 500, 1000, 1500] }],
+        presses,
+        runMs: 1400,
+      });
+
+      expect(difference).toBeNull();
+      // An edit sent with no loop to edit is the one thing the random presses may get refused.
+      expect(rewound.warnings.filter((line) => !line.includes('kept its loop'))).toEqual([]);
     });
   }
 });

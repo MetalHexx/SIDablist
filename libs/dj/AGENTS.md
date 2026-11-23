@@ -18,7 +18,8 @@ supplies everything environmental.
   `sink-tap.ts` (the engine's `SidSink`, mapping the output's counts onto stream frames),
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
   `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
-  `settings.ts` (the tempo layers and the main settings).
+  `settings.ts` (the tempo layers, the main settings and the loop's own), and `loops.ts` (`DeckLoops`:
+  jumps, the four-way key press, letting go, edits to the running loop and the loop's own settings).
 - `src/heavy-work/inline.ts` — `createInlineHeavyWork`, replay and scan on the calling thread, for Node,
   tests and the bench.
 - `src/index.ts` — the main path's public surface. Browser-only files live under `src/browser/` and
@@ -63,7 +64,10 @@ supplies everything environmental.
 - **`DeckState` is the saved state, and a field left out restores almost exactly.** A field the deck
   keeps that decides the next frames joins `DeckState` (and both copy methods), or its doc comment
   says why it is out. It passes most specs and breaks one playing state much later; only
-  `deck/rewind.spec.ts` catches it, by playing a rewound deck against a straight one.
+  `deck/rewind.spec.ts` catches it, by playing a rewound deck against a straight one. The loops'
+  fields (the queued and the waiting target, the settings they carry, the change pending, whether
+  the loop's own settings play) are held there by reference: a command is immutable, and a save
+  allocates nothing.
 - **A save is never made inside a tick, and the package never subscribes to the engine.** Listeners
   run inside the tick, and a call back into the engine from there, or a save, breaks its contract.
   All package logic runs between ticks.
@@ -85,7 +89,24 @@ supplies everything environmental.
   the last lookahead of frames is not heard. Decks repeat by default.
 - **A ready landing is fixed outside the saved state.** The engine does not save which images are
   prepared, so a re-render would find a waiting target ready earlier than it first was. A waiting
-  seek's landing frame is fixed once, when it is first seen ready, and a re-render lands it there.
+  seek's or jump's landing frame is fixed once, when it is first seen ready, and a re-render lands
+  it there.
+- **The four-way press is resolved at its landing frame.** A `key` is a start, a queue, a cancel or a
+  let-go by what the deck holds on the frame it lands on, never by what it held when it was sent, so
+  a replay at that frame (`fixed` is always `{ at: 'frame' }` for it) resolves the same way. A
+  `jump` sent for `pass-end` is the exception: it lands on its `from` frame and the engine's queue
+  owns the end of the pass. A first answer is only ever the engine's (is an image held, did it take
+  a change): whether a loop runs is derived again every time an entry is applied, because a command
+  that lands earlier can change it.
+- **The engine's queue is learnt from `tune.handOffs`.** A queued jump disappears from the engine on a
+  cancel, a replace, a `setActiveLoop`, a stop and a load as well as when it lands, so only a rise in
+  `handOffs`, read after each tick, is a landing: it moves the queued target to running, swaps the
+  settings and reports `jump-landed`. The settings a landing carries are built when the command lands,
+  never at the landing tick, which allocates nothing.
+- **`setActiveLoop` drops the queued jump and a pending change, so every caller names them again.**
+  A jump now that replaces the loop drops the queue on purpose; a stab (`seek` alone) and a change of
+  wrap (`setActiveLoop` with the same bounds, then `queueJump` and `changeLoopAt` again) keep them.
+  A new caller that sets the loop and forgets to re-queue loses a queued jump with no error.
 - **Seeks never replay off-thread while playing.** A seek to a frame the engine holds no image for is
   declared and waited for, because a replay's landing time would depend on the worker and break
   determinism.
@@ -99,7 +120,11 @@ supplies everything environmental.
   `for…of` over a `Map`, no `subarray`. `deck/deck.allocation.spec.ts` measures it (it needs
   `--expose-gc`, which `vitest.config.ts` gives the workers). The due time handed to the engine's
   clock callback is a fractional double V8 boxes: about 16 bytes a frame, which the specs' budgets
-  allow for.
+  allow for. A running loop adds the `lapProgress` of each update, boxed the same way, and for a
+  length that is not whole the lap phase and length it is worked out from: up to about 70 bytes a
+  frame in all, which the loop specs' shorter pass allows for. A landing the engine makes is read
+  after the tick from `tune.handOffs` with number compares and builds nothing but the picture and
+  the event it reports.
 
 ## When a change here ripples
 
@@ -110,7 +135,7 @@ supplies everything environmental.
   `messages/round-trip.spec.ts`, and update the adapter once it exists. Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
-  `deck/deck-state.ts`, `deck/command-log.ts`)?** The rewind must still give exactly the frames a
+  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`)?** The rewind must still give exactly the frames a
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)

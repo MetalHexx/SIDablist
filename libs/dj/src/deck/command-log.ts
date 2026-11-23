@@ -53,8 +53,13 @@ export interface LogEntry {
   /** Applied at least once; a rewind may apply it again. */
   applied: boolean;
   eventState: number;
-  /** The first answer to "is the target ready", for a seek: re-applying reuses it. */
+  /**
+   * The first answer to a check of what the engine holds, which re-applying reuses: "is the target
+   * ready" for a seek or a jump, whether the engine took the change `loop-bounds` named.
+   */
   ready: number;
+  /** A press that starts a deck that is not playing has asked the engine to play; it asks once. */
+  started: boolean;
 }
 
 /**
@@ -88,6 +93,7 @@ export class CommandLog {
       applied: false,
       eventState: EVENT_NONE,
       ready: ANSWER_UNASKED,
+      started: false,
     }));
     for (let i = 0; i < LOG_CAPACITY; i++) this.free[i] = LOG_CAPACITY - 1 - i;
   }
@@ -125,6 +131,7 @@ export class CommandLog {
     entry.applied = false;
     entry.eventState = EVENT_NONE;
     entry.ready = ANSWER_UNASKED;
+    entry.started = false;
     this.order[this.count++] = entry.index;
     return entry;
   }

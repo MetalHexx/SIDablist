@@ -108,7 +108,14 @@ export async function compareRewound(options: ComparisonOptions): Promise<Compar
   for (const index of arrival) {
     straight.send({ ...sent[index], when: { at: 'frame', frame: landings[index] } });
   }
-  await run(straight, options.runMs, [], () => undefined);
+  // It pauses at the moments the other was pressed at, so what the engine builds off the frame
+  // path (a declared target's image) reaches both at the same frame.
+  await run(
+    straight,
+    options.runMs,
+    options.presses.map((press) => press.atMs),
+    () => undefined,
+  );
 
   return {
     rewound,
