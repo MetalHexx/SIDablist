@@ -40,7 +40,16 @@ import {
   UNRESOLVED,
   type LogEntry,
 } from './command-log.js';
-import { DeckState, JUMP, LAST_POSITION, NOT_WAITING, NUDGE, SPEED } from './deck-state.js';
+import {
+  DeckState,
+  HAND_DOWN,
+  HAND_THROWN,
+  JUMP,
+  LAST_POSITION,
+  NOT_WAITING,
+  NUDGE,
+  SPEED,
+} from './deck-state.js';
 import { DrivenClock } from './driven-clock.js';
 import {
   EventQueue,
@@ -51,6 +60,7 @@ import {
   KIND_LOAD_FAILED,
   type QueuedEvent,
 } from './event-queue.js';
+import { DeckHand } from './hand.js';
 import {
   DeckLoops,
   RESOLVED_CANCEL,
@@ -64,6 +74,7 @@ import {
 import { NOTHING_APPLIED, RestoreRing, type RestoreSlot } from './restore-ring.js';
 import { isMainSetting, mutesAsSettings, readMutes, voiceOf, VOICE_COUNT } from './settings.js';
 import { SinkTap } from './sink-tap.js';
+import { DeckSlip } from './slip.js';
 import { effectiveTempo } from './tempo.js';
 
 /** How far ahead a deck with no output renders, in milliseconds. */
@@ -94,9 +105,6 @@ const NO_FRAME = Number.MAX_SAFE_INTEGER;
 
 /** Commands the package does not carry out yet: refused, as a deck refuses what it cannot do. */
 const NOT_AVAILABLE: ReadonlySet<string> = new Set([
-  'hand-touch',
-  'hand-move',
-  'slip',
   'live-loop-size',
   'live-loop',
   'live-loop-end',
@@ -160,6 +168,8 @@ export class Deck {
   private readonly replayRunner: ReplayRunner;
   private readonly prepareRunner: ReplayRunner | undefined;
   private readonly loops: DeckLoops;
+  private readonly slip: DeckSlip;
+  private readonly hand: DeckHand;
 
   private ring: RestoreRing | null = null;
   private output: DeckOutput | null = null;
@@ -210,7 +220,7 @@ export class Deck {
 
   private readonly update: Mutable<DeckUpdate>;
   private lastPictureSnapshot: PlayerSnapshot | null = null;
-  private readonly pictureKey = new Float64Array(9);
+  private readonly pictureKey = new Float64Array(11);
   private pictureError: string | null = null;
   private pictureQueued: JumpTarget | null = null;
   private pictureWaiting: JumpTarget | null = null;
@@ -246,7 +256,9 @@ export class Deck {
       ...(plugs.log === undefined ? {} : { log: plugs.log }),
     });
     this.player.setRepeatTrack(true);
-    this.loops = new DeckLoops(this.player, this.state, this.loopsHost());
+    this.slip = new DeckSlip(this.player, this.state);
+    this.hand = new DeckHand(this.player, this.state, this.slip);
+    this.loops = new DeckLoops(this.player, this.state, this.loopsHost(), this.slip);
     this.update = {
       kind: 'update',
       deck: id,
@@ -274,7 +286,8 @@ export class Deck {
 
   /**
    * Why a command is refused, or null. A press needs a settled deck: not empty, loading or failed.
-   * A load, the deck's own settings and the releases always pass.
+   * A load, the deck's own settings, slip, the hand's moves and the releases always pass: a move
+   * the deck cannot take is ignored when it lands.
    */
   refusal(command: DeckCommand): string | null {
     const kind = command.kind;
@@ -286,7 +299,15 @@ export class Deck {
       kind === 'cancel-queued' ||
       kind === 'let-go' ||
       kind === 'stop-loop';
-    if (release || kind === 'repeat' || kind === 'targets') return null;
+    if (
+      release ||
+      kind === 'repeat' ||
+      kind === 'targets' ||
+      kind === 'slip' ||
+      kind === 'hand-move'
+    ) {
+      return null;
+    }
     if (this.phase !== 'ready') return `${kind} on a deck that is ${this.phase}`;
     if (this.player.getSnapshot().transport === 'error') return `${kind} on a deck that is failed`;
     return null;
@@ -607,8 +628,9 @@ export class Deck {
    * the frame showed: a hand-off or a wrap ends the running loop's pass, a hand-off is the queued
    * target running now (the only way a landing from the queue is learnt), a loop change that is no
    * longer pending has landed, and a waiting seek or jump whose target became ready is fixed to land
-   * on the next frame. The restore point is saved after. The wrap is seen as the playhead moving
-   * back; a lap's phase moves only with it.
+   * on the next frame, and a throw that reached the deck's speed hands the record back. The
+   * restore point is saved after. The wrap is seen as the playhead moving back; a lap's phase
+   * moves only with it.
    */
   private afterTick(frame: number): void {
     const state = this.state;
@@ -634,6 +656,8 @@ export class Deck {
     if (snapshot.loop !== null && position < state.cells[LAST_POSITION]) passEnded = true;
     state.cells[LAST_POSITION] = position;
     if (passEnded) this.resolvePassEnds(frame);
+    const settling = this.hand.afterTick();
+    if (settling !== null) this.settleOn(settling);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -669,7 +693,8 @@ export class Deck {
         break;
       case 'stop':
         this.clearWaiting();
-        this.loops.letGo();
+        this.hand.letGo();
+        this.loops.drop();
         player.stop();
         break;
       case 'seek':
@@ -713,7 +738,7 @@ export class Deck {
         break;
       case 'stop-loop':
         if (this.state.waiting !== null) this.clearWaiting();
-        this.loops.letGo();
+        this.loops.stopLoop();
         break;
       case 'loop-bounds':
         endedLoop = this.loops.loopBounds(entry, command);
@@ -724,8 +749,24 @@ export class Deck {
       case 'capture':
         this.queueCaptured(entry, frame, player.capturePosition());
         break;
+      case 'hand-touch':
+        if (this.phase === 'ready') {
+          this.hand.touch();
+          // A touch on a deck that was not playing started the engine's clock and began its sink.
+          this.afterBegin();
+        }
+        break;
+      case 'hand-move':
+        this.hand.move(command.travelFrames, command.atMs);
+        break;
+      case 'hand-lift':
+        this.hand.lift(command.atMs, command.gripSeconds);
+        break;
+      case 'slip':
+        this.slip.setOn(command.on);
+        break;
       default:
-        // hand-lift is a release with nothing to release yet; the rest never get here.
+        // The rest never get here.
         break;
     }
     this.queueLanded(entry, frame, dueMs);
@@ -798,7 +839,8 @@ export class Deck {
     // Rounded and bounded as the engine rounds a seek, so a frame is the same one wherever it is kept.
     const tuneFrame = tuneFrameOf(asked);
     const target = frames(tuneFrame);
-    this.loops.letGo();
+    this.slip.abandon();
+    this.loops.drop();
     this.clearWaiting();
     if (!this.clock.started || player.getSnapshot().transport !== 'playing') {
       if (!this.supersededSeek(entry)) this.settleOn(player.seek(target));
@@ -1196,7 +1238,8 @@ export class Deck {
     this.ring = null;
     this.runStart = -1;
     if (this.hasTune) {
-      this.loops.letGo();
+      this.hand.letGo();
+      this.loops.drop();
       player.stop();
       const state = this.state;
       state.cells[SPEED] = 1;
@@ -1283,6 +1326,7 @@ export class Deck {
     this.grid = command.grid ?? null;
     player.loadTune(file);
     this.hasTune = true;
+    this.slip.trackLoopStart = command.trackLoop?.loopStartFrame ?? null;
     if (command.subtune !== file.startSong) player.selectSubtune(command.subtune);
     const trackLoop = command.trackLoop;
     player.setTrackStructure(
@@ -1458,6 +1502,7 @@ export class Deck {
     update.intervalUs = this.clock.lastStepUs;
     update.position = position;
     update.lapProgress = this.lapProgress(position);
+    update.slipPosition = this.slip.position();
     this.plugs.report(update);
   }
 
@@ -1489,6 +1534,7 @@ export class Deck {
     const phase =
       this.phase === 'empty' ? 0 : this.phase === 'loading' ? 1 : this.phase === 'failed' ? 2 : 3;
     const slots = this.ring === null ? 0 : this.ring.capacity;
+    const slip = (this.slip.on ? 1 : 0) | (this.slip.departed ? 2 : 0);
     if (
       snapshot === this.lastPictureSnapshot &&
       key[0] === state.speed &&
@@ -1500,6 +1546,8 @@ export class Deck {
       key[6] === slots &&
       key[7] === this.lookaheadMs &&
       key[8] === own &&
+      key[9] === slip &&
+      key[10] === state.handState &&
       this.pictureError === this.error &&
       this.pictureQueued === state.queued &&
       this.pictureWaiting === state.waiting &&
@@ -1517,6 +1565,8 @@ export class Deck {
     key[6] = slots;
     key[7] = this.lookaheadMs;
     key[8] = own;
+    key[9] = slip;
+    key[10] = state.handState;
     this.pictureError = this.error;
     this.pictureQueued = state.queued;
     this.pictureWaiting = state.waiting;
@@ -1580,8 +1630,9 @@ export class Deck {
         pending === null ? null : { startFrame: pending.startFrame, endFrame: pending.endFrame },
       liveLoop: null,
       liveLoopSize: null,
-      slip: { on: false, departed: false },
-      hand: 'up',
+      slip: { on: this.slip.on, departed: this.slip.departed },
+      hand:
+        state.handState === HAND_DOWN ? 'down' : state.handState === HAND_THROWN ? 'thrown' : 'up',
       settingsInPlay: state.ownInPlay ? 'loop' : 'main',
       settings: {
         main: mutesAsSettings(state.mutes),

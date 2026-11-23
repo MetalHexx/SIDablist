@@ -486,3 +486,252 @@ describe('a deck rewound by loop presses at random moments', () => {
     });
   }
 });
+
+/** Loops and a cue inside the first 400 frames, which is as far as the register record the hand and slip work on reaches. */
+const SLIPPED: JumpTarget = { startFrame: 100, endFrame: 117.4 };
+const SLIPPED_B: JumpTarget = { startFrame: 200, endFrame: 210, wraps: true };
+const SLIPPED_CUE: JumpTarget = { startFrame: 300, endFrame: null };
+const SLIP_TARGETS = (deck: DeckId): DeckCommand[] => [
+  { kind: 'targets', deck, frames: [100, 200, 300] },
+];
+
+const touch = (deck: DeckId, rig: Rig): DeckCommand => ({
+  kind: 'hand-touch',
+  deck,
+  atMs: rig.time.ms,
+});
+const moveTo =
+  (travelFrames: number) =>
+  (deck: DeckId, rig: Rig): DeckCommand => ({
+    kind: 'hand-move',
+    deck,
+    travelFrames,
+    atMs: rig.time.ms,
+  });
+const liftWith =
+  (gripSeconds: number) =>
+  (deck: DeckId, rig: Rig): DeckCommand => ({
+    kind: 'hand-lift',
+    deck,
+    atMs: rig.time.ms,
+    gripSeconds,
+  });
+const slipOn =
+  (on: boolean) =>
+  (deck: DeckId): DeckCommand => ({ kind: 'slip', deck, on });
+
+describe('a deck rewound with the hand on the record', () => {
+  it('follows the hand through rewinds while it is down', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      presses: [
+        press(300, touch),
+        press(340, moveTo(4)),
+        press(380, moveTo(-3)),
+        press(420, moveTo(9)),
+        ...rewindsEvery(310, 700, 17),
+      ],
+      runMs: 800,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().timing.rewinds).toBeGreaterThan(10);
+    expect(rewound.picture().hand).toBe('down');
+    expect(straight.picture().hand).toBe('down');
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('plays a throw through rewinds, from the lift to the arrival and the handback', async () => {
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(300, touch),
+        press(330, moveTo(2)),
+        press(350, moveTo(5)),
+        press(370, moveTo(8)),
+        press(390, liftWith(0.2)),
+        ...rewindsEvery(310, 1800, 29),
+      ],
+      runMs: 2000,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().hand).toBe('up');
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('grabs a thrown record again through rewinds', async () => {
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(300, touch),
+        press(320, moveTo(3)),
+        press(340, moveTo(6)),
+        press(360, liftWith(5)),
+        ...rewindsEvery(370, 500, 13),
+        press(520, touch),
+        press(560, moveTo(-2)),
+        ...rewindsEvery(570, 700, 13),
+        press(720, liftWith(0.2)),
+        ...rewindsEvery(730, 1200, 31),
+      ],
+      runMs: 1300,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('stops a record thrown backward at the start of a loop, and wraps one that wraps', async () => {
+    const { difference, rewound } = await compareRewound({
+      prepare: SLIP_TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'key', deck, target: SLIPPED_B })),
+        press(500, touch),
+        press(520, moveTo(-6)),
+        press(540, moveTo(-12)),
+        press(560, liftWith(2)),
+        ...rewindsEvery(570, 900, 19),
+        press(920, (deck) => ({ kind: 'loop-wraps', deck, wraps: false })),
+        press(940, touch),
+        press(960, moveTo(-8)),
+        press(980, moveTo(-20)),
+        press(1000, liftWith(2)),
+        ...rewindsEvery(1010, 1400, 19),
+      ],
+      runMs: 1500,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
+describe('a deck rewound with slip departed', () => {
+  it('lands a loop on the count it would have reached through rewinds, across a queued hand-off', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      prepare: SLIP_TARGETS,
+      presses: [
+        press(150, slipOn(true)),
+        press(200, (deck) => ({ kind: 'key', deck, target: SLIPPED })),
+        ...rewindsEvery(210, 500, 23),
+        press(520, (deck) => ({ kind: 'key', deck, target: SLIPPED_B })),
+        ...rewindsEvery(530, 900, 23),
+        press(920, (deck) => ({ kind: 'let-go', deck })),
+        ...rewindsEvery(930, 1100, 23),
+      ],
+      runMs: 1200,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().slip).toEqual({ on: true, departed: false });
+    expect(rewound.picture().loop).toBeNull();
+    expect(landings(rewound)).toEqual(landings(straight));
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('nests the hand in a loop departure and lands each on its own count through rewinds', async () => {
+    const { difference, rewound } = await compareRewound({
+      prepare: SLIP_TARGETS,
+      presses: [
+        press(150, slipOn(true)),
+        press(200, (deck) => ({ kind: 'key', deck, target: SLIPPED })),
+        ...rewindsEvery(210, 400, 23),
+        press(420, touch),
+        press(450, moveTo(15)),
+        press(480, moveTo(-8)),
+        ...rewindsEvery(490, 600, 17),
+        press(620, liftWith(0.5)),
+        ...rewindsEvery(630, 800, 17),
+        press(820, (deck) => ({ kind: 'stop-loop', deck })),
+        ...rewindsEvery(830, 1000, 17),
+      ],
+      runMs: 1100,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture()).toMatchObject({ slip: { departed: false }, hand: 'up', loop: null });
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('lands a hand on the count with slip on, and throws once slip is off', async () => {
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(150, slipOn(true)),
+        press(300, touch),
+        press(340, moveTo(7)),
+        ...rewindsEvery(350, 500, 19),
+        press(520, liftWith(0.5)),
+        ...rewindsEvery(530, 700, 19),
+        press(720, slipOn(false)),
+        press(740, touch),
+        press(780, moveTo(-4)),
+        press(820, liftWith(0.5)),
+        ...rewindsEvery(830, 1000, 19),
+      ],
+      runMs: 1200,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().slip.on).toBe(false);
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
+describe('a deck rewound by hand and slip presses at random moments', () => {
+  const TARGET_LIST = [SLIPPED, SLIPPED_B, SLIPPED_CUE];
+
+  for (let seed = 1; seed <= 12; seed++) {
+    it(`gives what a straight deck gives (seed ${seed})`, async () => {
+      const next = random(seed * 104729);
+      const presses: Press[] = [];
+      let travel = 0;
+      for (let i = 0, count = 8 + Math.floor(next() * 10); i < count; i++) {
+        const atMs = 100 + Math.floor(next() * 800);
+        const kind = Math.floor(next() * 12);
+        const target = TARGET_LIST[Math.floor(next() * TARGET_LIST.length)];
+        const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
+        travel += Math.floor(next() * 9) - 4;
+        const at = travel;
+        const grip = 0.2 + Math.floor(next() * 5) / 5;
+        const on = next() < 0.5;
+        presses.push(
+          press(atMs, (deck, rig): DeckCommand => {
+            const when =
+              ahead < 0 ? {} : { when: { at: 'frame' as const, frame: nextUnsent(rig) + ahead } };
+            switch (kind) {
+              case 0:
+              case 1:
+                return { ...touch(deck, rig), ...when };
+              case 2:
+              case 3:
+                return { ...moveTo(at)(deck, rig), ...when };
+              case 4:
+                return { ...liftWith(grip)(deck, rig), ...when };
+              case 5:
+                return { kind: 'slip', deck, on, ...when };
+              case 6:
+              case 7:
+                return { kind: 'key', deck, target, ...when };
+              case 8:
+                return { kind: 'let-go', deck, ...when };
+              case 9:
+                return { kind: 'stop-loop', deck, ...when };
+              case 10:
+                return { kind: 'cancel-queued', deck, ...when };
+              default:
+                return { kind: 'nudge', deck, amount: 0, ...when };
+            }
+          }),
+        );
+      }
+
+      const { difference, rewound } = await compareRewound({
+        lookaheadMs: 60 + Math.floor(next() * 3) * 30,
+        prepare: SLIP_TARGETS,
+        presses,
+        runMs: 1400,
+      });
+
+      expect(difference).toBeNull();
+      expect(rewound.warnings).toEqual([]);
+    });
+  }
+});

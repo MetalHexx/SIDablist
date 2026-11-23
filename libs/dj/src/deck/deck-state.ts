@@ -22,7 +22,18 @@ export const SPEED = 3;
 export const NUDGE = 4;
 export const JUMP = 5;
 export const LAST_POSITION = 6;
-const CELL_COUNT = 7;
+/** The hand's doubles: where it anchors the record, where the last tick left the position, how far it moved, the release speed, the grip, the rate. */
+export const HAND_ANCHOR = 7;
+export const HAND_EXPECTED = 8;
+export const HAND_TRAVEL = 9;
+export const HAND_RELEASE_SPEED = 10;
+export const HAND_GRIP = 11;
+export const HAND_RATE = 12;
+/** Where the slip departures' doubles begin: `SLIP_DEPARTURES` runs of `SLIP_CELL_STRIDE`. */
+export const SLIP_CELLS_AT = 13;
+export const SLIP_DEPARTURES = 2;
+export const SLIP_CELL_STRIDE = 5;
+const CELL_COUNT = SLIP_CELLS_AT + SLIP_DEPARTURES * SLIP_CELL_STRIDE;
 
 /** Slots in `DeckState.ints`. */
 const STREAM = 0;
@@ -32,7 +43,24 @@ const WAITING_SEQ = WAITING_FRAME + 1;
 const LAST_HAND_OFFS = WAITING_SEQ + 1;
 const LOOP_MUTES = LAST_HAND_OFFS + 1;
 const OWN_IN_PLAY = LOOP_MUTES + VOICE_COUNT;
-const INT_COUNT = OWN_IN_PLAY + 1;
+const HAND_STATE = OWN_IN_PLAY + 1;
+const HAND_ANCHOR_PENDING = HAND_STATE + 1;
+const HAND_SAMPLE_COUNT = HAND_ANCHOR_PENDING + 1;
+const HAND_SAMPLE_HEAD = HAND_SAMPLE_COUNT + 1;
+const HAND_THROW_STARTED = HAND_SAMPLE_HEAD + 1;
+const SLIP_ON = HAND_THROW_STARTED + 1;
+/** Where the slip departures' ints begin: `SLIP_DEPARTURES` runs of `SLIP_INT_STRIDE`. */
+export const SLIP_INTS_AT = SLIP_ON + 1;
+export const SLIP_INT_STRIDE = 4;
+const INT_COUNT = SLIP_INTS_AT + SLIP_DEPARTURES * SLIP_INT_STRIDE;
+
+/** The hand's states, as `DeckState.handState` holds them. */
+export const HAND_UP = 0;
+export const HAND_DOWN = 1;
+export const HAND_THROWN = 2;
+
+/** The samples the hand keeps for its release speed. */
+export const HAND_SAMPLES = 8;
 
 /** `waitingFrame` and `waitingSeq` while no seek waits for its target. */
 export const NOT_WAITING = -1;
@@ -41,6 +69,8 @@ export const NOT_WAITING = -1;
 export interface DeckStateImage {
   readonly cells: Float64Array;
   readonly ints: Int32Array;
+  readonly handTravels: Float64Array;
+  readonly handTimes: Float64Array;
   snapshot: PlayerSnapshot | null;
   varispeed: boolean;
   queued: JumpTarget | null;
@@ -66,6 +96,11 @@ export interface DeckStateImage {
  *   a command is immutable, and a save allocates nothing;
  * - what the between-tick logic compares against: the engine snapshot last read (by identity), the
  *   hand-offs landed, the playhead last seen;
+ * - the hand: its state, anchor, the position it expects, travel, samples with their count and head,
+ *   release speed, grip, rate and whether the throw has started. The rate source runs inside the
+ *   tick and changes these, so a rewind replays it from the numbers the slot holds;
+ * - slip: whether it is on, and the departure running and the one outside it, each held as numbers
+ *   (kind, queued, the lap it returns into, the count it left) so a save copies and builds nothing;
  * - whether the slot was saved in varispeed, which decides whether a restore into a paused engine
  *   is allowed.
  *
@@ -77,6 +112,9 @@ export interface DeckStateImage {
 export class DeckState implements Saveable<DeckStateImage> {
   readonly cells = new Float64Array(CELL_COUNT);
   readonly ints = new Int32Array(INT_COUNT);
+  /** The hand's samples, travel and host time, as a ring of `HAND_SAMPLES` written from `handSampleHead`. */
+  readonly handTravels = new Float64Array(HAND_SAMPLES);
+  readonly handTimes = new Float64Array(HAND_SAMPLES);
   /** The engine snapshot the between-tick logic last read. */
   snapshot: PlayerSnapshot | null = null;
   varispeed = false;
@@ -171,6 +209,48 @@ export class DeckState implements Saveable<DeckStateImage> {
     return this.ints.subarray(LOOP_MUTES, LOOP_MUTES + VOICE_COUNT);
   }
 
+  /** Where the hand is: `HAND_UP`, `HAND_DOWN` or `HAND_THROWN`. */
+  get handState(): number {
+    return this.ints[HAND_STATE];
+  }
+  set handState(state: number) {
+    this.ints[HAND_STATE] = state;
+  }
+  /** Whether the next rate the hand is asked for is the first since its touch, and sets the anchor. */
+  get handAnchorPending(): boolean {
+    return this.ints[HAND_ANCHOR_PENDING] === 1;
+  }
+  set handAnchorPending(pending: boolean) {
+    this.ints[HAND_ANCHOR_PENDING] = pending ? 1 : 0;
+  }
+  get handSampleCount(): number {
+    return this.ints[HAND_SAMPLE_COUNT];
+  }
+  set handSampleCount(count: number) {
+    this.ints[HAND_SAMPLE_COUNT] = count;
+  }
+  get handSampleHead(): number {
+    return this.ints[HAND_SAMPLE_HEAD];
+  }
+  set handSampleHead(head: number) {
+    this.ints[HAND_SAMPLE_HEAD] = head;
+  }
+  /** Whether the throw's first rate has been asked for. */
+  get handThrowStarted(): boolean {
+    return this.ints[HAND_THROW_STARTED] === 1;
+  }
+  set handThrowStarted(started: boolean) {
+    this.ints[HAND_THROW_STARTED] = started ? 1 : 0;
+  }
+
+  /** Whether slip mode is on. */
+  get slipOn(): boolean {
+    return this.ints[SLIP_ON] === 1;
+  }
+  set slipOn(on: boolean) {
+    this.ints[SLIP_ON] = on ? 1 : 0;
+  }
+
   get lastHandOffs(): number {
     return this.ints[LAST_HAND_OFFS];
   }
@@ -182,6 +262,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     return {
       cells: new Float64Array(CELL_COUNT),
       ints: new Int32Array(INT_COUNT),
+      handTravels: new Float64Array(HAND_SAMPLES),
+      handTimes: new Float64Array(HAND_SAMPLES),
       snapshot: null,
       varispeed: false,
       queued: null,
@@ -195,6 +277,8 @@ export class DeckState implements Saveable<DeckStateImage> {
   saveInto(target: DeckStateImage): void {
     target.cells.set(this.cells);
     target.ints.set(this.ints);
+    target.handTravels.set(this.handTravels);
+    target.handTimes.set(this.handTimes);
     target.snapshot = this.snapshot;
     target.varispeed = this.varispeed;
     target.queued = this.queued;
@@ -207,6 +291,8 @@ export class DeckState implements Saveable<DeckStateImage> {
   restoreFrom(source: DeckStateImage): void {
     this.cells.set(source.cells);
     this.ints.set(source.ints);
+    this.handTravels.set(source.handTravels);
+    this.handTimes.set(source.handTimes);
     this.snapshot = source.snapshot;
     this.varispeed = source.varispeed;
     this.queued = source.queued;

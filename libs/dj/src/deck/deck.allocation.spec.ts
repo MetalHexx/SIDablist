@@ -170,3 +170,103 @@ describe('the frame path with a loop running', () => {
     rig.dispose();
   });
 });
+
+/**
+ * A tick under the hand asks the rate source, which runs inside the engine's tick: it reads and
+ * writes the hand's numbers and allocates nothing of its own. What the pass allocates is what a
+ * loop's does (the boxed doubles the engine hands it and takes back, the update's lap progress
+ * and, while slip counts, its position), so the pass is no longer than a loop's.
+ */
+const HAND_FRAMES = 1_500;
+
+/** A wrapping loop the record can be thrown round for as long as a pass lasts, inside the register record's reach. */
+const WRAPPING: JumpTarget = { startFrame: 100, endFrame: 120, wraps: true };
+
+describe('the frame path with the hand on the record', () => {
+  /** A quiet rig whose deck loops with slip on, so a hand on the record is a nested departure. */
+  async function handOnLoop(): Promise<Rig> {
+    const rig = new Rig({ quiet: true });
+    rig.addDeck('a', { lookaheadMs: 60 });
+    await rig.load('a', 'still-time', { ends: 'playing' });
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(300);
+    rig.send({ kind: 'slip', deck: 'a', on: true });
+    rig.send({ kind: 'key', deck: 'a', target: WRAPPING });
+    await rig.microtasks();
+    rig.advance(100);
+    rig.send({ kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });
+    await rig.microtasks();
+    rig.advance(100);
+    expect(rig.picture().hand).toBe('down');
+    return rig;
+  }
+
+  it('allocates nothing but boxed numbers over the ticks of a hand that holds the record, and of a throw', async () => {
+    const rig = await handOnLoop();
+    const { time, wake } = rig;
+    const sink = rig.sinks.get('a')!;
+    const tick = (): void => {
+      time.ms += 20;
+      sink.advanceTo(time.ms);
+      wake.fire();
+    };
+
+    for (const phase of ['held', 'thrown'] as const) {
+      if (phase === 'thrown') {
+        // With slip on a lift lands the deck on the count; off, it throws. A grip this long keeps
+        // the throw at its release speed for the whole pass.
+        rig.send({ kind: 'slip', deck: 'a', on: false });
+        rig.send({ kind: 'hand-move', deck: 'a', travelFrames: 4, atMs: 100 });
+        rig.send({ kind: 'hand-move', deck: 'a', travelFrames: 8, atMs: 120 });
+        rig.send({ kind: 'hand-lift', deck: 'a', atMs: 130, gripSeconds: 1_000_000 });
+        await rig.microtasks();
+        rig.advance(100);
+        expect(rig.picture().hand).toBe('thrown');
+      }
+      const before = rig.picture().timing.framesDelivered;
+
+      const { heapGrowthBytes, scavenges } = await measureAllocation(
+        () => {
+          for (let i = 0; i < HAND_FRAMES; i++) tick();
+        },
+        { warmup: WARMUP_FRAMES },
+      );
+
+      expect(rig.picture().timing.framesDelivered).toBeGreaterThan(before + HAND_FRAMES);
+      expect(rig.picture().hand).toBe(phase === 'held' ? 'down' : 'thrown');
+      expect(scavenges, `${phase} scavenged`).toBe(0);
+      expect(heapGrowthBytes, `${phase} grew ${heapGrowthBytes}`).toBeLessThan(
+        ALLOCATION_NOISE_BYTES,
+      );
+    }
+    rig.dispose();
+  });
+
+  it('allocates nothing in the saves of presses that rewind a hand that is down', async () => {
+    const rig = await handOnLoop();
+    const { time, wake, dj } = rig;
+    const sink = rig.sinks.get('a')!;
+    // A hand move to where the hand already is: it lands, rewinds and re-renders, and changes
+    // nothing a picture holds.
+    const hold = { kind: 'hand-move', deck: 'a', travelFrames: 0, atMs: 0 } as const;
+
+    const { heapGrowthBytes, scavenges } = await measureAllocation(
+      () => {
+        for (let i = 0; i < PRESSES; i++) {
+          time.ms += 20;
+          sink.advanceTo(time.ms);
+          dj.send(hold);
+          wake.fire();
+        }
+      },
+      { warmup: WARMUP_PRESSES },
+    );
+
+    expect(rig.picture().timing.rewinds).toBeGreaterThan(PRESSES * 4);
+    expect(rig.picture().hand).toBe('down');
+    expect(scavenges).toBe(0);
+    expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+    rig.dispose();
+  });
+});

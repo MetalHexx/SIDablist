@@ -18,8 +18,11 @@ supplies everything environmental.
   `sink-tap.ts` (the engine's `SidSink`, mapping the output's counts onto stream frames),
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
   `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
-  `settings.ts` (the tempo layers, the main settings and the loop's own), and `loops.ts` (`DeckLoops`:
-  jumps, the four-way key press, letting go, edits to the running loop and the loop's own settings).
+  `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
+  jumps, the four-way key press, letting go, edits to the running loop and the loop's own settings),
+  `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
+  the deck's own speed) and `slip.ts` (`DeckSlip`: the departures, the second count and the landing
+  on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends).
 - `src/heavy-work/inline.ts` — `createInlineHeavyWork`, replay and scan on the calling thread, for Node,
   tests and the bench.
 - `src/index.ts` — the main path's public surface. Browser-only files live under `src/browser/` and
@@ -116,6 +119,28 @@ supplies everything environmental.
 - **Ring memory grows with lookahead, tempo and crossing lines.** About 136 KB a slot, one per frame
   the deck can hold at the fastest tempo, plus one; a ring is made off the frame path and rebuilt, not
   grown.
+- **The hand's rate source runs inside the engine's tick.** `VarispeedRateSource` is called by the
+  tick before it moves the record, so it may read the hand's numbers in `DeckState` and the engine's
+  snapshot and nothing else: no allocation, no engine command. The throw reaching the deck's speed
+  is acted on by `DeckHand.afterTick`, between ticks and before the restore point is saved (a rate
+  source or an arrival the slot does not hold replays a frame late). The rate source changes
+  `DeckState` fields itself, which is why a rewind replays it exactly: every field it touches is in
+  the slot.
+- **Slip begins before the engine call that moves the playhead, and the hand's before
+  `enterVarispeed`.** The shadow starts from the player's own position, phase and lap, and
+  varispeed clears the phase (a gate-off still owed after a jump). Begun after, a touch made on the
+  frame of a jump counts a frame off. A loop's departure begins before `setActiveLoop` replaces the
+  loop it returns into, and its landing is marked after.
+- **Slip nests one level.** A live loop or the hand begun inside a running departure keeps it and
+  its count as the outer line, which resumes (the count folded through the ticks the inner ran,
+  lapping the outer's own lap, else the track's) when the inner ends; a third level replaces the
+  outer one; a loop begun inside a departure begins nothing. All of it is in `DeckState` as numbers.
+- **The hand on a stopped record lands every command at the frontier.** The engine refuses every
+  restore into a stopped player, so a command under the hand there lands a lookahead late and
+  `timing.frontierLandings` counts it; a paused record in varispeed rewinds as a playing one does.
+  A throw arriving on a deck that is not playing runs the engine's paused landing, which starts an
+  off-thread jump and returns no promise: the deck follows it with an awaited `seek` to the
+  position and settles, so a `play` sent meanwhile waits and resumes exactly there.
 - **The per-frame path allocates nothing.** Preallocated typed arrays and records, no closures, no
   `for…of` over a `Map`, no `subarray`. `deck/deck.allocation.spec.ts` measures it (it needs
   `--expose-gc`, which `vitest.config.ts` gives the workers). The due time handed to the engine's

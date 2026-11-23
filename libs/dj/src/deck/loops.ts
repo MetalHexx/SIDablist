@@ -4,6 +4,7 @@ import type { DeckCommand, JumpTarget } from '../messages/commands.js';
 import { ANSWER_NO, ANSWER_UNASKED, ANSWER_YES, LOOP_YES, type LogEntry } from './command-log.js';
 import type { DeckState } from './deck-state.js';
 import { mutesAsBooleans, mutesOfSettings, VOICE_COUNT } from './settings.js';
+import type { DeckSlip } from './slip.js';
 
 /** How a `key` press resolved, as the event queue carries it: 0 for a command that is not a key. */
 export const RESOLVED_NONE = 0;
@@ -73,7 +74,7 @@ function canRun(target: JumpTarget): boolean {
  * target is ready, the four-way key press, letting go, edits to the running loop and the loop's own
  * settings. The engine holds the loop itself; this holds what the engine does not say (the target
  * queued and what it carries, the change named, whose settings are in play) in `DeckState`, so a
- * rewind puts it back with the engine.
+ * rewind puts it back with the engine. It tells slip where a loop begins, lands and ends.
  *
  * Every engine call here is made between ticks and from a command that lands through the log. A
  * landing the engine makes inside a tick is learnt afterwards, from the hand-offs it counts.
@@ -86,6 +87,7 @@ export class DeckLoops {
     private readonly player: SidPlayer,
     private readonly state: DeckState,
     private readonly host: LoopsHost,
+    private readonly slip: DeckSlip,
   ) {}
 
   /**
@@ -127,6 +129,7 @@ export class DeckLoops {
       case RESOLVED_CANCEL:
         if (sameTarget(this.state.queued, target)) this.dropQueue();
         if (sameTarget(this.state.waiting, target)) this.host.stopWaiting();
+        this.slip.cancelQueued();
         return false;
       case RESOLVED_QUEUE:
         this.queue(target);
@@ -140,14 +143,35 @@ export class DeckLoops {
   cancelQueued(): void {
     if (this.state.queued !== null) this.dropQueue();
     if (this.state.waiting !== null) this.host.stopWaiting();
+    this.slip.cancelQueued();
+  }
+
+  /**
+   * Stops everything looping and plays straight on: with slip on, the deck lands on the outermost
+   * departure's line first, unless that is the hand's.
+   */
+  stopLoop(): void {
+    this.slip.landOutermost();
+    this.letGo();
+  }
+
+  /**
+   * The DJ lets go of the running loop: with slip on and the loop a departure, the deck lands on
+   * the count slip kept first, then the loop is released as `drop` does. Returns whether a loop
+   * was running.
+   */
+  letGo(): boolean {
+    this.slip.land('loop');
+    return this.drop();
   }
 
   /**
    * Releases the running loop and the target queued behind it, and puts the main settings back on
-   * this frame. The queue goes because with no loop there is no end of pass for it to land at, and
-   * the engine ignores one. A waiting target stays. Returns whether a loop was running.
+   * this frame, with no slip landing (a stop, a seek or a load abandon slip themselves). The queue
+   * goes because with no loop there is no end of pass for it to land at, and the engine ignores
+   * one. A waiting target stays. Returns whether a loop was running.
    */
-  letGo(): boolean {
+  drop(): boolean {
     const player = this.player;
     const state = this.state;
     const looping = player.getSnapshot().loop !== null;
@@ -247,12 +271,16 @@ export class DeckLoops {
       return false;
     }
     const looping = this.player.getSnapshot().loop !== null;
+    const isLoop = target.endFrame !== null;
+    if (isLoop) this.slip.begin('loop');
     this.player.setActiveLoop(loopOf(target));
     this.state.queued = null;
     this.state.queuedSettings = null;
     this.state.pending = null;
     this.swapIn(target, settings);
     this.seek(target, settings);
+    if (isLoop) this.slip.loopLanded();
+    else this.slip.cueLanded();
     return looping;
   }
 
@@ -269,6 +297,8 @@ export class DeckLoops {
     state.queued = null;
     state.queuedSettings = null;
     this.swapIn(target, settings);
+    if (target.endFrame === null) this.slip.cueLanded();
+    else this.slip.loopLanded();
     this.host.jumpLanded(frame, target);
   }
 
@@ -290,6 +320,7 @@ export class DeckLoops {
     const loop = this.player.getSnapshot().loop;
     const settings = this.carriedBy(target);
     if (loop !== null && target.endFrame !== null && sameBounds(loop, target)) {
+      this.slip.begin('loop');
       this.swapIn(target, settings);
       this.seek(target, settings);
       return false;
@@ -299,6 +330,7 @@ export class DeckLoops {
     }
     if (entry.ready === ANSWER_YES) return this.land(target, settings);
     if (this.state.queued !== null) this.dropQueue();
+    if (target.endFrame !== null) this.slip.begin('loop', true);
     this.host.wait(tuneFrameOf(target.startFrame), entry.seq, target, settings);
     return false;
   }
@@ -306,6 +338,7 @@ export class DeckLoops {
   /** Queues `target` in the engine to land at the first wrap whose image is ready; replaces any queued. */
   private queue(target: JumpTarget): void {
     if (!this.runnable(target)) return;
+    if (target.endFrame !== null) this.slip.begin('loop', true);
     this.queueInEngine(target, this.carriedBy(target));
   }
 
