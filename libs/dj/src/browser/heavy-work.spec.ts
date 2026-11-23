@@ -29,14 +29,30 @@ const request = (id: number): ScanRequest => ({
   maxFrames: 100,
 });
 
-function setup(): { workers: FakeWorker[]; heavy: ReturnType<typeof createBrowserHeavyWork> } {
-  const workers: FakeWorker[] = [];
-  const build = (): Worker => {
+type Role = 'replay' | 'prepare' | 'scan';
+
+/** Each role builds its own workers, kept per role so a spec can tell which factory a worker came from. */
+function setup(): {
+  built: Record<Role, FakeWorker[]>;
+  workers: FakeWorker[];
+  heavy: ReturnType<typeof createBrowserHeavyWork>;
+} {
+  const built: Record<Role, FakeWorker[]> = { replay: [], prepare: [], scan: [] };
+  const buildFor = (role: Role) => (): Worker => {
     const worker = new FakeWorker();
-    workers.push(worker);
+    built[role].push(worker);
     return worker as unknown as Worker;
   };
-  return { workers, heavy: createBrowserHeavyWork({ replay: build, prepare: build, scan: build }) };
+  return {
+    built,
+    // The scan workers: what the scanner specs below drive.
+    workers: built.scan,
+    heavy: createBrowserHeavyWork({
+      replay: buildFor('replay'),
+      prepare: buildFor('prepare'),
+      scan: buildFor('scan'),
+    }),
+  };
 }
 
 describe('browser heavy work scanner', () => {
@@ -100,19 +116,22 @@ describe('browser heavy work replay runners', () => {
     expect(bare.prepareRunner).toBeUndefined();
   });
 
-  it('runs a request on the replay worker, built on first use', () => {
-    const workers: FakeWorker[] = [];
-    const heavy = createBrowserHeavyWork({
-      replay: () => {
-        const worker = new FakeWorker();
-        workers.push(worker);
-        return worker as unknown as Worker;
-      },
-      scan: () => new FakeWorker() as unknown as Worker,
-    });
+  it('runs a request on the replay worker, built on first use and no other role', () => {
+    const { built, heavy } = setup();
     const runner = heavy.replayRunner();
-    expect(workers).toHaveLength(0);
+    expect(built.replay).toHaveLength(0);
     void runner.run({ id: 9 } as Parameters<typeof runner.run>[0]);
-    expect(workers[0]?.posted).toEqual([{ id: 9 }]);
+    expect(built.replay[0]?.posted).toEqual([{ id: 9 }]);
+    expect(built.prepare).toHaveLength(0);
+    expect(built.scan).toHaveLength(0);
+  });
+
+  it('runs a prepare request on the prepare worker, not the replay worker', () => {
+    const { built, heavy } = setup();
+    const runner = heavy.prepareRunner?.();
+    void runner?.run({ id: 4 } as Parameters<NonNullable<typeof runner>['run']>[0]);
+    expect(built.prepare[0]?.posted).toEqual([{ id: 4 }]);
+    expect(built.replay).toHaveLength(0);
+    expect(built.scan).toHaveLength(0);
   });
 });

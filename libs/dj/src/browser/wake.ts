@@ -9,7 +9,7 @@ export interface WakeReadings {
   /** Mean time between consecutive beats, in milliseconds; 0 before the second beat. */
   readonly meanGapMs: number;
   readonly worstGapMs: number;
-  /** Beats that came more than twice the period after the one before. */
+  /** Beats that came more than twice the period after the one before (the audio source's period is at least one buffer). */
   readonly lateWakes: number;
   reset(): void;
 }
@@ -117,8 +117,9 @@ export function createBrowserWake(options: BrowserWakeOptions = {}): BrowserWake
   };
 
   const startAudio = (periodUs: number, onWake: () => void): void => {
-    const periodMs = periodUs / 1000;
     const context = new AudioContext();
+    // A buffer is the finest beat the audio source offers, so a gap is late against it, not a shorter period.
+    const periodMs = Math.max(periodUs / 1000, (1000 * AUDIO_BUFFER_FRAMES) / context.sampleRate);
     const processor = context.createScriptProcessor(AUDIO_BUFFER_FRAMES, 1, 1);
     const silence = context.createGain();
     silence.gain.value = 0;

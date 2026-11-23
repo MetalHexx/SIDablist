@@ -141,8 +141,8 @@ export interface DjRemote {
 
 /**
  * The host's side of the carry. It answers the package side's tune requests with
- * `options.fetchTune`, transferring the bytes' buffer: the bytes the host returns are detached
- * from it afterwards, so `fetchTune` must hand over bytes it does not keep.
+ * `options.fetchTune`, sending a copy of the bytes: `fetchTune` may return bytes it keeps. A
+ * `fetchTune` that throws or rejects fails the load with its message.
  */
 export function connectDj(
   port: PortLike,
@@ -160,14 +160,14 @@ export function connectDj(
       const reason = error instanceof Error ? error.message : String(error);
       port.postMessage({ type: 'tune-failed', id, reason } satisfies Wire, []);
     };
-    options.fetchTune(tune).then((bytes) => {
-      if (disposed) return;
-      try {
-        port.postMessage({ type: 'tune-bytes', id, bytes } satisfies Wire, [bytes.buffer]);
-      } catch (error) {
-        fail(error);
-      }
-    }, fail);
+    // Started inside the chain so a `fetchTune` that throws before returning a promise fails the load too.
+    Promise.resolve()
+      .then(() => options.fetchTune(tune))
+      .then((bytes) => {
+        if (disposed) return;
+        port.postMessage({ type: 'tune-bytes', id, bytes } satisfies Wire, []);
+      })
+      .catch(fail);
   };
 
   const detach = listen(port, options.log, 'host side', (wire) => {

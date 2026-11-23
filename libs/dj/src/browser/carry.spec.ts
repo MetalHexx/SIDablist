@@ -11,17 +11,19 @@ import { HoldingSink } from '../testing/holding-sink.js';
 import { INBOUND_SAMPLES } from '../testing/samples.js';
 import { connectDj, serveDj } from './carry.js';
 import type { PortLike } from './carry.js';
-import type { WorkerScope } from './wake.worker.js';
 
-// The type-level proof that the carry's port is satisfied by what it is meant to carry over,
-// checked by `tsc --strict` (the lib build) and never run.
-export function portsSatisfyPortLike(
-  messagePort: MessagePort,
-  worker: Worker,
-  workerScope: WorkerScope,
-): PortLike[] {
-  return [messagePort, worker, workerScope, new MessageChannel().port1];
+/** The part of a dedicated worker's global the carry runs over (`DedicatedWorkerGlobalScope` is not in the DOM lib). */
+interface WorkerScope {
+  postMessage(message: unknown, transfer: Transferable[]): void;
+  addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
+  removeEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
 }
+
+const stubDj = (inbound: DjInbound[] = []): Dj => ({
+  send: (message) => void inbound.push(message),
+  setOutput: () => undefined,
+  dispose: () => undefined,
+});
 
 const tunes = new Map(BUNDLED_TUNES.map((tune) => [tune.id, tune.base64] as const));
 const fetchBundled = (tune: string): Promise<Uint8Array> => {
@@ -88,7 +90,9 @@ async function scenario(
   await loaded();
   side.advance(100);
   await pause();
-  for (const sample of Object.values(INBOUND_SAMPLES)) {
+  // `remove-deck` goes last so every command before it acts on a live deck.
+  const { 'remove-deck': removal, ...others } = INBOUND_SAMPLES;
+  for (const sample of [...Object.values(others), removal]) {
     send(sample);
     await pause();
     side.advance(20);
@@ -108,7 +112,31 @@ function channel(): { host: MessagePort; far: MessagePort } {
 }
 
 describe('the carry across a MessageChannel', () => {
-  it('gives the host the same reports a direct run gives, for every command kind', async () => {
+  it('is satisfied by a MessagePort, a Worker and a worker global', () => {
+    const ports = (messagePort: MessagePort, worker: Worker, scope: WorkerScope): PortLike[] => [
+      messagePort,
+      worker,
+      scope,
+    ];
+    expect(ports).toBeTypeOf('function');
+  });
+
+  it('sends every command kind to the package side unchanged and in order', async () => {
+    const { host, far } = channel();
+    const inbound: DjInbound[] = [];
+    const served = serveDj(far, () => stubDj(inbound));
+    const remote = connectDj(host, { fetchTune: fetchBundled });
+    const samples = Object.values(INBOUND_SAMPLES);
+
+    for (const sample of samples) remote.send(sample);
+    await vi.waitFor(() => expect(inbound).toHaveLength(samples.length));
+
+    expect(inbound).toEqual(samples);
+    remote.dispose();
+    served.dispose();
+  });
+
+  it('gives the host the same reports from a real deck that a direct run gives', async () => {
     const direct: DjReport[] = [];
     const straight = packageSide({
       report: (report) => direct.push(structuredClone(report)),
@@ -165,6 +193,41 @@ describe('the carry across a MessageChannel', () => {
     await vi.waitFor(() => expect(reports.some((r) => r.kind === 'loaded')).toBe(true));
 
     expect(asked).toEqual(['still-time']);
+    remote.dispose();
+    served.dispose();
+  });
+
+  it('lets the host keep the bytes it returns, so the same tune loads again', async () => {
+    const { host, far } = channel();
+    let fetchTune!: (tune: string) => Promise<Uint8Array>;
+    const served = serveDj(far, (plugs) => {
+      fetchTune = plugs.fetchTune;
+      return stubDj();
+    });
+    const kept = new Uint8Array([1, 2, 3, 4]);
+    const remote = connectDj(host, { fetchTune: () => Promise.resolve(kept) });
+
+    expect(await fetchTune('t')).toEqual(new Uint8Array([1, 2, 3, 4]));
+    expect(await fetchTune('t')).toEqual(new Uint8Array([1, 2, 3, 4]));
+    expect(kept.byteLength).toBe(4);
+    remote.dispose();
+    served.dispose();
+  });
+
+  it('fails the load when the host fetch throws before returning a promise', async () => {
+    const { host, far } = channel();
+    let fetchTune!: (tune: string) => Promise<Uint8Array>;
+    const served = serveDj(far, (plugs) => {
+      fetchTune = plugs.fetchTune;
+      return stubDj();
+    });
+    const remote = connectDj(host, {
+      fetchTune: () => {
+        throw new Error('sync boom');
+      },
+    });
+
+    await expect(fetchTune('t')).rejects.toThrow('sync boom');
     remote.dispose();
     served.dispose();
   });

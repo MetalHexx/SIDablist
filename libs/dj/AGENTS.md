@@ -44,7 +44,7 @@ supplies everything environmental.
   says stream frame.
 - Browser globals are allowed only under `src/browser/` (lint ignores it). Nothing outside it imports from it, and the root index never re-exports it. The adapter never requests MIDI access: the permission and the output picker are the application’s.
 - A module worker gets no import map: a worker script that imports a bare `@sidablist/*` specifier needs the app’s bundler, so the app builds core’s `replay.worker` and analysis’s `scan.worker` and passes factories. `wake.worker.ts` imports nothing so it loads as it is, and declares a local shape for `self` because `DedicatedWorkerGlobalScope` is not in the DOM lib.
-- The carry’s wire is plain data (`inbound`, `report`, `fetch-tune`, `tune-bytes`, `tune-failed`); a message added to it joins both `serveDj` and `connectDj`. `connectDj` transfers the bytes `fetchTune` returns, which detaches them on the host.
+- The carry’s wire is plain data (`inbound`, `report`, `fetch-tune`, `tune-bytes`, `tune-failed`); a message added to it joins both `serveDj` and `connectDj`. `connectDj` sends a copy of the bytes `fetchTune` returns, so a host may keep and reuse them.
 - The main path takes the clock, the log, workers and the wake-up through plugs. It reads no clock,
   writes no console and builds no worker.
 - Nothing here names an application, a screen or a product; vocabulary is the DJ's.

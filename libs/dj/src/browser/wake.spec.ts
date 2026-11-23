@@ -156,6 +156,7 @@ describe('audio wake', () => {
   class FakeContext {
     static last: FakeContext | null = null;
     state = 'suspended';
+    sampleRate = 44100;
     resumed = false;
     closed = false;
     readonly destination = {};
@@ -211,5 +212,25 @@ describe('audio wake', () => {
     wake.stop();
     expect(context.closed).toBe(true);
     expect(context.processor.onaudioprocess).toBeNull();
+  });
+
+  it('judges a late beat against the buffer when the period asked for is finer than it', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('AudioContext', FakeContext);
+    const now = vi.spyOn(performance, 'now');
+    const wake = createBrowserWake({ source: 'audio' });
+    wake.start(1000, () => undefined);
+    const beat = FakeContext.last!.processor.onaudioprocess as () => void;
+
+    // A healthy buffer (about 5.8 ms) is not late against a 1 ms period; over two buffers is.
+    for (const at of [0, 5.8, 11.6]) {
+      now.mockReturnValue(at);
+      beat();
+    }
+    expect(wake.readings.lateWakes).toBe(0);
+    now.mockReturnValue(11.6 + 12);
+    beat();
+    expect(wake.readings.lateWakes).toBe(1);
+    wake.stop();
   });
 });

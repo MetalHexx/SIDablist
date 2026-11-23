@@ -1,7 +1,10 @@
 // Imports nothing, so a module worker loads it without an import map or a bundler.
 
+// Keeps this file a module, so its top-level names do not join the global scope.
+export {};
+
 /** The part of a dedicated worker's global this script uses. `DedicatedWorkerGlobalScope` is not in the DOM lib. */
-export interface WorkerScope {
+interface WorkerScope {
   postMessage(message: unknown): void;
   addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
   removeEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
