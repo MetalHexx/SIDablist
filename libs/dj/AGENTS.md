@@ -183,9 +183,9 @@ supplies everything environmental.
   `--expose-gc`, which `vitest.config.ts` gives the workers). The due time handed to the engine's
   clock callback is a fractional double V8 boxes, which the specs' budgets allow for. A running loop
   adds the `lapProgress` of each update, boxed the same way, and for a length that is not whole the
-  lap phase and length it is worked out from, which the loop specs' shorter pass allows for. A landing the engine makes is read
-  after the tick from `tune.handOffs` with number compares and builds nothing but the picture and
-  the event it reports.
+  lap phase and length it is worked out from, which the loop specs' shorter pass allows for. A
+  landing the engine makes is read after the tick from `tune.handOffs` with number compares and
+  builds nothing but the picture and the event it reports.
 
 ## When a change here ripples
 
@@ -209,7 +209,7 @@ supplies everything environmental.
   included. Detail: [`src/proof/determinism.spec.ts`](./src/proof/determinism.spec.ts)
 - **Changed `libs/asid`'s sink (`passedCount`, `replaceFrom`, `deliver`, `reset`)?** This package takes
   `@sidablist/asid` as a dev dependency for one spec, and a deck's rewind rests on those counts. Run
-  `pnpm --filter @sidablist/dj test`.
+  `pnpm --filter @sidablist/dj test`. Detail: [`src/proof/asid-sink.spec.ts`](./src/proof/asid-sink.spec.ts)
 
 ## Commands
 

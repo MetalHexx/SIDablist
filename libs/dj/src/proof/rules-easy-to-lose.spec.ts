@@ -79,10 +79,16 @@ describe('presses and releases', () => {
     const failed = new Rig();
     failed.addDeck('a');
     await failed.load('a', 'not-a-tune');
+    // A deck that holds a tune and is loading another: only its phase refuses a press.
+    const reloading = await playing([500]);
+    const swap = reloading.holdFetch('insid3-out');
+    reloading.send({ kind: 'load', deck: 'a', tune: 'insid3-out', subtune: 1, ends: 'playing' });
+    await reloading.microtasks();
 
     for (const [name, rig] of [
       ['empty', empty],
       ['loading', loading],
+      ['loading', reloading],
       ['failed', failed],
     ] as const) {
       expect(rig.picture().transport, name).toBe(name);
@@ -98,17 +104,19 @@ describe('presses and releases', () => {
       expect(
         rig.warnings.filter((line) => line.includes('refused')).length,
         `presses on a deck that is ${name}`,
-      ).toBeGreaterThanOrEqual(PRESSES.length - 1);
+      ).toBe(PRESSES.length);
     }
     slow.release();
+    swap.release();
     await loading.settle();
+    await reloading.settle();
 
     // A settled deck takes the presses.
     const settled = await playing([500]);
     settled.warnings.length = 0;
     for (const command of PRESSES.slice(1, 4)) await send(settled, command);
     expect(settled.warnings).toEqual([]);
-    for (const rig of [empty, loading, failed, settled]) rig.dispose();
+    for (const rig of [empty, loading, reloading, failed, settled]) rig.dispose();
   });
 });
 
@@ -125,6 +133,12 @@ describe('a load', () => {
     await rig.settle();
     rig.advance(100);
     expect(rig.picture().tempo.effective).toBe(1.3);
+    // The hand goes down before the loop starts, so both are in play at the load.
+    await send(rig, { kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });
+    rig.advance(60);
+    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    rig.advance(100);
+    expect(rig.picture()).toMatchObject({ hand: 'down', loop: { startFrame: 500, endFrame: 520 } });
 
     const slow = rig.holdFetch('insid3-out');
     rig.send({ kind: 'load', deck: 'a', tune: 'insid3-out', subtune: 1, ends: 'playing' });
@@ -136,6 +150,8 @@ describe('a load', () => {
     expect(waiting.tempo).toEqual({ speed: 1, nudge: 0, jump: 0, effective: 1 });
     expect(waiting.settings.main.every((setting) => setting.value === 0)).toBe(true);
     expect(waiting.readyFrames).toEqual([]);
+    expect(waiting.loop).toBeNull();
+    expect(waiting.hand).toBe('up');
 
     slow.fail(new Error('gone'));
     await rig.settle();
@@ -143,6 +159,7 @@ describe('a load', () => {
     expect(failed.transport).toBe('failed');
     expect(failed.tempo.effective).toBe(1);
     expect(failed.loop).toBeNull();
+    expect(failed.hand).toBe('up');
     expect(failed.settings.main.every((setting) => setting.value === 0)).toBe(true);
     rig.dispose();
   });
@@ -210,9 +227,10 @@ describe('an edit to a running loop', () => {
     expect(Math.max(...playhead(rig, edit.frame, edit.frame + 2))).toBeLessThan(520);
 
     rig.advance(100);
-    await send(rig, { kind: 'loop-wraps', deck: 'a', wraps: false });
-    // At once: no wait, and the edit still pending behind it.
+    // The loop does not wrap until now; the change shows on the picture with the edit still pending.
     expect(rig.picture().loop?.wraps).toBe(false);
+    await send(rig, { kind: 'loop-wraps', deck: 'a', wraps: true });
+    expect(rig.picture().loop?.wraps).toBe(true);
     expect(rig.picture().pendingBounds).not.toBeNull();
 
     rig.advance(600);
@@ -299,7 +317,7 @@ describe('the live looper', () => {
   });
 
   it('puts the loop underneath back before landing when it ends, so its count does not start again', async () => {
-    const UNDER: JumpTarget = { startFrame: 100, endFrame: 140 };
+    const UNDER: JumpTarget = { startFrame: 100, endFrame: 117.4 };
     const rig = new Rig();
     for (const id of ['a', 'c']) {
       rig.addDeck(id, { lookaheadMs: 60 });
@@ -320,20 +338,22 @@ describe('the live looper', () => {
 
     rig.send({ kind: 'live-loop-end', deck: 'a' });
     await rig.microtasks();
-    rig.advance(300);
+    rig.advance(1300);
 
     // The deck that ended the live loop carries on exactly where the one that only lapped it is.
+    // The loop's length is not whole, so a count started again shows in the frames that follow.
     const ended = rig.landed('live-loop-end')[0].frame;
     const heads = (id: string): Map<number, number> =>
       new Map(rig.ofKind('update', id).map((update) => [update.streamFrame, update.position]));
     const mine = heads('a');
     const theirs = heads('c');
-    for (let frame = ended + 1; frame < ended + 16; frame++) {
+    for (let frame = ended + 1; frame < ended + 60; frame++) {
+      expect(mine.get(frame), `frame ${frame}`).toBeDefined();
       expect(mine.get(frame), `frame ${frame}`).toBe(theirs.get(frame));
     }
     expect(rig.picture('a')).toMatchObject({
       liveLoop: null,
-      loop: { startFrame: 100, endFrame: 140 },
+      loop: { startFrame: 100, endFrame: 117.4 },
     });
     rig.dispose();
   });
