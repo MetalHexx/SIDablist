@@ -21,7 +21,7 @@ async function bareFrames(
   tune: string,
   speed: number,
   dueTimes: readonly number[],
-): Promise<WireFrame[]> {
+): Promise<{ readonly frames: WireFrame[]; readonly effectiveIntervalUs: number }> {
   const sink = new FakeSink();
   const clock = new FakeClock();
   const player = createSidPlayer({
@@ -37,8 +37,9 @@ async function bareFrames(
   player.setTargetClock(PAL_PHI2_HZ);
   player.setTempo(speed);
   await player.play();
+  const effectiveIntervalUs = player.getSnapshot().tempo.effectiveIntervalUs;
   for (const due of dueTimes) clock.tick(milliseconds(due));
-  return sink.deliveredFrames.map((item): WireFrame => ({
+  const frames = sink.deliveredFrames.map((item): WireFrame => ({
     kind: 'frame',
     frameNumber: item.frameNumber,
     dueAtMs: item.dueAtMs,
@@ -46,6 +47,7 @@ async function bareFrames(
     registers: Array.from(item.frame.registers.subarray(0, item.frame.count)),
     values: Array.from(item.frame.values.subarray(0, item.frame.count)),
   }));
+  return { frames, effectiveIntervalUs };
 }
 
 describe('a deck with no commands', () => {
@@ -59,12 +61,21 @@ describe('a deck with no commands', () => {
         const delivered = rig.frames().slice(0, FRAMES);
         expect(delivered).toHaveLength(FRAMES);
 
-        const bare = await bareFrames(
+        const { frames: bare, effectiveIntervalUs } = await bareFrames(
           tune.id,
           speed,
           delivered.map((frame) => frame.dueAtMs),
         );
         expect(firstFrameDifference(delivered, bare)).toBeNull();
+
+        // The bare engine was ticked at the deck's own due times, so that half of the comparison
+        // is circular; the engine's interval is the independent check on their spacing.
+        let worst = 0;
+        for (let i = 1; i < delivered.length; i++) {
+          const step = delivered[i].dueAtMs - delivered[i - 1].dueAtMs;
+          worst = Math.max(worst, Math.abs(step - effectiveIntervalUs / 1000));
+        }
+        expect(worst).toBeLessThan(1e-6);
         rig.dispose();
       });
     }

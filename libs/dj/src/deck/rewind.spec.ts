@@ -113,6 +113,26 @@ describe('a deck rewound against a deck that ran straight', () => {
     expect(tempo.effective).toBeCloseTo(1.3);
   });
 
+  it('stops on the frame it lands on, alone and after a speed change', async () => {
+    const alone = await compareRewound({
+      presses: [press(300, (deck) => ({ kind: 'stop', deck }))],
+      runMs: 600,
+    });
+    expect(alone.difference).toBeNull();
+    expect(alone.rewound.picture().transport).toBe('stopped');
+
+    const afterSpeed = await compareRewound({
+      tune: 'insid3-out',
+      presses: [
+        press(200, (deck) => ({ kind: 'speed', deck, value: 1.25 })),
+        press(400, (deck) => ({ kind: 'stop', deck })),
+      ],
+      runMs: 600,
+    });
+    expect(afterSpeed.difference).toBeNull();
+    expect(afterSpeed.rewound.picture().transport).toBe('stopped');
+  });
+
   it('turns repeat off and on', async () => {
     const { difference, rewound } = await compareRewound({
       presses: [

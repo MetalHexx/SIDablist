@@ -78,7 +78,10 @@ async function run(
  * Runs the same tune on two decks and compares what reached their sinks, frame for frame, due
  * times and frame numbers included. The first deck takes each press at `now`, in the middle of
  * the frames it holds, so every press rewinds. The second never rewinds: it is given every command
- * up front at the frame the first one landed it on, and renders straight through.
+ * up front at the frame the first one landed it on, and renders straight through. Because the
+ * second is sent every command up front and only advanced, it cannot express a command that
+ * restarts a halted deck (a `play` after a `pause` or `stop`) or a seek to a frame with no prepared
+ * image. `deck/deck.spec.ts` exercises both, though not frame for frame against a straight deck.
  */
 export async function compareRewound(options: ComparisonOptions): Promise<Comparison> {
   const rewound = new Rig(options.rig);
