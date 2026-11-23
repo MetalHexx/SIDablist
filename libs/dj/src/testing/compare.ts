@@ -144,3 +144,51 @@ export function firstDifference(a: readonly WireEvent[], b: readonly WireEvent[]
   }
   return null;
 }
+
+/** Spec-only. What `firstFrameDifference` looks at. */
+export interface FrameDifferenceOptions {
+  /** Compare due times and catch-up marks as well as the frame number, registers and values. Default true. */
+  readonly dueTimes?: boolean;
+}
+
+/**
+ * Describes where two wires first differ, naming the frame and the register, or null when they
+ * are the same: a regression then points at the frame it began on.
+ */
+export function firstFrameDifference(
+  a: readonly WireEvent[],
+  b: readonly WireEvent[],
+  options: FrameDifferenceOptions = {},
+): string | null {
+  const dueTimes = options.dueTimes ?? true;
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    const left = a[i];
+    const right = b[i];
+    if (left === undefined || right === undefined) {
+      return `item ${i}: one run ended (${a.length} against ${b.length} items)`;
+    }
+    if (left.kind !== right.kind) return `item ${i}: a ${left.kind} against a ${right.kind}`;
+    if (left.kind === 'begin' || left.kind === 'end') continue;
+    const other = right as typeof left;
+    if (left.frameNumber !== other.frameNumber) {
+      return `item ${i}: frame ${left.frameNumber} against frame ${other.frameNumber}`;
+    }
+    const writes = Math.max(left.registers.length, other.registers.length);
+    for (let j = 0; j < writes; j++) {
+      if (left.registers[j] !== other.registers[j] || left.values[j] !== other.values[j]) {
+        return (
+          `frame ${left.frameNumber} (item ${i}) write ${j}: register ${left.registers[j]} = ` +
+          `${left.values[j]} against register ${other.registers[j]} = ${other.values[j]}`
+        );
+      }
+    }
+    if (dueTimes && left.dueAtMs !== other.dueAtMs) {
+      return `frame ${left.frameNumber} (item ${i}): due at ${left.dueAtMs} ms against ${other.dueAtMs} ms`;
+    }
+    if (dueTimes && left.catchUpClamped !== other.catchUpClamped) {
+      return `frame ${left.frameNumber} (item ${i}): catch-up mark ${left.catchUpClamped} against ${other.catchUpClamped}`;
+    }
+  }
+  return null;
+}

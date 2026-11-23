@@ -19,7 +19,7 @@ supplies everything environmental.
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
   `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
   `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
-  jumps, the four-way key press, letting go, edits to the running loop and the loop's own settings),
+  jumps, the key press, letting go, edits to the running loop and the loop's own settings),
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
   the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
   on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
@@ -34,8 +34,12 @@ supplies everything environmental.
   main-path check. `harness.ts` (fake time, a manual wake, a `Rig` over `createDj`), `holding-sink.ts`
   (a sink that holds frames until its time passes them), `compare.ts` (a straight deck against a
   rewound one), `measure-allocation.ts` (a copy of core's, which core does not export).
-  `src/__fixtures__/` holds the two tunes cleared for redistribution; no other HVSC tune goes in the
-  repo.
+  `src/__fixtures__/` holds the tunes cleared for redistribution (`still-time`, `insid3-out`); no
+  other HVSC tune goes in the repo.
+- `src/proof/` — specs only, across the whole package: `equivalence.spec.ts` (a deck against a bare
+  engine, and two decks told the same commands), `determinism.spec.ts` (a run replayed from its
+  `landed` events), `asid-sink.spec.ts` (the real ASID sink over a fake port) and
+  `rules-easy-to-lose.spec.ts` (the behaviours a rewrite drops quietly).
 
 ## Conventions
 
@@ -100,7 +104,7 @@ supplies everything environmental.
   prepared, so a re-render would find a waiting target ready earlier than it first was. A waiting
   seek's or jump's landing frame is fixed once, when it is first seen ready, and a re-render lands
   it there.
-- **The four-way press is resolved at its landing frame.** A `key` is a start, a queue, a cancel or a
+- **A key press is resolved at its landing frame.** A `key` is a start, a queue, a cancel or a
   let-go by what the deck holds on the frame it lands on, never by what it held when it was sent, so
   a replay at that frame (`fixed` is always `{ at: 'frame' }` for it) resolves the same way. A
   `jump` sent for `pass-end` is the exception: it lands on its `from` frame and the engine's queue
@@ -122,9 +126,20 @@ supplies everything environmental.
 - **`play()` settles asynchronously, so await it.** It sets the transport only after its clock start
   resolves; a `pause()` any earlier does nothing. Every engine call that returns a promise is awaited,
   and the deck renders nothing and holds later commands until it settles.
-- **Ring memory grows with lookahead, tempo and crossing lines.** About 136 KB a slot, one per frame
-  the deck can hold at the fastest tempo, plus one; a ring is made off the frame path and rebuilt, not
-  grown.
+- **A sink that holds nothing never rewinds a frame.** The real ASID sink's `passedCount()` is its
+  deliveries and `replaceFrom` returns it, so a command lands on the next frame to render and nothing
+  is redone. A sink that reports fewer frames passed than it was handed makes the deck re-render
+  frames the far end already has: duplicated on the wire, with no error. `proof/asid-sink.spec.ts`
+  catches it.
+- **A replay is exact from `fixed`, and from nothing else.** A `landed` event's `fixed` is
+  `{ at: 'pass-end', from }` for a jump taken at the end of a pass; replayed as a frame it queues
+  nothing and plays another run. Due times are exact only across stretches with no resume (`play`
+  after a pause) and no catch-up skip, since both take theirs from `time.now()`; registers, values and
+  frame numbers always agree. A replay sends every command ahead of its frame, so a halt landing
+  ahead must drop no held frame before it.
+- **Ring memory grows with lookahead, tempo and crossing lines.** A slot holds a whole engine state,
+  one per frame the deck can hold at the fastest tempo, plus one; a ring is made off the frame path
+  and rebuilt, not grown.
 - **Crossing lines rebuild the ring.** The grid and the kept live-loop size decide which lines the
   engine saves images at (`setCrossingCaptures`), and a restore point is only good for the lines it
   was saved under, so declaring new ones makes the restore ring again, between ticks and after the
@@ -166,10 +181,9 @@ supplies everything environmental.
 - **The per-frame path allocates nothing.** Preallocated typed arrays and records, no closures, no
   `for…of` over a `Map`, no `subarray`. `deck/deck.allocation.spec.ts` measures it (it needs
   `--expose-gc`, which `vitest.config.ts` gives the workers). The due time handed to the engine's
-  clock callback is a fractional double V8 boxes: about 16 bytes a frame, which the specs' budgets
-  allow for. A running loop adds the `lapProgress` of each update, boxed the same way, and for a
-  length that is not whole the lap phase and length it is worked out from: up to about 70 bytes a
-  frame in all, which the loop specs' shorter pass allows for. A landing the engine makes is read
+  clock callback is a fractional double V8 boxes, which the specs' budgets allow for. A running loop
+  adds the `lapProgress` of each update, boxed the same way, and for a length that is not whole the
+  lap phase and length it is worked out from, which the loop specs' shorter pass allows for. A landing the engine makes is read
   after the tick from `tune.handOffs` with number compares and builds nothing but the picture and
   the event it reports.
 
@@ -182,10 +196,20 @@ supplies everything environmental.
   `messages/round-trip.spec.ts`, and update the adapter (`src/browser/carry.ts`). Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
-  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
+  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/hand.ts`, `deck/slip.ts`,
+  `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)
+
+- **Changed what a deck delivers: a landing rule, `fixed`, the `landed` event, the sink tap, or how
+  the deck reads a sink's `passedCount` and `replaceFrom` (`deck/`, `testing/holding-sink.ts`)?**
+  Unit specs can stay green while a deck stops matching a bare engine, a replay of its own run, or
+  the real ASID sink, and those fail by frame and register. Run the whole package's tests, `proof/`
+  included. Detail: [`src/proof/determinism.spec.ts`](./src/proof/determinism.spec.ts)
+- **Changed `libs/asid`'s sink (`passedCount`, `replaceFrom`, `deliver`, `reset`)?** This package takes
+  `@sidablist/asid` as a dev dependency for one spec, and a deck's rewind rests on those counts. Run
+  `pnpm --filter @sidablist/dj test`.
 
 ## Commands
 
