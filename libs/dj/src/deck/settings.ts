@@ -53,5 +53,7 @@ export function mutesOfSettings(settings: readonly NumberedSetting[]): boolean[]
 
 /** `mutes` (one 0 or 1 a voice) as one boolean a voice. */
 export function mutesAsBooleans(mutes: Int32Array): boolean[] {
-  return Array.from(mutes.subarray(0, VOICE_COUNT), (m) => m === 1);
+  const muted = new Array<boolean>(VOICE_COUNT);
+  for (let voice = 0; voice < VOICE_COUNT; voice++) muted[voice] = mutes[voice] === 1;
+  return muted;
 }
