@@ -7,7 +7,14 @@
 /** Names one deck among those a host has added. */
 export type DeckId = string;
 
-/** When a command lands. The package fixes it to a stream frame when it receives the command. */
+/**
+ * When a command lands. The package fixes it to a stream frame when it receives the command.
+ *
+ * A deck keeps at most 256 commands that the sink has not yet passed (a burst in one turn, or
+ * automation laid out ahead at `frame`). Past that, a `speed`, `nudge`, `speed-jump`, `loop-wraps`
+ * or `setting` that lands on the same frame as, and straight after, one of its own kind replaces it,
+ * so the latest value counts; any other command is refused and the log plug is told.
+ */
 export type When =
   /** The next frame not yet sent. */
   | { readonly at: 'now' }

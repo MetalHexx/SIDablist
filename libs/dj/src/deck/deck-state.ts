@@ -8,7 +8,7 @@ import { VOICE_COUNT } from './settings.js';
  * in the package's own terms (core does not export it): `createState` allocates, off the tick;
  * `saveInto` and `restoreFrom` allocate nothing and call nothing.
  */
-export interface Saveable<S> {
+interface Saveable<S> {
   createState(): S;
   saveInto(target: S): void;
   restoreFrom(source: S): void;
@@ -31,7 +31,7 @@ export const HAND_GRIP = 11;
 export const HAND_RATE = 12;
 /** Where the slip departures' doubles begin: `SLIP_DEPARTURES` runs of `SLIP_CELL_STRIDE`. */
 export const SLIP_CELLS_AT = 13;
-export const SLIP_DEPARTURES = 2;
+const SLIP_DEPARTURES = 2;
 export const SLIP_CELL_STRIDE = 5;
 /** The live loop's doubles; each holds `NaN` while it has nothing to say. */
 const LIVE_START = SLIP_CELLS_AT + SLIP_DEPARTURES * SLIP_CELL_STRIDE;

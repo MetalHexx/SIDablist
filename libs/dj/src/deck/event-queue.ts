@@ -1,5 +1,5 @@
 /** How many events a deck queues before it drops the newest. */
-export const EVENT_CAPACITY = 256;
+const EVENT_CAPACITY = 256;
 
 export const KIND_LANDED = 0;
 export const KIND_LOADED = 1;

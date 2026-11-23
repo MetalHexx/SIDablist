@@ -120,6 +120,19 @@ supplies everything environmental.
   A jump now that replaces the loop drops the queue on purpose; a stab (`seek` alone) and a change of
   wrap (`setActiveLoop` with the same bounds, then `queueJump` and `changeLoopAt` again) keep them.
   A new caller that sets the loop and forgets to re-queue loses a queued jump with no error.
+- **A frame past the tune is refused at the deck, not the validator.** A seek, a `jump` or `key`
+  target's start and a `loop-bounds` start above the greatest of the engine's jump ceiling, the
+  position basis and the tune's own length are refused with a reason (`Deck.refusal`); a `targets`
+  list drops such frames with a warning (`Deck.receive`). The engine clamps nothing there and replays
+  from the start of the tune at a cost linear in the frame, which with the inline heavy work blocks
+  the caller and with workers holds the deck (`settling`) until the replay ends. `validateInbound`
+  is stateless and knows no tune, so the bound cannot live there.
+- **The command log holds 256 entries, and a flood loses what is not sweepable.** An entry goes
+  once the sink has passed its frame, so a sustained control stream never reaches the cap; a burst of
+  more than 256 in one turn, or automation laid out ahead, does. At the cap a `speed`, `nudge`,
+  `speed-jump`, `loop-wraps` or `setting` (same setting number) landing on the same frame as the
+  newest entry, not yet flushed, replaces it so the latest value survives; any other command is
+  refused with a warning to the log plug, which a host with no `log` plug never sees.
 - **Seeks never replay off-thread while playing.** A seek to a frame the engine holds no image for is
   declared and waited for, because a replay's landing time would depend on the worker and break
   determinism.

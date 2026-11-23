@@ -3,7 +3,7 @@ import type { DeckStateImage } from './deck-state.js';
 import { MAX_TEMPO } from './tempo.js';
 
 /** The memory one slot holds: about 136 KB, the engine's machine image and loop-entry image. */
-export const SLOT_BYTES = 136 * 1024;
+const SLOT_BYTES = 136 * 1024;
 
 /** `appliedThrough` of a slot saved before any command ran at its next frame. */
 export const NOTHING_APPLIED = -1;

@@ -14,6 +14,7 @@ import type { DeckCommand } from '../messages/commands.js';
 import { compareRewound } from '../testing/compare.js';
 import { Rig, multiSongTune } from '../testing/harness.js';
 import { HoldingSink } from '../testing/holding-sink.js';
+import { LOG_CAPACITY } from './command-log.js';
 import type { Deck } from './deck.js';
 
 /** The stream frame of the next frame the rig's sink has not passed. */
@@ -581,11 +582,40 @@ describe('the command log', () => {
     await rig.load('a', 'still-time', { ends: 'playing' });
     rig.advance(300);
     // Every press lands on a frame the sink has not passed, so none can be dropped yet.
-    for (let i = 0; i < 300; i++) rig.send({ kind: 'nudge', deck: 'a', amount: 0 });
+    for (let i = 0; i < 300; i++) rig.send({ kind: 'cancel-queued', deck: 'a' });
     await rig.microtasks();
 
     expect(rig.warnings.length).toBeGreaterThan(0);
     expect(rig.warnings[0]).toContain('the command log of deck a is full');
+    rig.dispose();
+  });
+
+  it('keeps the latest value of a fast control once it is full', async () => {
+    const rig = new Rig();
+    rig.addDeck('a', { lookaheadMs: 120 });
+    await rig.load('a', 'still-time', { ends: 'playing' });
+    rig.advance(300);
+    for (let i = 0; i < LOG_CAPACITY + 44; i++) {
+      rig.send({ kind: 'speed', deck: 'a', value: i === LOG_CAPACITY + 43 ? 1.5 : 0.5 + i / 1000 });
+    }
+    await rig.microtasks();
+
+    expect(rig.warnings).toEqual([]);
+    expect(rig.picture().tempo.speed).toBe(1.5);
+    rig.dispose();
+  });
+
+  it("refuses a full log's command that is not the same control as the one before it", async () => {
+    const rig = new Rig();
+    rig.addDeck('a', { lookaheadMs: 120 });
+    await rig.load('a', 'still-time', { ends: 'playing' });
+    rig.advance(300);
+    for (let i = 0; i < LOG_CAPACITY - 1; i++) rig.send({ kind: 'cancel-queued', deck: 'a' });
+    rig.send({ kind: 'setting', deck: 'a', setting: 1, value: 1 });
+    rig.send({ kind: 'setting', deck: 'a', setting: 2, value: 1 });
+    await rig.microtasks();
+
+    expect(rig.warnings).toEqual(['dj: refused setting: the command log of deck a is full']);
     rig.dispose();
   });
 
@@ -1000,6 +1030,67 @@ describe('the end of a pass', () => {
     expect(second.command).toMatchObject({ frame: 3000 });
     expect(second.frame).toBe(first.frame);
     expect(rig.frames()[first.frame].frameNumber).toBe(3000);
+    rig.dispose();
+  });
+});
+
+describe('frames past the end of the tune', () => {
+  const FAR = 5_000_000;
+
+  it('refuses a seek, a jump, a key and a loop edit to one, and the deck keeps rendering', async () => {
+    const rig = new Rig();
+    rig.addDeck('a', { lookaheadMs: 120 });
+    await rig.load('a', 'still-time', { ends: 'playing' });
+    rig.advance(100);
+
+    rig.send({ kind: 'seek', deck: 'a', frame: FAR });
+    rig.send({ kind: 'jump', deck: 'a', target: { startFrame: FAR, endFrame: null } });
+    rig.send({ kind: 'key', deck: 'a', target: { startFrame: FAR, endFrame: FAR + 100 } });
+    rig.send({ kind: 'loop-bounds', deck: 'a', startFrame: FAR, endFrame: FAR + 100 });
+    await rig.microtasks();
+
+    expect(rig.warnings).toHaveLength(4);
+    for (const kind of ['seek', 'jump', 'key', 'loop-bounds']) {
+      expect(rig.warnings.some((w) => w.startsWith(`dj: refused ${kind}: frame ${FAR}`))).toBe(
+        true,
+      );
+    }
+    expect(rig.landed().map((event) => event.command.kind)).toEqual(['load']);
+    const before = rig.frames().length;
+    rig.advance(100);
+    expect(rig.frames().length).toBeGreaterThan(before);
+    rig.dispose();
+  });
+
+  it('refuses a seek on a paused deck without settling on it', async () => {
+    const rig = new Rig();
+    rig.addDeck('a');
+    await rig.load('a', 'still-time', { ends: 'paused' });
+
+    rig.send({ kind: 'seek', deck: 'a', frame: FAR });
+    rig.send({ kind: 'seek', deck: 'a', frame: 300 });
+    await rig.settle();
+
+    expect(rig.warnings).toHaveLength(1);
+    expect(rig.landed('seek').map((event) => event.command)).toEqual([
+      { kind: 'seek', deck: 'a', frame: 300 },
+    ]);
+    rig.dispose();
+  });
+
+  it('drops the far frames of a target list and keeps the rest', async () => {
+    const rig = new Rig();
+    rig.addDeck('a');
+    await rig.load('a', 'still-time', { ends: 'paused' });
+
+    rig.send({ kind: 'targets', deck: 'a', frames: [300, FAR, 600] });
+    await rig.settle();
+
+    expect(rig.warnings).toHaveLength(1);
+    expect(rig.warnings[0]).toContain('dropped 1 frame(s)');
+    expect(rig.landed('targets').map((event) => event.command)).toEqual([
+      { kind: 'targets', deck: 'a', frames: [300, 600] },
+    ]);
     rig.dispose();
   });
 });

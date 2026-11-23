@@ -1,7 +1,7 @@
 import { clamp } from '@sidablist/core';
 
 /** The slowest effective tempo a deck plays at, as a multiple of the tune's own rate. */
-export const MIN_TEMPO = 0.3;
+const MIN_TEMPO = 0.3;
 
 /** The fastest effective tempo a deck plays at, as a multiple of the tune's own rate. */
 export const MAX_TEMPO = 1.7;

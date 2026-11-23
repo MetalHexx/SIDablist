@@ -1,7 +1,10 @@
 import type { RegisterRecord } from '@sidablist/core';
 import type { DeckCommand } from '../messages/commands.js';
 
-/** How many entries a deck's log holds; a command past it is refused. */
+/**
+ * How many entries a deck's log holds. Past it a sweepable command folds into the one before it,
+ * and any other is refused (see `Deck.receive`).
+ */
 export const LOG_CAPACITY = 256;
 
 /** `LogEntry.frame` of a `pass-end` entry whose pass has not ended yet. */

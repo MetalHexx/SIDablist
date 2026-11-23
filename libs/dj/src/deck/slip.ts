@@ -9,7 +9,7 @@ import {
 } from './deck-state.js';
 
 /** What starts a departure from the line. */
-export type SlipKind = 'live-loop' | 'loop' | 'hand';
+type SlipKind = 'live-loop' | 'loop' | 'hand';
 
 /** A departure's kind as `DeckState` holds it. */
 const NONE = 0;

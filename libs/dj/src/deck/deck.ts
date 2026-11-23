@@ -79,10 +79,10 @@ import { DeckSlip } from './slip.js';
 import { effectiveTempo } from './tempo.js';
 
 /** How far ahead a deck with no output renders, in milliseconds. */
-export const DEFAULT_LOOKAHEAD_MS = 15;
+const DEFAULT_LOOKAHEAD_MS = 15;
 
 /** What a deck asks of the package that holds it. */
-export interface DeckHost {
+interface DeckHost {
   /** The deck's clock may have started or stopped: the package's one wake follows the decks. */
   syncWake(): void;
 }
@@ -311,35 +311,125 @@ export class Deck {
     if (this.phase !== 'ready') return `${kind} on a deck that is ${this.phase}`;
     if (this.player.getSnapshot().transport === 'error') return `${kind} on a deck that is failed`;
     if (kind === 'live-loop' && this.grid === null) return 'live-loop on a deck with no grid';
+    const far = this.farFrame(command);
+    if (far !== null) {
+      return `frame ${far} is past the end of the tune (the deck holds frames up to ${this.frameCeiling()})`;
+    }
     return null;
   }
 
-  /** Takes a command the deck has accepted: fixes its `When`, logs it and flushes it. */
-  receive(command: DeckCommand): void {
-    if (this.disposed) return;
-    const entry = this.log.push(command, null);
-    if (entry === null) {
-      this.plugs.log?.warn(
-        `dj: refused ${command.kind}: the command log of deck ${this.id} is full`,
-      );
-      return;
-    }
-    const unsent = this.tap.firstUnsent();
-    const when = command.when;
-    switch (when?.at) {
-      case 'frame':
-        entry.from = Math.max(when.frame, unsent);
+  /**
+   * The farthest tune frame the deck takes a command to: the engine's ceiling for a jump, the
+   * tune's indexed length or its own length, whichever is greatest. A frame past it would be
+   * replayed from the start of the tune, at a cost linear in the frame.
+   */
+  private frameCeiling(): number {
+    const snapshot = this.player.getSnapshot();
+    const basis = snapshot.basis;
+    return Math.max(
+      basis.ceilingFrames,
+      basis.positionBasisFrames,
+      snapshot.tune?.lengthFrames ?? 0,
+    );
+  }
+
+  /** The first frame `command` names that is past `frameCeiling()`, or null. */
+  private farFrame(command: DeckCommand): number | null {
+    let frame: number;
+    switch (command.kind) {
+      case 'seek':
+        frame = command.frame;
         break;
-      case 'pass-end':
-        entry.passEnd = true;
-        entry.from = Math.max(when.from ?? unsent, unsent);
+      case 'jump':
+      case 'key':
+        frame = command.target.startFrame;
+        break;
+      case 'loop-bounds':
+        frame = command.startFrame;
         break;
       default:
-        entry.from = unsent;
+        return null;
     }
+    return frame > this.frameCeiling() ? frame : null;
+  }
+
+  /**
+   * Takes a command the deck has accepted: fixes its `When`, logs it and flushes it. A `targets`
+   * command drops, with a warning, the frames past the tune. With the log full, a sweepable command
+   * (a speed, a nudge, a setting, a wrap) lands in the command before it when that one has not been
+   * flushed and lands on the same frame, so the latest value of a fast control survives; any other
+   * command is refused.
+   */
+  receive(input: DeckCommand): void {
+    if (this.disposed) return;
+    const command = input.kind === 'targets' ? this.withinTune(input) : input;
+    const unsent = this.tap.firstUnsent();
+    const when = command.when;
+    let from: number;
+    switch (when?.at) {
+      case 'frame':
+        from = Math.max(when.frame, unsent);
+        break;
+      case 'pass-end':
+        from = Math.max(when.from ?? unsent, unsent);
+        break;
+      default:
+        from = unsent;
+    }
+    const entry = this.log.push(command, null);
+    if (entry === null) {
+      if (!this.foldIntoLast(command, from)) {
+        this.plugs.log?.warn(
+          `dj: refused ${command.kind}: the command log of deck ${this.id} is full`,
+        );
+      }
+      return;
+    }
+    entry.passEnd = when?.at === 'pass-end';
+    entry.from = from;
+    this.markPressed(entry, command);
+    this.schedule();
+  }
+
+  private markPressed(entry: LogEntry, command: DeckCommand): void {
     if (command.pressedAtMs !== undefined) entry.pressedAtMs = command.pressedAtMs;
     else if ('atMs' in command) entry.pressedAtMs = command.atMs;
-    this.schedule();
+  }
+
+  /** A `targets` command without the frames past the tune; `command` itself when none is. */
+  private withinTune(command: Extract<DeckCommand, { kind: 'targets' }>): DeckCommand {
+    const ceiling = this.frameCeiling();
+    const kept = command.frames.filter((frame) => frame <= ceiling);
+    if (kept.length === command.frames.length) return command;
+    this.plugs.log?.warn(
+      `dj: targets on deck ${this.id} dropped ${command.frames.length - kept.length} frame(s) past the end of the tune (the deck holds frames up to ${ceiling})`,
+    );
+    return { ...command, frames: kept };
+  }
+
+  /** Puts `command` in the log's newest entry in place of what it held; false when that is not safe. */
+  private foldIntoLast(command: DeckCommand, from: number): boolean {
+    if (this.log.size === 0 || command.when?.at === 'pass-end') return false;
+    const last = this.log.at(this.log.size - 1);
+    const held = last.command;
+    if (held === null || last.flushed || last.passEnd || last.from !== from) return false;
+    if (held.kind !== command.kind || held.when?.at === 'pass-end') return false;
+    switch (command.kind) {
+      case 'speed':
+      case 'nudge':
+      case 'speed-jump':
+      case 'loop-wraps':
+        break;
+      case 'setting':
+        if (held.kind !== 'setting' || held.setting !== command.setting) return false;
+        break;
+      default:
+        return false;
+    }
+    last.command = command;
+    last.pressedAtMs = Number.NaN;
+    this.markPressed(last, command);
+    return true;
   }
 
   /** Answers a request. Requests read a deck and change nothing, and never wait for a flush. */
