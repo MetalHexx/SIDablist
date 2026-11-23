@@ -18,6 +18,7 @@ Filled in as libraries land — a module missing from this table is a module no 
 | `libs/asid`     | The ASID wire format and its MIDI scheduling — one `SidSink` implementation.                                                                                                                                                                                                                | [`libs/asid/AGENTS.md`](./libs/asid/AGENTS.md)         |
 | `libs/analysis` | Turns a scanned tune's register stream into its persisted `TuneIndexRecord` — the detectors, plus the scan ladder that decides how deep to scan — and the frame arithmetic over a beat grid.                                                                                                | [`libs/analysis/AGENTS.md`](./libs/analysis/AGENTS.md) |
 | `libs/tunes`    | The DJ's knowledge of a tune: identity, reference, `Playable`, named loop markers, sets and tune memory with the rules that edit them, the `TuneStore`/`TuneIndexer`/`LoopPositionsStore`/`SetStore`/`TuneMemoryStore` ports a host supplies, and the index-once-per-hash-and-subtune rule. | [`libs/tunes/AGENTS.md`](./libs/tunes/AGENTS.md)       |
+| `libs/dj`       | The DJ logic over a deck's playhead: decks, loops, cues, slip, the live looper, the hand and rewind, speaking industry DJ terms and knowing no application.                                                                                                                                 | [`libs/dj/AGENTS.md`](./libs/dj/AGENTS.md)             |
 
 ## Invariants
 
@@ -32,7 +33,7 @@ moving the boundary is a decision rather than an import.
 ### `libs/core` touches no browser global
 
 No `window`, `document`, `navigator`, `localStorage`, and no `performance`, `console` or
-`new Worker(...)` in `libs/core/src` or `libs/asid/src` outside specs: time, the log and the worker
+`new Worker(...)` in `libs/core/src`, `libs/asid/src` or `libs/dj/src` outside specs: time, the log and the worker
 come from the host. Everything environmental arrives through an injected port. Lint enforces it; the no-dependency CI build catches what lint misses. A library
 that quietly assumes a browser cannot run under Node, under Electron, or in a test without one.
 
