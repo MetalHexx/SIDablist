@@ -136,6 +136,11 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   `grid-lines.spec.ts`, and core's `timeline/active-loop.spec.ts` and `timeline/shadow-position.spec.ts`.
   Detail: [`libs/core/AGENTS.md`](../core/AGENTS.md).
 
+- **Changed `recordRegisters` or the grid-line helpers (`loopStartAtOrBefore`, `gridLine`, `lapPhaseAt`,
+  `shrinkLanding`, `foldIntoLoop`, `lapPhaseOfFold`)?** `libs/dj`'s live looper and hand build on them,
+  so a loop or a throw lands a frame off with no compile error. Run `pnpm --filter @sidablist/dj test`.
+  Detail: [`libs/dj/AGENTS.md`](../dj/AGENTS.md).
+
 ## Commands
 
 ```

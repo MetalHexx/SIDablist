@@ -1,0 +1,48 @@
+{
+  "name": "@sidablist/dj",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.js"
+    },
+    "./browser/wake.worker": {
+      "types": "./dist/browser/wake.worker.d.ts",
+      "import": "./dist/browser/wake.worker.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "browser": [
+        "./dist/browser/index.d.ts"
+      ],
+      "browser/wake.worker": [
+        "./dist/browser/wake.worker.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@sidablist/analysis": "workspace:*",
+    "@sidablist/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@sidablist/asid": "workspace:*",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.lib.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.lib.json --noEmit && tsc -p tsconfig.main.json"
+  }
+}

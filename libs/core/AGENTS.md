@@ -611,6 +611,12 @@ rate` specs in `player/create-sid-player.spec.ts` catch it.
   change is intended, then retire `registers/__reference__/` and that spec together. Detail:
   [`docs/architecture.md`](../../docs/architecture.md).
 
+- **Changed `SidPlayer`'s save and restore, the sink contract's `passedCount` and `replaceFrom`,
+  `queueJump`, `changeLoopAt`, the shadow, varispeed or `tune.handOffs`?** `libs/dj` rewinds a deck and
+  lands its commands through these, and a change that moves them leaves a deck whose rewound frames
+  differ from straight play, with no compile error. Run `pnpm --filter @sidablist/dj test`, whose
+  rewind-exactness spec catches it. Detail: [`libs/dj/AGENTS.md`](../dj/AGENTS.md).
+
 ## Commands
 
 ```

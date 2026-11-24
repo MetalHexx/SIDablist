@@ -42,12 +42,18 @@ export default tseslint.config(
     },
   },
   {
-    // Core and the ASID sink read no clock, write to no console and build no worker: the host
-    // supplies a `TimeSource`, an `EngineLog` and a worker factory. `Worker` the type stays usable
-    // (the factory's signature), so only its construction is banned. Flat config replaces a rule's
+    // Core, the ASID sink and the DJ main path read no clock, write to no console and build no
+    // worker: the host supplies a `TimeSource`, an `EngineLog` and a worker factory. `Worker` the
+    // type stays usable (the factory's signature), so only its construction is banned. Flat config replaces a rule's
     // options in a later matching block, so the four browser names are repeated here.
-    files: ['libs/core/src/**/*.ts', 'libs/asid/src/**/*.ts'],
-    ignores: ['**/*.spec.ts', 'libs/core/src/testing/**', 'libs/asid/src/web-midi/**'],
+    files: ['libs/core/src/**/*.ts', 'libs/asid/src/**/*.ts', 'libs/dj/src/**/*.ts'],
+    ignores: [
+      '**/*.spec.ts',
+      'libs/core/src/testing/**',
+      'libs/asid/src/web-midi/**',
+      'libs/dj/src/testing/**',
+      'libs/dj/src/browser/**',
+    ],
     rules: {
       'no-restricted-globals': [
         'error',
