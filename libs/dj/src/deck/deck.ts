@@ -26,6 +26,7 @@ import type {
   DeckUpdate,
 } from '../messages/reports.js';
 import type { DeckOutput, DjPlugs } from '../plugs.js';
+import { HOLD_RELEASED, SETTING_SLOTS } from '../messages/setting-table.js';
 import {
   ANSWER_NO,
   ANSWER_UNASKED,
@@ -75,7 +76,7 @@ import {
   type LoopsHost,
 } from './loops.js';
 import { NOTHING_APPLIED, RestoreRing, type RestoreSlot } from './restore-ring.js';
-import { isMainSetting, mutesAsSettings, readMutes, voiceOf, VOICE_COUNT } from './settings.js';
+import { applyList, homeList, offHome, oppositeOfTune, readList, VOICE_COUNT } from './settings.js';
 import { SinkTap } from './sink-tap.js';
 import { DeckSlip } from './slip.js';
 import { effectiveTempo } from './tempo.js';
@@ -106,6 +107,9 @@ const RESOLUTIONS: Readonly<Record<number, HotCueResolution>> = {
 
 const NO_FRAME = Number.MAX_SAFE_INTEGER;
 
+/** The bytes of the chip's registers, which `readRegisters` fills. */
+const REGISTER_BYTES = 25;
+
 /** Slots in `Deck.times`: the doubles the picture's timing reports, kept where a store never boxes. */
 const WORST_LATE_MS = 0;
 const LAST_REWIND_MS = 1;
@@ -117,6 +121,12 @@ const LANDINGS_KEPT = 8;
 
 /** A deck's `load` register-record margin, in seconds of tune past what the engine measures. */
 const RECORD_MARGIN_SECONDS = 5;
+
+/** Whether two settings lists differ, element by element. */
+function differs(a: Float64Array, b: Float64Array): boolean {
+  for (let i = 1; i < SETTING_SLOTS; i++) if (a[i] !== b[i]) return true;
+  return false;
+}
 
 /** Whether `command` halts the engine's output: its stop drops every frame the sink still holds. */
 function halts(entry: LogEntry): boolean {
@@ -216,7 +226,13 @@ export class Deck {
 
   private readonly update: Mutable<DeckUpdate>;
   private lastPictureSnapshot: PlayerSnapshot | null = null;
-  private readonly pictureKey = new Float64Array(16);
+  private readonly pictureKey = new Float64Array(15);
+  /** The settings lists as the last picture showed them, which the next change check compares against in place. */
+  private readonly pictureMain = new Float64Array(SETTING_SLOTS);
+  private readonly pictureLoop = new Float64Array(SETTING_SLOTS);
+  /** The two buffers a lock reads the registers into, made once so a press allocates none. */
+  private readonly lockWritten = new Uint8Array(REGISTER_BYTES);
+  private readonly lockSent = new Uint8Array(REGISTER_BYTES);
   private pictureError: string | null = null;
   private pictureQueued: JumpTarget | null = null;
   private pictureWaiting: JumpTarget | null = null;
@@ -289,8 +305,10 @@ export class Deck {
 
   /**
    * Why a command is refused, or null. A press needs a settled deck: not empty, loading or failed.
-   * A load, the deck's own settings, slip, the hand's moves and the releases always pass: a move
-   * the deck cannot take is ignored when it lands. The live looper is off on a deck with no grid.
+   * A load, a `settings` (a host's panic is always accepted, and on a deck with no tune it only
+   * changes the main list, which the next load replaces), slip, the hand's moves and the releases
+   * (a `voice-hold` with `held: false` among them) always pass: a move the deck cannot take is
+   * ignored when it lands. The live looper is off on a deck with no grid.
    */
   refusal(command: DeckCommand): string | null {
     const kind = command.kind;
@@ -300,10 +318,12 @@ export class Deck {
       kind === 'hand-lift' ||
       kind === 'cancel-queued' ||
       kind === 'let-go' ||
-      kind === 'stop-loop';
+      kind === 'stop-loop' ||
+      (kind === 'voice-hold' && !command.held);
     if (
       release ||
       kind === 'repeat' ||
+      kind === 'settings' ||
       kind === 'targets' ||
       kind === 'slip' ||
       kind === 'hand-move'
@@ -784,6 +804,7 @@ export class Deck {
     }
     const player = this.player;
     let endedLoop = endsLoop(command);
+    let dropped = false;
     switch (command.kind) {
       case 'play':
         if (player.getSnapshot().transport !== 'playing') this.settleOn(player.play());
@@ -813,9 +834,16 @@ export class Deck {
         player.setRepeatTrack(command.on);
         break;
       case 'setting':
-        if (isMainSetting(command.setting)) {
-          this.loops.setSetting(voiceOf(command.setting), command.value === 1);
-        }
+        this.loops.setSetting(command.setting, command.value);
+        break;
+      case 'settings':
+        dropped = !this.loops.setSettings(command.settingsIn, command.changes);
+        break;
+      case 'voice-hold':
+        player.setVoiceHeld(command.voice, command.held);
+        break;
+      case 'flip-lock':
+        this.flipLock(command.setting, command.lock);
         break;
       case 'targets':
         this.hostTargets = [...command.frames];
@@ -881,8 +909,31 @@ export class Deck {
         // The rest never get here.
         break;
     }
-    this.queueLanded(entry, frame, dueMs);
+    this.queueLanded(entry, frame, dueMs, dropped);
     if (endedLoop) this.endPass(frame, entry.seq);
+  }
+
+  /**
+   * A one-bit switch's lock, in the settings in play. With `lock` absent it is a press: a held
+   * switch is handed back, a released one is locked. `lock: true` locks a released switch and leaves
+   * a held one as it is; `lock: false` hands it back. A lock puts the switch at the opposite of what
+   * the tune has it at, which on a command landing on stream frame F is what the tune wrote in the
+   * last frame rendered before F (F−1's play call, before any shaping: `written`, never `sent`). A
+   * re-render restores the engine to F−1 first, so reading again gives the same answer and no first
+   * answer is kept.
+   */
+  private flipLock(setting: number, lock: boolean | undefined): void {
+    const state = this.state;
+    const list = state.ownInPlay ? state.loopSettings : state.mainSettings;
+    const held = list[setting] !== HOLD_RELEASED;
+    if (lock === false || (lock === undefined && held)) {
+      this.loops.setSetting(setting, HOLD_RELEASED);
+      return;
+    }
+    if (held) return;
+    this.player.readRegisters(this.lockWritten, this.lockSent);
+    const locked = oppositeOfTune(setting, this.lockWritten);
+    if (locked !== null) this.loops.setSetting(setting, locked);
   }
 
   /**
@@ -899,7 +950,7 @@ export class Deck {
     return resolved === RESOLVED_START || resolved === RESOLVED_QUEUE;
   }
 
-  private queueLanded(entry: LogEntry, frame: number, dueMs: number): void {
+  private queueLanded(entry: LogEntry, frame: number, dueMs: number, dropped: boolean): void {
     if (entry.eventState !== EVENT_NONE) return;
     const event = this.events.push(KIND_LANDED, frame);
     if (event === null) {
@@ -911,6 +962,7 @@ export class Deck {
     event.dueMs = dueMs;
     event.a = entry.command?.kind === 'hot-cue' ? this.loops.resolved : RESOLVED_NONE;
     event.b = this.state.ownInPlay ? 2 : 1;
+    event.c = dropped ? 1 : 0;
     entry.eventState = EVENT_QUEUED;
   }
 
@@ -1385,10 +1437,9 @@ export class Deck {
       state.cells[NUDGE] = 0;
       state.cells[JUMP] = 0;
       player.setTempo(1);
-      player.clearVoiceMutes();
-      state.mutes.fill(0);
       player.setJumpTargets([]);
     }
+    this.resetSettings();
     this.phase = 'loading';
     this.error = null;
     this.framesDelivered = 0;
@@ -1402,6 +1453,22 @@ export class Deck {
       command.ends ??
       (transportBefore === 'playing' || transportBefore === 'paused' ? transportBefore : 'stopped');
     void this.runLoad(command, this.generation, ends);
+  }
+
+  /**
+   * Everything the settings hold goes home, with or without a tune (a `settings` can land on a deck
+   * that has none): both lists, the loop's own out of play, and the engine's offsets, holds, pitches,
+   * mutes and voice holds.
+   */
+  private resetSettings(): void {
+    const state = this.state;
+    const player = this.player;
+    homeList(state.mainSettings);
+    homeList(state.loopSettings);
+    state.ownInPlay = false;
+    applyList(player, state.mainSettings);
+    player.clearVoiceMutes();
+    for (let voice = 0; voice < VOICE_COUNT; voice++) player.setVoiceHeld(voice, false);
   }
 
   private async runLoad(command: LoadCommand, generation: number, ends: Ends): Promise<void> {
@@ -1484,10 +1551,10 @@ export class Deck {
 
     state.cells[SPEED] = command.speed ?? 1;
     player.setTempo(effectiveTempo(state.speed, state.nudge, state.jump));
-    readMutes(command.settings, state.mutes);
-    for (let voice = 0; voice < VOICE_COUNT; voice++) {
-      player.setVoiceMuted(voice, state.muted(voice));
-    }
+    // The engine carries holds and offsets across a load, so the whole list is written: what the
+    // load does not name goes home, and a `settings` that landed while the load waited is overwritten.
+    readList(command.settings, state.mainSettings);
+    applyList(player, state.mainSettings);
     state.snapshot = null;
     state.lastHandOffs = 0;
     state.cells[LAST_POSITION] = player.getPosition();
@@ -1602,7 +1669,14 @@ export class Deck {
           frame: event.frame,
           waitMs: Number.isNaN(entry.pressedAtMs) ? null : event.dueMs - entry.pressedAtMs,
         };
-        if (command.kind === 'setting') landed.settingsIn = event.b === 2 ? 'loop' : 'main';
+        if (
+          command.kind === 'setting' ||
+          command.kind === 'settings' ||
+          command.kind === 'flip-lock'
+        ) {
+          if (event.c === 1) landed.dropped = true;
+          else landed.settingsIn = event.b === 2 ? 'loop' : 'main';
+        }
         if (command.kind === 'hot-cue') landed.resolved = RESOLUTIONS[event.a];
         return landed;
       }
@@ -1664,13 +1738,7 @@ export class Deck {
     const state = this.state;
     const snapshot = this.player.getSnapshot();
     const key = this.pictureKey;
-    const mutes = (state.muted(0) ? 1 : 0) | (state.muted(1) ? 2 : 0) | (state.muted(2) ? 4 : 0);
-    const own = state.ownInPlay
-      ? 8 |
-        (state.loopMuted(0) ? 1 : 0) |
-        (state.loopMuted(1) ? 2 : 0) |
-        (state.loopMuted(2) ? 4 : 0)
-      : 0;
+    const own = state.ownInPlay ? 1 : 0;
     const phase =
       this.phase === 'empty' ? 0 : this.phase === 'loading' ? 1 : this.phase === 'failed' ? 2 : 3;
     const slots = this.ring === null ? 0 : this.ring.capacity;
@@ -1682,22 +1750,22 @@ export class Deck {
       key[1] === state.nudge &&
       key[2] === state.jump &&
       key[3] === state.waitingFrame &&
-      key[4] === mutes &&
-      key[5] === phase &&
-      key[6] === slots &&
-      key[7] === this.lookaheadMs &&
-      key[8] === own &&
-      key[9] === slip &&
-      key[10] === state.handState &&
-      key[11] === live &&
-      key[12] === (state.liveOn ? state.liveStart : -1) &&
-      key[13] === (state.liveOn ? state.liveEnd : -1) &&
-      key[14] === (Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd) &&
-      key[15] === (Number.isNaN(state.liveSize) ? -1 : state.liveSize) &&
+      key[4] === phase &&
+      key[5] === slots &&
+      key[6] === this.lookaheadMs &&
+      key[7] === own &&
+      key[8] === slip &&
+      key[9] === state.handState &&
+      key[10] === live &&
+      key[11] === (state.liveOn ? state.liveStart : -1) &&
+      key[12] === (state.liveOn ? state.liveEnd : -1) &&
+      key[13] === (Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd) &&
+      key[14] === (Number.isNaN(state.liveSize) ? -1 : state.liveSize) &&
       this.pictureError === this.error &&
       this.pictureQueued === state.queued &&
       this.pictureWaiting === state.waiting &&
-      this.picturePending === state.pending
+      this.picturePending === state.pending &&
+      !this.settingsChanged()
     ) {
       return;
     }
@@ -1706,23 +1774,36 @@ export class Deck {
     key[1] = state.nudge;
     key[2] = state.jump;
     key[3] = state.waitingFrame;
-    key[4] = mutes;
-    key[5] = phase;
-    key[6] = slots;
-    key[7] = this.lookaheadMs;
-    key[8] = own;
-    key[9] = slip;
-    key[10] = state.handState;
-    key[11] = live;
-    key[12] = state.liveOn ? state.liveStart : -1;
-    key[13] = state.liveOn ? state.liveEnd : -1;
-    key[14] = Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd;
-    key[15] = Number.isNaN(state.liveSize) ? -1 : state.liveSize;
+    key[4] = phase;
+    key[5] = slots;
+    key[6] = this.lookaheadMs;
+    key[7] = own;
+    key[8] = slip;
+    key[9] = state.handState;
+    key[10] = live;
+    key[11] = state.liveOn ? state.liveStart : -1;
+    key[12] = state.liveOn ? state.liveEnd : -1;
+    key[13] = Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd;
+    key[14] = Number.isNaN(state.liveSize) ? -1 : state.liveSize;
+    this.pictureMain.set(state.mainSettings);
+    if (state.ownInPlay) this.pictureLoop.set(state.loopSettings);
     this.pictureError = this.error;
     this.pictureQueued = state.queued;
     this.pictureWaiting = state.waiting;
     this.picturePending = state.pending;
     this.plugs.report(this.buildPicture());
+  }
+
+  /**
+   * Whether a list the picture shows differs from what the last picture showed, compared in place
+   * and allocating nothing. The loop's own list counts only while it plays.
+   */
+  private settingsChanged(): boolean {
+    const state = this.state;
+    return (
+      differs(state.mainSettings, this.pictureMain) ||
+      (state.ownInPlay && differs(state.loopSettings, this.pictureLoop))
+    );
   }
 
   private buildPicture(): DeckPicture {
@@ -1792,8 +1873,8 @@ export class Deck {
         state.handState === HAND_DOWN ? 'down' : state.handState === HAND_THROWN ? 'thrown' : 'up',
       settingsInPlay: state.ownInPlay ? 'loop' : 'main',
       settings: {
-        main: mutesAsSettings(state.mutes),
-        loop: state.ownInPlay ? mutesAsSettings(state.loopMutes) : null,
+        main: offHome(state.mainSettings),
+        loop: state.ownInPlay ? offHome(state.loopSettings) : null,
       },
       readyFrames: [...(tuneSnapshot?.preparedFrames ?? [])],
       grid: this.grid,

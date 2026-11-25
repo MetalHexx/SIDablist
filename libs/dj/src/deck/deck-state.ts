@@ -1,6 +1,7 @@
 import type { ActiveLoop, JumpSettings, PlayerSnapshot } from '@sidablist/core';
 import type { JumpTarget } from '../messages/commands.js';
-import { VOICE_COUNT } from './settings.js';
+import { SETTING, SETTING_SLOTS } from '../messages/setting-table.js';
+import { homeList } from './settings.js';
 
 /**
  * A part that keeps everything deciding what it does next in storage made ahead of time and can
@@ -43,12 +44,10 @@ const CELL_COUNT = LIVE_SIZE + 1;
 
 /** Slots in `DeckState.ints`. */
 const STREAM = 0;
-const MUTES = 1;
-const WAITING_FRAME = MUTES + VOICE_COUNT;
+const WAITING_FRAME = 1;
 const WAITING_SEQ = WAITING_FRAME + 1;
 const LAST_HAND_OFFS = WAITING_SEQ + 1;
-const LOOP_MUTES = LAST_HAND_OFFS + 1;
-const OWN_IN_PLAY = LOOP_MUTES + VOICE_COUNT;
+const OWN_IN_PLAY = LAST_HAND_OFFS + 1;
 const HAND_STATE = OWN_IN_PLAY + 1;
 const HAND_ANCHOR_PENDING = HAND_STATE + 1;
 const HAND_SAMPLE_COUNT = HAND_ANCHOR_PENDING + 1;
@@ -80,6 +79,8 @@ export interface DeckStateImage {
   readonly ints: Int32Array;
   readonly handTravels: Float64Array;
   readonly handTimes: Float64Array;
+  readonly mainSettings: Float64Array;
+  readonly loopSettings: Float64Array;
   snapshot: PlayerSnapshot | null;
   varispeed: boolean;
   queued: JumpTarget | null;
@@ -97,12 +98,13 @@ export interface DeckStateImage {
  * - the driven clock's due time, interval and tick count (`cells`, shared with the clock itself), so
  *   a re-render is due when the original was;
  * - the stream frame, which a rewind takes back to the frame it re-renders from;
- * - the tempo layers (speed, nudge, jump) and the main settings (the voice mutes);
+ * - the tempo layers (speed, nudge, jump) and the settings: the main list and the loop's own, each
+ *   the value of every numbered setting (the voice holds are the engine's, saved with it);
  * - the waiting seek or jump: the tune frame it waits for and the log entry that asked, which is
  *   what lets a re-render find its fixed landing, and a waiting jump's target and settings;
  * - the loops: the target queued in the engine with the settings it carries, the loop change named
- *   and not yet landed, and the loop's own settings with whether they are in play (the main ones
- *   are then held aside, untouched, in the main mutes). Targets and settings are held by reference:
+ *   and not yet landed, and whether the loop's own settings are in play (the main ones are then held
+ *   aside, untouched, in the main list). Targets and settings are held by reference:
  *   a command is immutable, and a save allocates nothing;
  * - what the between-tick logic compares against: the engine snapshot last read (by identity), the
  *   hand-offs landed, the playhead last seen;
@@ -127,6 +129,10 @@ export class DeckState implements Saveable<DeckStateImage> {
   /** The hand's samples, travel and host time, as a ring of `HAND_SAMPLES` written from `handSampleHead`. */
   readonly handTravels = new Float64Array(HAND_SAMPLES);
   readonly handTimes = new Float64Array(HAND_SAMPLES);
+  /** Every numbered setting's value in the main settings, by setting number (index 0 is unused). */
+  readonly mainSettings = new Float64Array(SETTING_SLOTS);
+  /** The same for the loop's own settings; meaningful while `ownInPlay`. */
+  readonly loopSettings = new Float64Array(SETTING_SLOTS);
   /** The engine snapshot the between-tick logic last read. */
   snapshot: PlayerSnapshot | null = null;
   varispeed = false;
@@ -153,6 +159,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.cells[LIVE_SIZE] = Number.NaN;
     this.ints[WAITING_FRAME] = NOT_WAITING;
     this.ints[WAITING_SEQ] = NOT_WAITING;
+    homeList(this.mainSettings);
+    homeList(this.loopSettings);
   }
 
   /** The frames the deck has delivered since it was added: the next frame to render. */
@@ -175,15 +183,7 @@ export class DeckState implements Saveable<DeckStateImage> {
 
   /** Whether `voice` is muted by the main settings. */
   muted(voice: number): boolean {
-    return this.ints[MUTES + voice] === 1;
-  }
-  /** Mutes or unmutes `voice` in the main settings. */
-  setMuted(voice: number, muted: boolean): void {
-    this.ints[MUTES + voice] = muted ? 1 : 0;
-  }
-  /** The main settings' mutes as a 0/1 view that `settings.ts` reads and writes. */
-  get mutes(): Int32Array {
-    return this.ints.subarray(MUTES, MUTES + VOICE_COUNT);
+    return this.mainSettings[SETTING.VOICE_1_MUTE + voice] === 1;
   }
 
   get waitingFrame(): number {
@@ -220,14 +220,7 @@ export class DeckState implements Saveable<DeckStateImage> {
   }
   /** Whether `voice` is muted by the loop's own settings (meaningful while they are in play). */
   loopMuted(voice: number): boolean {
-    return this.ints[LOOP_MUTES + voice] === 1;
-  }
-  setLoopMuted(voice: number, muted: boolean): void {
-    this.ints[LOOP_MUTES + voice] = muted ? 1 : 0;
-  }
-  /** The loop's own mutes as a 0/1 view that `mutesAsSettings` reads. */
-  get loopMutes(): Int32Array {
-    return this.ints.subarray(LOOP_MUTES, LOOP_MUTES + VOICE_COUNT);
+    return this.loopSettings[SETTING.VOICE_1_MUTE + voice] === 1;
   }
 
   /** Where the hand is: `HAND_UP`, `HAND_DOWN` or `HAND_THROWN`. */
@@ -336,6 +329,8 @@ export class DeckState implements Saveable<DeckStateImage> {
       ints: new Int32Array(INT_COUNT),
       handTravels: new Float64Array(HAND_SAMPLES),
       handTimes: new Float64Array(HAND_SAMPLES),
+      mainSettings: new Float64Array(SETTING_SLOTS),
+      loopSettings: new Float64Array(SETTING_SLOTS),
       snapshot: null,
       varispeed: false,
       queued: null,
@@ -352,6 +347,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     target.ints.set(this.ints);
     target.handTravels.set(this.handTravels);
     target.handTimes.set(this.handTimes);
+    target.mainSettings.set(this.mainSettings);
+    target.loopSettings.set(this.loopSettings);
     target.snapshot = this.snapshot;
     target.varispeed = this.varispeed;
     target.queued = this.queued;
@@ -367,6 +364,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.ints.set(source.ints);
     this.handTravels.set(source.handTravels);
     this.handTimes.set(source.handTimes);
+    this.mainSettings.set(source.mainSettings);
+    this.loopSettings.set(source.loopSettings);
     this.snapshot = source.snapshot;
     this.varispeed = source.varispeed;
     this.queued = source.queued;

@@ -19,9 +19,11 @@ supplies everything environmental.
   and the picture. Around it: `driven-clock.ts` (the engine's `FrameClock`, ticked only by the deck),
   `sink-tap.ts` (the engine's `SidSink`, mapping the output's counts onto stream frames),
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
-  `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
-  `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
-  jumps, the hot cue press, letting go, edits to the running loop and the loop's own settings),
+  `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` (the
+  tempo layers) and `settings.ts` (the settings lists, applying one setting to the engine and what a
+  jump carries; the table itself lives in `messages/setting-table.ts`), `loops.ts` (`DeckLoops`:
+  jumps, the hot cue press, letting go, edits to the running loop, and the settings in play, with a
+  loop's own swapped in on its landing frame and out on its let-go),
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
   the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
   on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
@@ -213,6 +215,28 @@ supplies everything environmental.
   lap phase and length it is worked out from, which the loop specs' shorter pass allows for. A
   landing the engine makes is read after the tick from `tune.handOffs` with number compares and
   builds nothing but the picture and the event it reports.
+- **A setting's number is fixed forever.** A new setting takes the next number; an old one is never
+  reused or renumbered, because a recording, a stored list and `validateInbound` all mean the number.
+- **Both settings lists are saved state.** `DeckState.mainSettings` and `loopSettings`, each the value
+  of every setting by number, are in every restore point and both copy methods; a setting kept
+  anywhere else restores almost exactly.
+- **A loop's own list and the main list are each complete: unnamed means home.** A jump into a target
+  with settings of its own carries every field the package owns (pitch and mutes for three voices, an
+  offset for every offset setting, a hold for every hold), built when the command lands; a jump with
+  none, landing while a loop's own play, carries the main list back whole. A jump never goes through
+  `releaseSettings`, which the end of a loop does (let-go, stop-loop, a seek, a stop, a load), so the
+  main list is applied once.
+- **The engine carries holds and offsets across a load, so a load writes the whole list.** At its
+  landing frame it puts both lists and the engine home, with a tune or without (a `settings` can land
+  on an empty deck), and at install it writes the main list over home, which also overwrites a
+  `settings` that landed while the load waited. Writing only what the load names leaves the last
+  tune's holds and offsets in force.
+- **`flip-lock` reads `written`, not `sent`.** A lock is the opposite of what the tune wrote in the
+  last frame rendered before its landing frame, before any shaping; `sent` is the package's own
+  shaped output and would lock against itself.
+- **`voice-hold` is the engine's and is never carried.** The engine inverts the voice's latched mute
+  while it is held and keeps the hold in its own saved state. It is in no settings list, no jump's
+  settings and no picture, and a load releases it.
 
 ## When a change here ripples
 
@@ -222,9 +246,14 @@ supplies everything environmental.
   across `postMessage`. Update `messages/validate.ts`, run `messages/validate.spec.ts` and
   `messages/round-trip.spec.ts`, and update the adapter (`src/browser/carry.ts`). Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
+- **Changed the setting table (`messages/setting-table.ts`: numbers, fields or ranges)?** It changes
+  what a recording means and what `validateInbound` refuses, and `deck/settings.ts` builds every list,
+  engine call and carried jump from it. Run `messages/setting-table.spec.ts`, the validate and
+  round-trip specs, and the whole dj suite. Detail:
+  [`src/messages/setting-table.ts`](./src/messages/setting-table.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
-  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/hand.ts`, `deck/slip.ts`,
-  `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
+  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/settings.ts`, `deck/hand.ts`,
+  `deck/slip.ts`, `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)

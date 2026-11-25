@@ -680,12 +680,12 @@ describe('a loop with settings of its own', () => {
     rig.advance(400);
     expectMutedFrom(rig, rig.landed('hot-cue')[0].frame);
     expect(rig.picture().settingsInPlay).toBe('loop');
-    expect(rig.picture().settings.loop).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 1 },
-      { setting: 3, value: 0 },
-    ]);
-    expect(rig.picture().settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(rig.picture().settings.loop?.find((s) => s.setting === 2)).toEqual({
+      setting: 2,
+      value: 1,
+    });
+    expect(rig.picture().settings.loop?.find((s) => s.setting === 1)).toBeUndefined();
+    expect(rig.picture().settings.main).toEqual([]);
 
     await send(rig, { kind: 'let-go', deck: 'a' });
     rig.advance(200);
@@ -706,15 +706,21 @@ describe('a loop with settings of its own', () => {
     rig.advance(100);
 
     expect(rig.landed('setting')[0].settingsIn).toBe('loop');
-    expect(rig.picture().settings.loop?.[0]).toEqual({ setting: 1, value: 1 });
-    expect(rig.picture().settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(rig.picture().settings.loop?.find((s) => s.setting === 1)).toEqual({
+      setting: 1,
+      value: 1,
+    });
+    expect(rig.picture().settings.main).toEqual([]);
 
     await send(rig, { kind: 'stop-loop', deck: 'a' });
     rig.advance(20);
     await send(rig, { kind: 'setting', deck: 'a', setting: 3, value: 1 });
     rig.advance(100);
     expect(rig.landed('setting')[1].settingsIn).toBe('main');
-    expect(rig.picture().settings.main[2]).toEqual({ setting: 3, value: 1 });
+    expect(rig.picture().settings.main.find((s) => s.setting === 3)).toEqual({
+      setting: 3,
+      value: 1,
+    });
     rig.dispose();
   });
 

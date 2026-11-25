@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { JumpTarget } from '../messages/commands.js';
+import { SETTING } from '../messages/setting-table.js';
 import { Rig } from '../testing/harness.js';
 import { ALLOCATION_NOISE_BYTES, measureAllocation } from '../testing/measure-allocation.js';
 
@@ -66,6 +67,81 @@ describe('the frame path', { timeout: LONG_RUN_MS }, () => {
     const rewinds = rig.picture().timing.rewinds;
     expect(rewinds).toBeGreaterThan(PRESSES * 8);
     expect(rig.picture().timing.rewoundFrames).toBeGreaterThan(rewinds * 4);
+    expect(scavenges).toBe(0);
+    expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+    rig.dispose();
+  });
+});
+
+/** A quiet rig playing with offsets, holds, a pitch, a mute and a voice hold in force. */
+async function shaped(lookaheadMs: number): Promise<Rig> {
+  const rig = new Rig({ quiet: true });
+  rig.addDeck('a', { lookaheadMs });
+  await rig.load('a', 'still-time', { ends: 'playing' });
+  rig.send({
+    kind: 'settings',
+    deck: 'a',
+    settingsIn: 'main',
+    changes: [
+      { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+      { setting: SETTING.VOICE_1_FREQUENCY_OFFSET, value: 30 },
+      { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: 4 },
+      { setting: SETTING.VOLUME_HOLD, value: 9 },
+      { setting: SETTING.KEY, value: 3 },
+      { setting: SETTING.VOICE_1_COARSE, value: 2 },
+      { setting: SETTING.VOICE_3_FINE, value: 20 },
+      { setting: SETTING.VOICE_3_MUTE, value: 1 },
+    ],
+  });
+  rig.send({ kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+  await rig.microtasks();
+  rig.advance(500);
+  expect(rig.picture().settings.main).toHaveLength(8);
+  return rig;
+}
+
+describe('the frame path with the tune shaped', { timeout: LONG_RUN_MS }, () => {
+  it('allocates nothing over plain play with offsets, holds, a pitch and a voice hold in force', async () => {
+    const rig = await shaped(60);
+    const { time, wake } = rig;
+    const sink = rig.sinks.get('a')!;
+
+    const { heapGrowthBytes, scavenges } = await measureAllocation(
+      () => {
+        for (let i = 0; i < FRAMES; i++) {
+          time.ms += 20;
+          sink.advanceTo(time.ms);
+          wake.fire();
+        }
+      },
+      { warmup: WARMUP_FRAMES },
+    );
+
+    expect(scavenges).toBe(0);
+    expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+    rig.dispose();
+  });
+
+  it('allocates nothing in the saves of presses that rewind it', async () => {
+    const rig = await shaped(120);
+    const { time, wake, dj } = rig;
+    const sink = rig.sinks.get('a')!;
+    const release = { kind: 'nudge', deck: 'a', amount: 0 } as const;
+
+    const { heapGrowthBytes, scavenges } = await measureAllocation(
+      () => {
+        for (let i = 0; i < PRESSES; i++) {
+          time.ms += 20;
+          sink.advanceTo(time.ms);
+          dj.send(release);
+          wake.fire();
+        }
+      },
+      { warmup: WARMUP_PRESSES },
+    );
+
+    const rewinds = rig.picture().timing.rewinds;
+    expect(rewinds).toBeGreaterThan(PRESSES * 8);
     expect(scavenges).toBe(0);
     expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
     rig.dispose();

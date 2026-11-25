@@ -148,7 +148,7 @@ describe('a load', () => {
     const waiting = rig.picture();
     expect(waiting.transport).toBe('loading');
     expect(waiting.tempo).toEqual({ speed: 1, nudge: 0, jump: 0, effective: 1 });
-    expect(waiting.settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(waiting.settings.main).toEqual([]);
     expect(waiting.readyFrames).toEqual([]);
     expect(waiting.loop).toBeNull();
     expect(waiting.hand).toBe('up');
@@ -160,7 +160,7 @@ describe('a load', () => {
     expect(failed.tempo.effective).toBe(1);
     expect(failed.loop).toBeNull();
     expect(failed.hand).toBe('up');
-    expect(failed.settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(failed.settings.main).toEqual([]);
     rig.dispose();
   });
 });
@@ -419,11 +419,9 @@ describe('what the package does without the engine’s help', () => {
     expect(wrote(rig, frame, VOICE_2_CONTROL)).toBe(SOUNDING);
     expect(wrote(rig, frame, VOICE_3_CONTROL)).toBeNull();
     expect(rig.picture()).toMatchObject({ settingsInPlay: 'main' });
-    expect(rig.picture().settings.main).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 0 },
-      { setting: 3, value: 1 },
-    ]);
+    const main = rig.picture().settings.main;
+    expect(main.find((s) => s.setting === 3)).toEqual({ setting: 3, value: 1 });
+    expect(main.find((s) => s.setting === 2)).toBeUndefined();
     rig.dispose();
   });
 });

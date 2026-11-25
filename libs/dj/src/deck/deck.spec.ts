@@ -268,11 +268,8 @@ describe('loading', () => {
     await rig.load('a', 'still-time', { ends: 'paused', settings: [{ setting: 3, value: 1 }] });
     const picture = rig.picture();
     expect(picture.tempo).toEqual({ speed: 1, nudge: 0, jump: 0, effective: 1 });
-    expect(picture.settings.main).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 0 },
-      { setting: 3, value: 1 },
-    ]);
+    expect(picture.settings.main.find((s) => s.setting === 3)).toEqual({ setting: 3, value: 1 });
+    expect(picture.settings.main.find((s) => s.setting === 1)).toBeUndefined();
     expect(picture.readyFrames).toEqual([]);
     rig.dispose();
   });

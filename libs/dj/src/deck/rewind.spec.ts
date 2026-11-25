@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { DeckCommand, DeckId, JumpTarget } from '../messages/commands.js';
+import { HOLD_RELEASED, SETTING } from '../messages/setting-table.js';
 import { compareRewound, type Press } from '../testing/compare.js';
 import type { Rig } from '../testing/harness.js';
 
@@ -176,11 +177,7 @@ describe('a deck rewound against a deck that ran straight', () => {
     });
 
     expect(difference).toBeNull();
-    expect(rewound.picture().settings.main).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 0 },
-      { setting: 3, value: 0 },
-    ]);
+    expect(rewound.picture().settings.main.find((s) => s.setting === 2)).toBeUndefined();
     expect(rewound.landed('setting').every((event) => event.settingsIn === 'main')).toBe(true);
   });
 
@@ -238,6 +235,78 @@ describe('a deck rewound against a deck that ran straight', () => {
   });
 });
 
+/**
+ * A setting and the values a press may give it, for the random presses: an offset, holds that
+ * release, the pitch settings.
+ */
+const SHAPES: readonly { readonly setting: number; readonly values: readonly number[] }[] = [
+  { setting: SETTING.CUTOFF_OFFSET, values: [-60, 0, 90] },
+  { setting: SETTING.VOICE_2_WAVEFORM_HOLD, values: [HOLD_RELEASED, 1, 8] },
+  { setting: SETTING.VOLUME_HOLD, values: [HOLD_RELEASED, 9] },
+  { setting: SETTING.KEY, values: [0, 5, -7] },
+  { setting: SETTING.VOICE_1_COARSE, values: [0, 12, -3] },
+  { setting: SETTING.VOICE_3_FINE, values: [0, 40] },
+  { setting: SETTING.VOICE_1_FREQUENCY_OFFSET, values: [0, 200] },
+  { setting: SETTING.VOICE_3_MUTE, values: [0, 1] },
+];
+const SWITCHES = [SETTING.VOICE_1_GATE_HOLD, SETTING.VOICE_2_TEST_HOLD, SETTING.VOICE_3_SYNC_HOLD];
+
+/** What a random press of one of the settings commands is, from numbers drawn when the press is made up. */
+interface ShapingDraw {
+  readonly shape: number;
+  readonly value: number;
+  readonly other: number;
+  readonly voice: number;
+  readonly held: boolean;
+  readonly lock: boolean | undefined;
+  readonly inLoop: boolean;
+}
+
+function drawShaping(next: () => number): ShapingDraw {
+  const shape = Math.floor(next() * SHAPES.length);
+  const lock = Math.floor(next() * 3);
+  return {
+    shape,
+    value: Math.floor(next() * 3),
+    other: Math.floor(next() * SHAPES.length),
+    voice: Math.floor(next() * 3),
+    held: next() < 0.6,
+    lock: lock === 0 ? undefined : lock === 1,
+    inLoop: next() < 0.5,
+  };
+}
+
+function shapingPress(deck: DeckId, draw: ShapingDraw, kind: number): DeckCommand {
+  const shape = SHAPES[draw.shape];
+  const value = shape.values[draw.value % shape.values.length];
+  switch (kind) {
+    case 0:
+      return { kind: 'setting', deck, setting: shape.setting, value };
+    case 1: {
+      const other =
+        SHAPES[(draw.other === draw.shape ? draw.other + 1 : draw.other) % SHAPES.length];
+      return {
+        kind: 'settings',
+        deck,
+        settingsIn: draw.inLoop ? 'loop' : 'main',
+        changes: [
+          { setting: shape.setting, value },
+          { setting: other.setting, value: other.values[draw.value % other.values.length] },
+        ],
+      };
+    }
+    case 2:
+      return { kind: 'voice-hold', deck, voice: draw.voice, held: draw.held };
+    default:
+      return {
+        kind: 'flip-lock',
+        deck,
+        setting: SWITCHES[draw.voice],
+        ...(draw.lock === undefined ? {} : { lock: draw.lock }),
+      };
+  }
+}
+
 /** A small seeded random source, so every run presses the same moments. */
 function random(seed: number): () => number {
   let state = seed >>> 0 || 1;
@@ -256,11 +325,12 @@ describe('a deck rewound by presses at random moments', () => {
       const presses: Press[] = [];
       for (let i = 0, count = 4 + Math.floor(next() * 8); i < count; i++) {
         const atMs = 100 + Math.floor(next() * 700);
-        const kind = Math.floor(next() * 8);
+        const kind = Math.floor(next() * 12);
         const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
         const value = 0.6 + Math.floor(next() * 12) / 10;
         const voice = 1 + Math.floor(next() * 3);
         const on = next() < 0.5;
+        const draw = drawShaping(next);
         presses.push(
           press(atMs, (deck, rig): DeckCommand => {
             const when =
@@ -280,6 +350,11 @@ describe('a deck rewound by presses at random moments', () => {
                 return { kind: 'seek', deck, frame: 1500, ...when };
               case 6:
                 return { kind: 'targets', deck, frames: [1500, 2500], ...when };
+              case 7:
+              case 8:
+              case 9:
+              case 10:
+                return { ...shapingPress(deck, draw, kind - 7), ...when };
               default:
                 return { kind: 'nudge', deck, amount: 0, ...when };
             }
@@ -447,7 +522,7 @@ describe('a deck rewound with loops in play', () => {
     expect(difference).toBeNull();
     expect(landings(rewound)).toEqual(landings(straight));
     expect(rewound.picture()).toMatchObject({ settingsInPlay: 'main', loop: null });
-    expect(rewound.picture().settings.main[0]).toEqual({ setting: 1, value: 0 });
+    expect(rewound.picture().settings.main.find((s) => s.setting === 1)).toBeUndefined();
     expect(rewound.warnings).toEqual([]);
   });
 });
@@ -456,7 +531,18 @@ describe('a deck rewound by loop presses at random moments', () => {
   const OWN: JumpTarget = { startFrame: 200, endFrame: 230, settings: [{ setting: 2, value: 1 }] };
   const SHARED: JumpTarget = { startFrame: 300, endFrame: 330 };
   const OWN_WRAPS: JumpTarget = { startFrame: 1000, endFrame: 1020, wraps: true, settings: [] };
-  const TARGET_LIST = [LOOP_A, LOOP_B, CUE, OWN, SHARED, OWN_WRAPS];
+  const OWN_FULL: JumpTarget = {
+    startFrame: 200,
+    endFrame: 240,
+    settings: [
+      { setting: SETTING.KEY, value: 12 },
+      { setting: SETTING.CUTOFF_HOLD, value: 300 },
+      { setting: SETTING.VOICE_3_WAVEFORM_HOLD, value: 8 },
+      { setting: SETTING.VOICE_2_COARSE, value: -5 },
+      { setting: SETTING.VOICE_1_MUTE, value: 1 },
+    ],
+  };
+  const TARGET_LIST = [LOOP_A, LOOP_B, CUE, OWN, SHARED, OWN_WRAPS, OWN_FULL];
 
   for (let seed = 1; seed <= 16; seed++) {
     it(`gives what a straight deck gives (seed ${seed})`, async () => {
@@ -464,10 +550,11 @@ describe('a deck rewound by loop presses at random moments', () => {
       const presses: Press[] = [];
       for (let i = 0, count = 6 + Math.floor(next() * 8); i < count; i++) {
         const atMs = 100 + Math.floor(next() * 800);
-        const kind = Math.floor(next() * 12);
+        const kind = Math.floor(next() * 16);
         const target = TARGET_LIST[Math.floor(next() * TARGET_LIST.length)];
         const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
         const on = next() < 0.5;
+        const draw = drawShaping(next);
         presses.push(
           press(atMs, (deck, rig): DeckCommand => {
             const when =
@@ -477,6 +564,11 @@ describe('a deck rewound by loop presses at random moments', () => {
               case 1:
               case 2:
                 return { kind: 'hot-cue', deck, target, ...when };
+              case 12:
+              case 13:
+              case 14:
+              case 15:
+                return { ...shapingPress(deck, draw, kind - 12), ...when };
               case 3:
                 return { kind: 'jump', deck, target, ...when };
               case 4:
@@ -525,6 +617,187 @@ describe('a deck rewound by loop presses at random moments', () => {
       expect(rewound.warnings.filter((line) => !line.includes('kept its loop'))).toEqual([]);
     });
   }
+});
+
+describe('a deck rewound with the tune shaped', () => {
+  const FULL_LIST: JumpTarget = {
+    startFrame: 200,
+    endFrame: 230,
+    settings: [
+      { setting: SETTING.VOICE_2_MUTE, value: 1 },
+      { setting: SETTING.KEY, value: 7 },
+      { setting: SETTING.CUTOFF_HOLD, value: 600 },
+      { setting: SETTING.VOICE_3_WAVEFORM_HOLD, value: 8 },
+      { setting: SETTING.VOICE_1_FINE, value: -35 },
+    ],
+  };
+  const set = (setting: number, value: number) => (deck: DeckId) =>
+    ({ kind: 'setting', deck, setting, value }) as DeckCommand;
+
+  it('sweeps an offset a setting at a time among held frames', async () => {
+    const sweep: Press[] = [];
+    for (let at = 150, i = 0; at < 800; at += 11, i++) {
+      sweep.push(press(at, set(SETTING.CUTOFF_OFFSET, ((i * 37) % 200) - 100)));
+    }
+    const { difference, rewound } = await compareRewound({ presses: sweep, runMs: 900 });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().timing.rewinds).toBeGreaterThan(20);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('lands a settings list on one frame, with an offset, a hold and a pitch together', async () => {
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(300, (deck) => ({
+          kind: 'settings',
+          deck,
+          settingsIn: 'main',
+          changes: [
+            { setting: SETTING.CUTOFF_OFFSET, value: 120 },
+            { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: 8 },
+            { setting: SETTING.KEY, value: -5 },
+            { setting: SETTING.VOICE_1_MUTE, value: 1 },
+          ],
+        })),
+        ...rewindsEvery(310, 700, 17),
+        press(720, (deck) => ({
+          kind: 'settings',
+          deck,
+          settingsIn: 'main',
+          changes: [
+            { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: HOLD_RELEASED },
+            { setting: SETTING.KEY, value: 0 },
+          ],
+        })),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.landed('settings').every((event) => event.settingsIn === 'main')).toBe(true);
+    expect(rewound.picture().settings.main.map((entry) => entry.setting)).toEqual([
+      SETTING.VOICE_1_MUTE,
+      SETTING.CUTOFF_OFFSET,
+    ]);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('holds Kill across held frames and lets it go', async () => {
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(300, (deck) => ({ kind: 'voice-hold', deck, voice: 0, held: true })),
+        ...rewindsEvery(310, 600, 13),
+        press(620, set(SETTING.VOICE_2_MUTE, 1)),
+        press(650, (deck) => ({ kind: 'voice-hold', deck, voice: 1, held: true })),
+        ...rewindsEvery(660, 800, 13),
+        press(820, (deck) => ({ kind: 'voice-hold', deck, voice: 0, held: false })),
+        press(850, (deck) => ({ kind: 'voice-hold', deck, voice: 1, held: false })),
+      ],
+      runMs: 1000,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.picture().settings.main).toEqual([{ setting: SETTING.VOICE_2_MUTE, value: 1 }]);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('flips a lock on and off, and sets and releases it, through rewinds', async () => {
+    const lock = (lockTo?: boolean) => (deck: DeckId) =>
+      ({
+        kind: 'flip-lock',
+        deck,
+        setting: SETTING.VOICE_1_GATE_HOLD,
+        ...(lockTo === undefined ? {} : { lock: lockTo }),
+      }) as DeckCommand;
+    const { difference, rewound } = await compareRewound({
+      presses: [
+        press(300, lock()),
+        ...rewindsEvery(310, 450, 13),
+        press(470, lock()),
+        ...rewindsEvery(480, 560, 13),
+        press(580, lock(true)),
+        press(640, lock(true)),
+        ...rewindsEvery(650, 760, 13),
+        press(780, lock(false)),
+      ],
+      runMs: 900,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.landed('flip-lock')).toHaveLength(5);
+    expect(rewound.picture().settings.main).toEqual([]);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('flips a lock in a loop’s own list through rewinds between the two presses', async () => {
+    // A lock named a couple of frames ahead lands inside the held frames, and the presses after it rewind to before it.
+    const lock = (deck: DeckId, rig: Rig): DeckCommand => ({
+      kind: 'flip-lock',
+      deck,
+      setting: SETTING.VOICE_3_TEST_HOLD,
+      when: { at: 'frame', frame: nextUnsent(rig) + 2 },
+    });
+    const own: JumpTarget = {
+      startFrame: 200,
+      endFrame: 230,
+      settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+    };
+    const { difference, rewound } = await compareRewound({
+      tune: 'insid3-out',
+      prepare: TARGETS,
+      presses: [
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: own })),
+        ...rewindsEvery(160, 290, 13),
+        press(300, lock),
+        ...rewindsEvery(303, 460, 3),
+        press(470, lock),
+        ...rewindsEvery(473, 600, 3),
+        press(620, (deck) => ({ kind: 'let-go', deck })),
+      ],
+      runMs: 800,
+    });
+
+    expect(difference).toBeNull();
+    expect(rewound.landed('flip-lock').map((event) => event.settingsIn)).toEqual(['loop', 'loop']);
+    expect(rewound.picture().settings).toMatchObject({ main: [], loop: null });
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('plays a loop with a full list of its own in and out through rewinds across both frames', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      tune: 'insid3-out',
+      prepare: TARGETS,
+      presses: [
+        press(100, set(SETTING.CUTOFF_OFFSET, 80)),
+        press(120, set(SETTING.VOICE_3_FREQUENCY_HOLD, 900)),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: FULL_LIST })),
+        ...rewindsEvery(160, 500, 19),
+        press(520, (deck) => ({
+          kind: 'settings',
+          deck,
+          settingsIn: 'loop',
+          changes: [{ setting: SETTING.VOLUME_HOLD, value: 6 }],
+        })),
+        ...rewindsEvery(530, 700, 19),
+        press(720, (deck) => ({ kind: 'let-go', deck })),
+        ...rewindsEvery(730, 900, 19),
+        press(920, (deck) => ({ kind: 'hot-cue', deck, target: FULL_LIST })),
+        ...rewindsEvery(930, 1100, 19),
+        press(1120, (deck) => ({ kind: 'seek', deck, frame: 300 })),
+      ],
+      runMs: 1300,
+    });
+
+    expect(difference).toBeNull();
+    expect(landings(rewound)).toEqual(landings(straight));
+    expect(rewound.picture()).toMatchObject({ settingsInPlay: 'main', loop: null });
+    expect(rewound.picture().settings.main.map((entry) => entry.setting)).toEqual([
+      SETTING.VOICE_3_FREQUENCY_HOLD,
+      SETTING.CUTOFF_OFFSET,
+    ]);
+    expect(rewound.warnings).toEqual([]);
+  });
 });
 
 /** Loops and a cue inside the first 400 frames, which is as far as the register record the hand and slip work on reaches. */
