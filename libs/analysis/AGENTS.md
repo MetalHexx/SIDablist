@@ -103,6 +103,11 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 - **A record's voice control columns are the chip's, not the shadow's.** The shadow keeps the first
   byte of a doubled write; `controlBytes` holds the last, and `toRegisterRecord` swaps it in. Entry
   `i` is the chip after play call `i + 1`; off by one plays the tune a frame late.
+- **`beatsPerMinute` takes the play-call interval at tempo 1, and the tempo apart from it.** From a
+  deck's picture that interval is `rate.nominalIntervalUs / rate.exactCallsPerFrame`; a deck's
+  `update.intervalUs` is already paced at the tempo, so handing it over applies the tempo twice. A grid
+  from a scan holds over a span and answers nothing outside it (`inGridSpan`); whether to show a BPM
+  there is the host's call, not this package's.
 - **The dependency arrow is `analysis → core` only.** `core` must never import from this package.
   `indexTune` receiving the `sidHash` as a parameter, rather than reaching for a hashing routine
   itself, is what keeps that arrow one-directional — see Conventions above.

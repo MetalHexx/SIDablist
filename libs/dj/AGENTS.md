@@ -46,8 +46,9 @@ supplies everything environmental.
   `src/__fixtures__/` holds the tunes cleared for redistribution (`still-time`, `insid3-out`); no
   other HVSC tune goes in the repo.
 - `src/proof/` — specs only, across the whole package: `equivalence.spec.ts` (a deck against a bare
-  engine, and two decks told the same commands), `determinism.spec.ts` (a run replayed from its
-  `landed` events), `asid-sink.spec.ts` (the real ASID sink over a fake port) and
+  engine, with and without a settings list off home, and two decks told the same commands),
+  `determinism.spec.ts` (a run replayed from its `landed` events, taps and their `grid-fitted` events
+  included), `asid-sink.spec.ts` (the real ASID sink over a fake port) and
   `rules-easy-to-lose.spec.ts` (the behaviours a rewrite drops quietly).
 
 ## Conventions
@@ -261,6 +262,15 @@ supplies everything environmental.
 - **`flip-lock` reads `written`, not `sent`.** A lock is the opposite of what the tune wrote in the
   last frame rendered before its landing frame, before any shaping; `sent` is the package's own
   shaped output and would lock against itself.
+- **A command is a press unless `Deck.refusal` lists it as a release.** A press is refused on a deck
+  that is empty, loading or failed; a release (`voice-hold` with `held: false`, `tap-end`, `nudge` 0,
+  `hand-lift`, `let-go`, `stop-loop`, `cancel-queued`) and a `settings` never are. A new command that
+  should be a release but is not listed there is refused exactly when a host's key-up needs it, and a
+  hold stays down.
+- **A `settings` names its list and is dropped when that list is not in play on its landing frame.**
+  `landed` then carries `dropped: true` and no `settingsIn`. It is never applied to the other list,
+  however a host a frame behind saw the loop; `setting` and `flip-lock` have no name and go to the list
+  in play on their landing frame, reporting it as `settingsIn`.
 - **`voice-hold` is the engine's and is never carried.** The engine inverts the voice's latched mute
   while it is held and keeps the hold in its own saved state. It is in no settings list, no jump's
   settings and no picture, and a load releases it.
@@ -284,6 +294,13 @@ supplies everything environmental.
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)
+
+- **Changed what a tap marks or fits (`deck/deck.ts`'s tap path, the run in `deck/deck-state.ts`)?**
+  `fitBeatGrid` reads a mark as a position on the register record's entry basis, against `noteStarts`
+  of the same record, and every fitted grid rebuilds the restore ring; a mark on another basis fits a
+  grid from nothing, or a wrong one, with no error. Run `deck/taps.spec.ts`, `deck/rewind.spec.ts`,
+  `proof/determinism.spec.ts` and `libs/analysis`'s `beat-grid.spec.ts`. Detail:
+  [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md)
 
 - **Changed what a deck delivers: a landing rule, `fixed`, the `landed` event, the sink tap, or how
   the deck reads a sink's `passedCount` and `replaceFrom` (`deck/`, `testing/holding-sink.ts`)?**

@@ -1,6 +1,9 @@
 import { loopStartAtOrBefore } from '@sidablist/analysis';
+import { readSidField } from '@sidablist/core';
+import type { SidField } from '@sidablist/core';
 import { describe, expect, it } from 'vitest';
 import type { DeckCommand, Grid, JumpTarget } from '../messages/commands.js';
+import { SETTING, SETTING_NUMBERS, describeSetting } from '../messages/setting-table.js';
 import { Rig, multiSongTune } from '../testing/harness.js';
 
 /**
@@ -59,6 +62,15 @@ describe('presses and releases', () => {
     { kind: 'nudge', deck: 'a', amount: 0 },
     { kind: 'hand-lift', deck: 'a', atMs: 0, gripSeconds: 0.25 },
     { kind: 'stop-loop', deck: 'a' },
+    { kind: 'voice-hold', deck: 'a', voice: 0, held: false },
+    { kind: 'tap-end', deck: 'a' },
+    // A host's panic is always accepted.
+    {
+      kind: 'settings',
+      deck: 'a',
+      settingsIn: 'main',
+      changes: [{ setting: SETTING.KEY, value: 1 }],
+    },
   ];
   const PRESSES: DeckCommand[] = [
     { kind: 'play', deck: 'a' },
@@ -66,6 +78,10 @@ describe('presses and releases', () => {
     { kind: 'nudge', deck: 'a', amount: 0.05 },
     { kind: 'hot-cue', deck: 'a', target: LOOP_A },
     { kind: 'hand-touch', deck: 'a', atMs: 0 },
+    { kind: 'setting', deck: 'a', setting: SETTING.KEY, value: 2 },
+    { kind: 'flip-lock', deck: 'a', setting: SETTING.VOICE_1_GATE_HOLD },
+    { kind: 'voice-hold', deck: 'a', voice: 0, held: true },
+    { kind: 'tap', deck: 'a', atMs: 0 },
   ];
 
   it('land only on a settled deck, while a release goes through on an empty, a loading and a failed one', async () => {
@@ -422,6 +438,290 @@ describe('what the package does without the engine’s help', () => {
     const main = rig.picture().settings.main;
     expect(main.find((s) => s.setting === 3)).toEqual({ setting: 3, value: 1 });
     expect(main.find((s) => s.setting === 2)).toBeUndefined();
+    rig.dispose();
+  });
+});
+
+/** A PSID whose play routine is `code`, at $1010, with `table` at $1020 for it to read. */
+function psid(code: readonly number[], table: readonly number[] = []): Uint8Array {
+  const header = new Uint8Array(0x7c);
+  const view = new DataView(header.buffer);
+  header.set([0x50, 0x53, 0x49, 0x44]);
+  view.setUint16(0x04, 2);
+  view.setUint16(0x06, 0x7c);
+  view.setUint16(0x08, 0x1000);
+  view.setUint16(0x0a, 0x1000);
+  view.setUint16(0x0c, 0x1010);
+  view.setUint16(0x0e, 1);
+  view.setUint16(0x10, 1);
+  const payload = new Uint8Array(0x40);
+  payload[0] = 0x60;
+  payload.set(code, 0x10);
+  payload.set(table, 0x20);
+  const bytes = new Uint8Array(header.length + payload.length);
+  bytes.set(header);
+  bytes.set(payload, header.length);
+  return bytes;
+}
+
+/** Copies the 25 bytes at $1020 to the chip every frame: LDX #24; LDA $1020,X; STA $D400,X; DEX; BPL; RTS. */
+const COPY_TABLE = [0xa2, 0x18, 0xbd, 0x20, 0x10, 0x9d, 0x00, 0xd4, 0xca, 0x10, 0xf7, 0x60];
+/** Every voice pulse and gated, a low-pass filter at cutoff 256 on all three, full volume; never moves. */
+const STEADY = [
+  0x45, 0x1d, 0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x20, 0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x30,
+  0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x20, 0x47, 0x1f,
+];
+/** Writes voice 1's gate high from the 30th play call on: INC $FB; LDA $FB; CMP #30; LDA #0; ROL A; STA $D404; RTS. */
+const GATE_RISES = [0xe6, 0xfb, 0xa5, 0xfb, 0xc9, 0x1e, 0xa9, 0x00, 0x2a, 0x8d, 0x04, 0xd4, 0x60];
+const CONTROL = [4, 11, 18];
+const CUTOFF: SidField = { name: 'cutoff' };
+const frequency = (voice: number): SidField => ({ name: 'frequency', voice });
+
+/** A deck on the steady tune, loaded with `load` and playing. */
+async function shaped(load: Partial<Extract<DeckCommand, { kind: 'load' }>> = {}): Promise<Rig> {
+  const rig = new Rig();
+  rig.addTune('steady', psid(COPY_TABLE, STEADY));
+  rig.addDeck('a');
+  await rig.load('a', 'steady', { ends: 'playing', ...load });
+  rig.advance(200);
+  return rig;
+}
+
+/** The chip's registers as the tune wrote them and as they are sent, at the render frontier. */
+function chip(rig: Rig): { written: Uint8Array; sent: Uint8Array } {
+  rig.send({ kind: 'registers', deck: 'a' });
+  const answers = rig.ofKind('registers');
+  return answers[answers.length - 1];
+}
+
+describe('a load that is overtaken', () => {
+  it('leaves nothing of the shaping behind: offsets, holds, pitch, mutes and a voice hold are home', async () => {
+    const rig = await shaped({
+      settings: [
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+        { setting: SETTING.VOICE_2_FREQUENCY_HOLD, value: 900 },
+        { setting: SETTING.KEY, value: 5 },
+        { setting: SETTING.VOICE_3_MUTE, value: 1 },
+      ],
+    });
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    const before = chip(rig);
+    expect(Array.from(before.sent)).not.toEqual(Array.from(before.written));
+    expect(before.sent[CONTROL[0]]).toBe(0);
+
+    rig.addTune('steady-b', psid(COPY_TABLE, STEADY));
+    rig.addTune('steady-c', psid(COPY_TABLE, STEADY));
+    const slow = rig.holdFetch('steady-b');
+    rig.send({ kind: 'load', deck: 'a', tune: 'steady-b', subtune: 1, ends: 'playing' });
+    await rig.microtasks();
+    // Reset before the first wait: the picture and the engine are home while the fetch is out.
+    expect(rig.picture().settings.main).toEqual([]);
+    const waiting = chip(rig);
+    expect(Array.from(waiting.sent)).toEqual(Array.from(waiting.written));
+
+    rig.send({ kind: 'load', deck: 'a', tune: 'steady-c', subtune: 1, ends: 'playing' });
+    await rig.settle();
+    slow.release();
+    await rig.settle();
+    rig.advance(200);
+
+    const now = chip(rig);
+    expect(rig.picture().tune?.tune).toBe('steady-c');
+    expect(rig.picture().settings.main).toEqual([]);
+    expect(Array.from(now.sent)).toEqual(Array.from(now.written));
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    rig.dispose();
+  });
+});
+
+describe('a voice hold', () => {
+  const OWN: JumpTarget = {
+    startFrame: 100,
+    endFrame: 130,
+    settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+  };
+
+  it('is never carried: it outlives a loop’s own settings and a let-go untouched, and a load releases it', async () => {
+    const rig = await shaped({ settings: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] });
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
+    rig.advance(100);
+    // The loop's list swapped the mutes under the hold: voice 2 muted, voice 3 sounding, voice 1 still held.
+    let now = chip(rig);
+    expect(rig.picture().settingsInPlay).toBe('loop');
+    expect(now.sent[CONTROL[0]]).toBe(0);
+    expect(now.sent[CONTROL[1]]).toBe(0);
+    expect(now.sent[CONTROL[2]]).toBe(0x41);
+    expect(rig.picture().settings.loop).toEqual([{ setting: SETTING.VOICE_2_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: false });
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    await send(rig, { kind: 'let-go', deck: 'a' });
+    rig.advance(100);
+    now = chip(rig);
+    expect(rig.picture().settingsInPlay).toBe('main');
+    expect(now.sent[CONTROL[0]]).toBe(0);
+    expect(now.sent[CONTROL[1]]).toBe(0x41);
+    expect(now.sent[CONTROL[2]]).toBe(0);
+
+    // Let go, the voice sounds as its list says: the hold left no mute in either list.
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: false });
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    expect(rig.picture().settings.main).toEqual([{ setting: SETTING.VOICE_3_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    expect(chip(rig).sent[CONTROL[0]]).toBe(0);
+    await rig.load('a', 'steady', { ends: 'playing' });
+    rig.advance(200);
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    expect(rig.picture().settings.main).toEqual([]);
+    rig.dispose();
+  });
+});
+
+describe('a settings list that names the list that has just stopped playing', () => {
+  it('is dropped, and not applied to the one that took its place', async () => {
+    const OWN: JumpTarget = {
+      startFrame: 100,
+      endFrame: 130,
+      settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+    };
+    const rig = await shaped();
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+
+    // The loop's own list is in play from the frame before the list is sent, as seen by a host a frame behind.
+    const updates = rig.ofKind('update');
+    const at = updates[updates.length - 1].streamFrame + 1 - (rig.sinks.get('a')?.holding ?? 0) + 2;
+    rig.send({ kind: 'hot-cue', deck: 'a', target: OWN, when: { at: 'frame', frame: at } });
+    rig.send({
+      kind: 'settings',
+      deck: 'a',
+      settingsIn: 'main',
+      changes: [{ setting: SETTING.CUTOFF_OFFSET, value: 100 }],
+      when: { at: 'frame', frame: at + 1 },
+    });
+    await rig.microtasks();
+    rig.advance(100);
+
+    const [late] = rig.landed('settings');
+    expect(late).toMatchObject({ dropped: true, frame: at + 1 });
+    expect(rig.picture()).toMatchObject({
+      settingsInPlay: 'loop',
+      settings: { main: [], loop: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }] },
+    });
+    const now = chip(rig);
+    expect(readSidField(now.sent, CUTOFF)).toBe(readSidField(now.written, CUTOFF));
+    rig.dispose();
+  });
+});
+
+describe('a lock flip', () => {
+  /** A deck on the tune whose gate rises in a known play call, paused with a flip waiting at stream frame `at`. */
+  async function flippedAt(at: number): Promise<Rig> {
+    const rig = new Rig();
+    rig.addTune('rises', psid(GATE_RISES));
+    rig.addDeck('a');
+    await rig.load('a', 'rises', { ends: 'paused' });
+    rig.send({
+      kind: 'flip-lock',
+      deck: 'a',
+      setting: SETTING.VOICE_1_GATE_HOLD,
+      when: { at: 'frame', frame: at },
+    });
+    await rig.microtasks();
+    rig.send({ kind: 'play', deck: 'a' });
+    await rig.settle();
+    rig.advance(1500);
+    return rig;
+  }
+
+  const gate = (rig: Rig, frame: number): number => (wrote(rig, frame, 4) ?? -1) & 1;
+
+  it('reads the tune as it stands on its landing frame: the frame before it, not the last one a host saw', async () => {
+    const probe = new Rig();
+    probe.addTune('rises', psid(GATE_RISES));
+    probe.addDeck('a');
+    await probe.load('a', 'rises', { ends: 'playing' });
+    probe.advance(1500);
+    const rise = probe
+      .frames()
+      .findIndex((frame) => (frame.values[frame.registers.indexOf(4)] & 1) === 1);
+    probe.dispose();
+    expect(rise).toBeGreaterThan(2);
+
+    // The tune writes the new gate in frame `rise`. A flip landing on the next frame locks to the opposite of it.
+    const after = await flippedAt(rise + 1);
+    expect(after.landed('flip-lock')[0].frame).toBe(rise + 1);
+    expect(after.picture().settings.main).toEqual([
+      { setting: SETTING.VOICE_1_GATE_HOLD, value: 0 },
+    ]);
+    expect(gate(after, rise)).toBe(1);
+    expect(gate(after, rise + 1)).toBe(0);
+    after.dispose();
+
+    // Landing on `rise` itself, it reads the frame before, which still wrote the old gate.
+    const on = await flippedAt(rise);
+    expect(on.picture().settings.main).toEqual([{ setting: SETTING.VOICE_1_GATE_HOLD, value: 1 }]);
+    expect(gate(on, rise - 1)).toBe(0);
+    expect(gate(on, rise)).toBe(1);
+    on.dispose();
+  });
+});
+
+describe('a panic', () => {
+  it('is one settings list at home: the panel goes home on one frame, and mutes and speed stay', async () => {
+    const rig = await shaped({
+      speed: 1.3,
+      settings: [
+        { setting: SETTING.VOICE_2_MUTE, value: 1 },
+        { setting: SETTING.KEY, value: 5 },
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+        { setting: SETTING.VOICE_1_WAVEFORM_HOLD, value: 2 },
+        { setting: SETTING.VOICE_3_COARSE, value: -7 },
+        { setting: SETTING.VOICE_2_FINE, value: 40 },
+      ],
+    });
+    const shapedChip = chip(rig);
+    expect(readSidField(shapedChip.sent, frequency(0))).not.toBe(
+      readSidField(shapedChip.written, frequency(0)),
+    );
+
+    // What panic puts back is the host's list: every setting but the mutes, at its home.
+    const changes = SETTING_NUMBERS.flatMap((setting) => {
+      const info = describeSetting(setting);
+      return info === null || info.kind === 'mute' ? [] : [{ setting, value: info.home }];
+    });
+    await send(rig, { kind: 'settings', deck: 'a', settingsIn: 'main', changes });
+    rig.advance(100);
+
+    const [panic] = rig.landed('settings');
+    expect(panic.settingsIn).toBe('main');
+    const now = chip(rig);
+    const homeSent = Array.from(now.written);
+    homeSent[CONTROL[1]] = 0;
+    expect(Array.from(now.sent)).toEqual(homeSent);
+    expect(rig.picture().settings.main).toEqual([{ setting: SETTING.VOICE_2_MUTE, value: 1 }]);
+    expect(rig.picture().tempo.speed).toBe(1.3);
+    // One frame: everything but the mutes is home from the landing frame on, and was shaped the frame before.
+    for (const register of [0, 1, 22]) {
+      expect(wrote(rig, panic.frame, register)).toBe(STEADY[register]);
+      expect(wrote(rig, panic.frame - 1, register)).not.toBe(STEADY[register]);
+    }
     rig.dispose();
   });
 });
