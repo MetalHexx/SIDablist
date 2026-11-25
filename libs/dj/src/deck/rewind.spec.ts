@@ -1273,6 +1273,11 @@ const tapOn =
     return { kind: 'tap', deck, atMs: update.dueAtMs + offsetMs };
   };
 const tapEnd = (deck: DeckId): DeckCommand => ({ kind: 'tap-end', deck });
+/** A `when` that fixes a command `frames` frames past the next frame the sink has not been given. */
+const aheadOf = (rig: Rig, frames: number): When => ({
+  at: 'frame',
+  frame: nextUnsent(rig) + frames,
+});
 const nudgeZero = (deck: DeckId): DeckCommand => ({ kind: 'nudge', deck, amount: 0 });
 
 /**
@@ -1372,10 +1377,6 @@ describe('a deck rewound with taps', () => {
 
 describe('a deck rewound across a run that was closed and begun again', () => {
   it('puts the old run back for the tap that lands before the tap-end that closed it', async () => {
-    const aheadOf = (rig: Rig, frames: number): When => ({
-      at: 'frame',
-      frame: nextUnsent(rig) + frames,
-    });
     const { difference, rewound, straight } = await compareRewound({
       tune: TAP_TUNE,
       lookaheadMs: 120,
@@ -1399,6 +1400,40 @@ describe('a deck rewound across a run that was closed and begun again', () => {
     expect(fits.map((event) => event.taps)).toEqual([4]);
     expect(fits[0].grid.beatOneFrame).toBeGreaterThan(60);
     expect(fits).toEqual(straight.ofKind('grid-fitted'));
+  });
+});
+
+describe('a deck rewound across a tap that lands before one it has already applied', () => {
+  it('fits the later tap again from the run it now follows', async () => {
+    const { difference, rewound, straight } = await compareRewound({
+      tune: TAP_TUNE,
+      lookaheadMs: 120,
+      load: { grid: TAP_GRID },
+      presses: [
+        press(700, tapOn(65)),
+        press(820, tapOn(77)),
+        press(940, tapOn(89)),
+        press(1060, tapOn(101)),
+        // The fifth mark fits the grid in use, so nothing is rebuilt and a tap can still land ahead of it.
+        press(1300, (deck, rig) => ({ ...tapOn(113)(deck, rig), when: aheadOf(rig, 8) })),
+        // The sixth mark lands before it, so the rewind applies the fifth tap again after six marks.
+        press(1302, tapOn(29)),
+        ...rewindsEvery(1310, 1500, 17),
+        press(1520, liveSize(24)),
+        press(1600, liveStart),
+        ...rewindsEvery(1610, 1900, 23),
+      ],
+      runMs: 2100,
+    });
+
+    expect(difference).toBeNull();
+    const fits = rewound.ofKind('grid-fitted');
+    expect(fits.map((event) => event.taps)).toEqual([4, 5, 6]);
+    expect(fits[1].grid).not.toEqual(fits[0].grid);
+    expect(fits[2].grid).toEqual(fits[1].grid);
+    expect(fits).toEqual(straight.ofKind('grid-fitted'));
+    expect(rewound.picture().grid).toEqual(straight.picture().grid);
+    expect(rewound.ofKind('picture').some((picture) => picture.loop?.live === true)).toBe(true);
   });
 });
 

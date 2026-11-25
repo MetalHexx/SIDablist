@@ -178,12 +178,14 @@ supplies everything environmental.
   are immutable) and the run of taps (the positions its taps marked, and how many) are in every restore
   point and both copy methods. The grid is read from there by the live looper, the gate and the picture;
   a copy kept anywhere else restores almost exactly. `tap-end` and a load empty the run.
-- **A tap's mark and its fit are first answers.** Both are kept on the log entry and reused when a
-  rewind applies the tap again: the history behind the mark (each delivered frame's due time and
-  position, by `frame % 512`, outside `DeckState`) is overwritten by re-renders, and fitting allocates.
-  A fit that changes the grid sets it and declares the lines after the tap's own state changes, so the
-  restore point the new ring is seeded with holds them; every fit, changed or not, queues its
-  `grid-fitted` beside the `landed`, which a rewind discards and makes again once.
+- **A tap's mark is a first answer; its fit is not.** The mark is kept on the log entry and reused when
+  a rewind applies the tap again: the history behind it (each delivered frame's due time and position,
+  by `frame % 512`, outside `DeckState`) is overwritten by re-renders. The fit is made again on every
+  application, because it is a function of the whole run in force and a replay's run can differ: a
+  tap landing ahead of one already applied adds a mark before it, and a cached fit would set the grid
+  from the shorter run. A fit that changes the grid sets it and declares the lines after the tap's own
+  state changes, so the restore point the new ring is seeded with holds them; every fit, changed or
+  not, queues its `grid-fitted` beside the `landed`, which a rewind discards and makes again once.
 - **A tap's mark searches only the frames before its own landing frame.** Never the held frames a
   flush is about to re-render: searching from the newest render would mark a frame the replay, which
   sees only the frames before the landing frame, never sees, and a replay at the fixed frame would

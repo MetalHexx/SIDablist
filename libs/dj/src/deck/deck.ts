@@ -1030,10 +1030,11 @@ export class Deck {
    * is seeded with holds them). Every fit is reported. A tap on a deck that is not playing, or
    * before the register record has arrived, does nothing and says so the first time.
    *
-   * The mark and the fit are first answers: the history behind the mark is rewritten by re-renders
-   * and fitting allocates, so a re-application reuses both. The mark looks only at frames before
-   * `frame`, never at the held ones a flush is about to re-render, so a replay at `frame` marks the
-   * same one.
+   * The mark is a first answer: the history behind it is rewritten by re-renders, so a
+   * re-application reuses it. It looks only at frames before `frame`, never at the held ones a flush
+   * is about to re-render, so a replay at `frame` marks the same one. The fit is made again on every
+   * application, because the run in force can differ on a replay: a tap landing ahead of this one
+   * adds a mark before it. Fitting allocates, between ticks, never on the frame path.
    */
   private applyTap(entry: LogEntry, frame: number, atMs: number): void {
     const state = this.state;
@@ -1051,11 +1052,7 @@ export class Deck {
     state.addTapMark(entry.mark);
     const taps = state.tapCount;
     if (taps < FIT_FROM_TAPS) return;
-    if (!entry.fitAsked) {
-      entry.fitAsked = true;
-      entry.fit = fitBeatGrid(state.tapRun(), known.starts);
-    }
-    const fit = entry.fit;
+    const fit = fitBeatGrid(state.tapRun(), known.starts);
     if (fit === null) return;
     const grid = state.grid;
     if (
