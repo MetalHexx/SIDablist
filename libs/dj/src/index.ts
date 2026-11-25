@@ -1,4 +1,5 @@
-export { SETTING } from './messages/commands.js';
+export { HOLD_RELEASED, SETTING, describeSetting } from './messages/setting-table.js';
+export type { SettingInfo, SettingKind } from './messages/setting-table.js';
 export type {
   DeckCommand,
   DeckId,
@@ -17,7 +18,7 @@ export type {
   DeckRegisters,
   DeckUpdate,
   DjReport,
-  KeyResolution,
+  HotCueResolution,
 } from './messages/reports.js';
 export { validateInbound } from './messages/validate.js';
 export type { ValidationResult } from './messages/validate.js';

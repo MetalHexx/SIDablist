@@ -43,7 +43,7 @@ async function send(rig: Rig, command: Parameters<Rig['send']>[0]): Promise<void
 }
 
 const key = (rig: Rig, target: JumpTarget): Promise<void> =>
-  send(rig, { kind: 'key', deck: 'a', target });
+  send(rig, { kind: 'hot-cue', deck: 'a', target });
 
 /** The playhead of each delivered frame, from stream frame `from` up to `to`. */
 function playhead(rig: Rig, from: number, to: number): number[] {
@@ -68,29 +68,29 @@ function lastJumpLanded(rig: Rig): JumpLanded {
   return landed[landed.length - 1];
 }
 
-describe('a key press', () => {
+describe('a hot cue press', () => {
   it('resolves from the deck at its landing frame: start, queue, cancel and let go', async () => {
     const rig = await playing([500, 1500]);
 
     await key(rig, LOOP_A);
     rig.advance(100);
-    expect(rig.landed('key')[0]).toMatchObject({ resolved: 'start' });
+    expect(rig.landed('hot-cue')[0]).toMatchObject({ resolved: 'start' });
     expect(rig.picture().loop).toMatchObject({ startFrame: 500, endFrame: 520 });
 
     await key(rig, CUE);
     rig.advance(20);
-    expect(rig.landed('key')[1]).toMatchObject({ resolved: 'queue' });
+    expect(rig.landed('hot-cue')[1]).toMatchObject({ resolved: 'queue' });
     expect(rig.picture().queued).toEqual(CUE);
 
     await key(rig, CUE);
     rig.advance(20);
-    expect(rig.landed('key')[2]).toMatchObject({ resolved: 'cancel' });
+    expect(rig.landed('hot-cue')[2]).toMatchObject({ resolved: 'cancel' });
     expect(rig.picture().queued).toBeNull();
     expect(rig.picture().loop).not.toBeNull();
 
     await key(rig, LOOP_A);
     rig.advance(20);
-    expect(rig.landed('key')[3]).toMatchObject({ resolved: 'let-go' });
+    expect(rig.landed('hot-cue')[3]).toMatchObject({ resolved: 'let-go' });
     expect(rig.picture().loop).toBeNull();
     expect(rig.warnings).toEqual([]);
     rig.dispose();
@@ -103,7 +103,7 @@ describe('a key press', () => {
     await key(rig, CUE);
     rig.advance(20);
 
-    for (const landed of rig.landed('key')) {
+    for (const landed of rig.landed('hot-cue')) {
       expect(landed.fixed).toEqual({ at: 'frame', frame: landed.frame });
     }
     rig.dispose();
@@ -117,12 +117,12 @@ describe('a key press', () => {
     await rig.settle();
     expect(rig.picture().transport).toBe('stopped');
 
-    rig.send({ kind: 'key', deck: 'a', target: LOOP_A });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: LOOP_A });
     await rig.settle();
     rig.advance(200);
 
     expect(rig.picture().transport).toBe('playing');
-    expect(rig.landed('key')[0]).toMatchObject({ resolved: 'start' });
+    expect(rig.landed('hot-cue')[0]).toMatchObject({ resolved: 'start' });
     expect(playhead(rig, 0, 1)[0]).toBe(500);
     expect(Math.max(...playhead(rig, 0, 10))).toBeLessThan(520);
     expect(rig.picture().loop).toMatchObject({ startFrame: 500, endFrame: 520 });
@@ -133,10 +133,10 @@ describe('a key press', () => {
     const rig = await playing([500, 1500]);
     await key(rig, LOOP_A);
     rig.advance(100);
-    const pressed = rig.landed('key')[0].frame;
+    const pressed = rig.landed('hot-cue')[0].frame;
     await key(rig, CUE);
     rig.advance(20);
-    expect(rig.landed('key')[1]).toMatchObject({ resolved: 'queue' });
+    expect(rig.landed('hot-cue')[1]).toMatchObject({ resolved: 'queue' });
     expect(rig.ofKind('jump-landed')).toEqual([]);
 
     rig.advance(600);
@@ -162,7 +162,7 @@ describe('a queued target', () => {
     // The cue is declared and queued in one turn. One microtask runs the flush that queues it, and
     // the image it asks for is not built until the turns after: time passes first, laps and all.
     rig.send({ kind: 'targets', deck: 'a', frames: [500, 2500] });
-    rig.send({ kind: 'key', deck: 'a', target: { startFrame: 2500, endFrame: null } });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: { startFrame: 2500, endFrame: null } });
     await Promise.resolve();
     expect(rig.picture().queued).toMatchObject({ startFrame: 2500 });
     expect(rig.picture().readyFrames).not.toContain(2500);
@@ -174,7 +174,7 @@ describe('a queued target', () => {
     expect(rig.picture().readyFrames).toContain(2500);
     rig.advance(500);
     const landing = lastJumpLanded(rig);
-    const pressed = rig.landed('key')[1].frame;
+    const pressed = rig.landed('hot-cue')[1].frame;
     expect(landing).toMatchObject({ via: 'pass-end', startFrame: 2500 });
     expect(landing.frame).toBeGreaterThan(pressed + 20);
     // At a wrap, not when the image arrived: the frame before is the last one a lap plays.
@@ -191,11 +191,11 @@ describe('a queued target', () => {
     rig.advance(100);
     expect(rig.picture().transport).toBe('paused');
 
-    rig.send({ kind: 'key', deck: 'a', target: CUE });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: CUE });
     await rig.settle();
     rig.advance(400);
 
-    expect(rig.landed('key')[1]).toMatchObject({ resolved: 'queue' });
+    expect(rig.landed('hot-cue')[1]).toMatchObject({ resolved: 'queue' });
     expect(rig.picture().transport).toBe('playing');
     expect(lastJumpLanded(rig)).toMatchObject({ via: 'pass-end', startFrame: 1500 });
     rig.dispose();
@@ -205,12 +205,12 @@ describe('a queued target', () => {
     const rig = new Rig();
     rig.addDeck('a');
     rig.send({ kind: 'jump', deck: 'a', target: LOOP_A });
-    rig.send({ kind: 'key', deck: 'a', target: LOOP_A });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: LOOP_A });
     await rig.microtasks();
 
     expect(rig.warnings).toEqual([
       'dj: refused jump: jump on a deck that is empty',
-      'dj: refused key: key on a deck that is empty',
+      'dj: refused hot-cue: hot-cue on a deck that is empty',
     ]);
     expect(rig.landed()).toEqual([]);
     rig.dispose();
@@ -436,7 +436,7 @@ describe('leaving a loop', () => {
     rig.advance(100);
     // A target that waits for its image, and a cue queued behind the loop: one turn, one flush.
     rig.send({ kind: 'jump', deck: 'a', target: { startFrame: 3000, endFrame: null } });
-    rig.send({ kind: 'key', deck: 'a', target: CUE });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: CUE });
     await rig.microtasks();
     expect(rig.picture().queued).toEqual(CUE);
     expect(rig.picture().waiting).not.toBeNull();
@@ -454,7 +454,7 @@ describe('leaving a loop', () => {
     rig.dispose();
   });
 
-  it('cancels a waiting target with a key on it', async () => {
+  it('cancels a waiting target with a hot cue on it', async () => {
     const rig = await playing([500]);
     await key(rig, LOOP_A);
     rig.advance(100);
@@ -464,7 +464,7 @@ describe('leaving a loop', () => {
     await key(rig, waiting);
     rig.advance(400);
 
-    expect(rig.landed('key')[1]).toMatchObject({ resolved: 'cancel' });
+    expect(rig.landed('hot-cue')[1]).toMatchObject({ resolved: 'cancel' });
     expect(rig.picture().waiting).toBeNull();
     expect(rig.ofKind('jump-landed')).toEqual([]);
     rig.dispose();
@@ -475,7 +475,7 @@ describe('leaving a loop', () => {
     await key(rig, LOOP_A);
     rig.advance(100);
     rig.send({ kind: 'jump', deck: 'a', target: { startFrame: 3000, endFrame: null } });
-    rig.send({ kind: 'key', deck: 'a', target: CUE });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: CUE });
     rig.send({ kind: 'stop-loop', deck: 'a' });
     await rig.microtasks();
     rig.advance(600);
@@ -678,7 +678,7 @@ describe('a loop with settings of its own', () => {
 
     await key(rig, OWN);
     rig.advance(400);
-    expectMutedFrom(rig, rig.landed('key')[0].frame);
+    expectMutedFrom(rig, rig.landed('hot-cue')[0].frame);
     expect(rig.picture().settingsInPlay).toBe('loop');
     expect(rig.picture().settings.loop).toEqual([
       { setting: 1, value: 0 },
@@ -741,7 +741,7 @@ describe('a loop with settings of its own', () => {
     rig.advance(100);
     await key(rig, SHARED);
     rig.advance(20);
-    expect(rig.landed('key')[1]).toMatchObject({ resolved: 'queue' });
+    expect(rig.landed('hot-cue')[1]).toMatchObject({ resolved: 'queue' });
     expect(rig.picture().settingsInPlay).toBe('loop');
 
     rig.advance(600);

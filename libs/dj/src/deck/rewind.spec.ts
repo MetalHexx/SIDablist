@@ -325,7 +325,7 @@ describe('a deck rewound with loops in play', () => {
     const { difference, rewound, straight } = await compareRewound({
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_A })),
         ...rewindsEvery(200, 700, 23),
       ],
       runMs: 900,
@@ -342,8 +342,8 @@ describe('a deck rewound with loops in play', () => {
     const { difference, rewound, straight } = await compareRewound({
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
-        press(250, (deck) => ({ kind: 'key', deck, target: LOOP_B })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_A })),
+        press(250, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_B })),
         ...rewindsEvery(260, 700, 17),
       ],
       runMs: 900,
@@ -363,7 +363,7 @@ describe('a deck rewound with loops in play', () => {
     const { difference, rewound, straight } = await compareRewound({
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_A })),
         press(250, (deck) => ({
           kind: 'jump',
           deck,
@@ -385,7 +385,7 @@ describe('a deck rewound with loops in play', () => {
     const { difference, rewound, straight } = await compareRewound({
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_A })),
         press(250, (deck) => ({ kind: 'loop-bounds', deck, startFrame: 500, endFrame: 510 })),
         ...rewindsEvery(260, 700, 17),
       ],
@@ -405,11 +405,11 @@ describe('a deck rewound with loops in play', () => {
     const { difference, rewound } = await compareRewound({
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: LOOP_A })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: LOOP_A })),
         press(250, (deck) => ({ kind: 'loop-bounds', deck, startFrame: 500, endFrame: 510 })),
         press(300, (deck) => ({ kind: 'loop-wraps', deck, wraps: true })),
         ...rewindsEvery(310, 600, 21),
-        press(620, (deck) => ({ kind: 'key', deck, target: CUE })),
+        press(620, (deck) => ({ kind: 'hot-cue', deck, target: CUE })),
         press(650, (deck) => ({ kind: 'loop-wraps', deck, wraps: false })),
         ...rewindsEvery(660, 900, 21),
       ],
@@ -433,12 +433,12 @@ describe('a deck rewound with loops in play', () => {
       tune: 'insid3-out',
       prepare: TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: own })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: own })),
         press(260, (deck) => ({ kind: 'setting', deck, setting: 1, value: 1 })),
-        press(330, (deck) => ({ kind: 'key', deck, target: shared })),
+        press(330, (deck) => ({ kind: 'hot-cue', deck, target: shared })),
         press(360, (deck) => ({ kind: 'loop-wraps', deck, wraps: true })),
         ...rewindsEvery(370, 800, 19),
-        press(850, (deck) => ({ kind: 'key', deck, target: own })),
+        press(850, (deck) => ({ kind: 'hot-cue', deck, target: own })),
         press(1000, (deck) => ({ kind: 'let-go', deck })),
       ],
       runMs: 1200,
@@ -476,7 +476,7 @@ describe('a deck rewound by loop presses at random moments', () => {
               case 0:
               case 1:
               case 2:
-                return { kind: 'key', deck, target, ...when };
+                return { kind: 'hot-cue', deck, target, ...when };
               case 3:
                 return { kind: 'jump', deck, target, ...when };
               case 4:
@@ -623,7 +623,7 @@ describe('a deck rewound with the hand on the record', () => {
     const { difference, rewound } = await compareRewound({
       prepare: SLIP_TARGETS,
       presses: [
-        press(150, (deck) => ({ kind: 'key', deck, target: SLIPPED_B })),
+        press(150, (deck) => ({ kind: 'hot-cue', deck, target: SLIPPED_B })),
         press(500, touch),
         press(520, moveTo(-6)),
         press(540, moveTo(-12)),
@@ -650,9 +650,9 @@ describe('a deck rewound with slip departed', () => {
       prepare: SLIP_TARGETS,
       presses: [
         press(150, slipOn(true)),
-        press(200, (deck) => ({ kind: 'key', deck, target: SLIPPED })),
+        press(200, (deck) => ({ kind: 'hot-cue', deck, target: SLIPPED })),
         ...rewindsEvery(210, 500, 23),
-        press(520, (deck) => ({ kind: 'key', deck, target: SLIPPED_B })),
+        press(520, (deck) => ({ kind: 'hot-cue', deck, target: SLIPPED_B })),
         ...rewindsEvery(530, 900, 23),
         press(920, (deck) => ({ kind: 'let-go', deck })),
         ...rewindsEvery(930, 1100, 23),
@@ -672,7 +672,7 @@ describe('a deck rewound with slip departed', () => {
       prepare: SLIP_TARGETS,
       presses: [
         press(150, slipOn(true)),
-        press(200, (deck) => ({ kind: 'key', deck, target: SLIPPED })),
+        press(200, (deck) => ({ kind: 'hot-cue', deck, target: SLIPPED })),
         ...rewindsEvery(210, 400, 23),
         press(420, touch),
         press(450, moveTo(15)),
@@ -749,7 +749,7 @@ describe('a deck rewound by hand and slip presses at random moments', () => {
                 return { kind: 'slip', deck, on, ...when };
               case 6:
               case 7:
-                return { kind: 'key', deck, target, ...when };
+                return { kind: 'hot-cue', deck, target, ...when };
               case 8:
                 return { kind: 'let-go', deck, ...when };
               case 9:
@@ -789,7 +789,7 @@ const liveSize =
   (deck: DeckId): DeckCommand => ({ kind: 'live-loop-size', deck, lengthFrames });
 const liveStart = (deck: DeckId): DeckCommand => ({ kind: 'live-loop', deck });
 const liveEnd = (deck: DeckId): DeckCommand => ({ kind: 'live-loop-end', deck });
-const keyUnder = (deck: DeckId): DeckCommand => ({ kind: 'key', deck, target: LIVE_UNDER });
+const hotCueUnder = (deck: DeckId): DeckCommand => ({ kind: 'hot-cue', deck, target: LIVE_UNDER });
 
 describe('a deck rewound with a live loop', () => {
   it('runs a live loop through rewinds, with a shrink pending, a grown size and its end', async () => {
@@ -823,10 +823,10 @@ describe('a deck rewound with a live loop', () => {
       prepare: LIVE_TARGETS,
       presses: [
         press(100, slipOn(true)),
-        press(150, keyUnder),
+        press(150, hotCueUnder),
         ...rewindsEvery(160, 300, 23),
         press(320, liveStart),
-        press(330, (deck) => ({ kind: 'key', deck, target: LIVE_QUEUED })),
+        press(330, (deck) => ({ kind: 'hot-cue', deck, target: LIVE_QUEUED })),
         ...rewindsEvery(340, 480, 19),
         press(500, (deck) => ({
           kind: 'loop-bounds',
@@ -854,7 +854,7 @@ describe('a deck rewound with a live loop', () => {
       load: { grid: LIVE_GRID },
       prepare: LIVE_TARGETS,
       presses: [
-        press(150, keyUnder),
+        press(150, hotCueUnder),
         ...rewindsEvery(160, 300, 23),
         press(320, liveStart),
         ...rewindsEvery(330, 560, 19),
@@ -880,7 +880,7 @@ describe('a deck rewound with a live loop', () => {
       load: { grid: LIVE_GRID },
       prepare: LIVE_TARGETS,
       presses: [
-        press(150, keyUnder),
+        press(150, hotCueUnder),
         press(300, liveStart),
         ...rewindsEvery(310, 440, 17),
         press(460, (deck) => ({ kind: 'live-loop-adopt', deck })),
@@ -958,9 +958,9 @@ describe('a deck rewound by live loop presses at random moments', () => {
               case 7:
                 return { kind: 'slip', deck, on, ...when };
               case 8:
-                return { ...keyUnder(deck), ...when };
+                return { ...hotCueUnder(deck), ...when };
               case 9:
-                return { kind: 'key', deck, target: LIVE_QUEUED, ...when };
+                return { kind: 'hot-cue', deck, target: LIVE_QUEUED, ...when };
               case 10:
                 return { kind: 'stop-loop', deck, ...when };
               default:

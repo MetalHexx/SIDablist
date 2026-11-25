@@ -1,4 +1,5 @@
 import type { DjInbound } from '../messages/commands.js';
+import { HOLD_RELEASED, SETTING } from '../messages/setting-table.js';
 import type { DjReport } from '../messages/reports.js';
 
 const target = { startFrame: 100, endFrame: 164 } as const;
@@ -15,7 +16,14 @@ export const INBOUND_SAMPLES: {
     tune: 'hvsc:Hubbard/Commando.sid',
     subtune: 2,
     speed: 1.5,
-    settings: [{ setting: 1, value: 1 }],
+    settings: [
+      { setting: SETTING.VOICE_1_MUTE, value: 1 },
+      { setting: SETTING.VOICE_2_FREQUENCY_OFFSET, value: -300 },
+      { setting: SETTING.VOICE_1_GATE_HOLD, value: 1 },
+      { setting: SETTING.CUTOFF_HOLD, value: HOLD_RELEASED },
+      { setting: SETTING.KEY, value: -3 },
+      { setting: SETTING.VOICE_3_FINE, value: 12.5 },
+    ],
     trackLoop: { loopStartFrame: 10, loopPeriodFrames: 64, endedAtFrame: null },
     grid: { beatFrames: 8, beatOneFrame: 2 },
     ends: 'paused',
@@ -31,14 +39,44 @@ export const INBOUND_SAMPLES: {
   'speed-jump': { kind: 'speed-jump', deck: 'a', amount: 0.1 },
   repeat: { kind: 'repeat', deck: 'a', on: true },
   setting: { kind: 'setting', deck: 'a', setting: 2, value: 1 },
+  settings: {
+    kind: 'settings',
+    deck: 'a',
+    settingsIn: 'loop',
+    changes: [
+      { setting: SETTING.VOICE_1_MUTE, value: 1 },
+      { setting: SETTING.VOICE_2_MUTE, value: 1 },
+    ],
+  },
+  'voice-hold': { kind: 'voice-hold', deck: 'a', voice: 2, held: true },
+  'flip-lock': { kind: 'flip-lock', deck: 'a', setting: SETTING.VOICE_1_SYNC_HOLD, lock: true },
+  tap: { kind: 'tap', deck: 'a', atMs: 2500.5 },
+  'tap-end': { kind: 'tap-end', deck: 'a' },
   targets: { kind: 'targets', deck: 'a', frames: [0, 100, 164] },
   jump: {
     kind: 'jump',
     deck: 'a',
-    target: { ...target, wraps: true, lapPhase: 0.25, settings: [{ setting: 3, value: 0 }] },
+    target: {
+      ...target,
+      wraps: true,
+      lapPhase: 0.25,
+      settings: [
+        { setting: SETTING.VOICE_3_MUTE, value: 0 },
+        { setting: SETTING.VOLUME_OFFSET, value: -4 },
+        { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: 8 },
+        { setting: SETTING.EXTERNAL_FILTERED_HOLD, value: HOLD_RELEASED },
+        { setting: SETTING.KEY, value: 7 },
+        { setting: SETTING.VOICE_1_FINE, value: -33.25 },
+      ],
+    },
     when: { at: 'pass-end', from: 40 },
   },
-  key: { kind: 'key', deck: 'a', target: { startFrame: 100, endFrame: null }, when: { at: 'now' } },
+  'hot-cue': {
+    kind: 'hot-cue',
+    deck: 'a',
+    target: { startFrame: 100, endFrame: null },
+    when: { at: 'now' },
+  },
   'cancel-queued': { kind: 'cancel-queued', deck: 'a' },
   'let-go': { kind: 'let-go', deck: 'a' },
   'stop-loop': { kind: 'stop-loop', deck: 'a' },
@@ -81,6 +119,21 @@ export const REPORT_SAMPLES: readonly DjReport[] = [
     resolved: 'queue',
     settingsIn: 'loop',
   },
+  {
+    kind: 'landed',
+    deck: 'a',
+    command: {
+      kind: 'settings',
+      deck: 'a',
+      settingsIn: 'loop',
+      changes: [{ setting: SETTING.VOICE_1_MUTE, value: 1 }],
+    },
+    fixed: { at: 'frame', frame: 9 },
+    frame: 9,
+    waitMs: null,
+    settingsIn: 'main',
+    dropped: true,
+  },
   { kind: 'loaded', deck: 'a', tune: 't', subtune: 1, subtuneCount: 3, frame: 0 },
   { kind: 'load-failed', deck: 'a', tune: 't', reason: 'not found' },
   {
@@ -90,6 +143,13 @@ export const REPORT_SAMPLES: readonly DjReport[] = [
     via: 'ready',
     startFrame: 100,
     endFrame: null,
+  },
+  {
+    kind: 'grid-fitted',
+    deck: 'a',
+    frame: 40,
+    grid: { beatFrames: 25, beatOneFrame: 15 },
+    taps: 6,
   },
   { kind: 'captured', deck: 'a', frame: 12, position: 11.75 },
   {
@@ -108,7 +168,7 @@ export const REPORT_SAMPLES: readonly DjReport[] = [
     slip: { on: true, departed: false },
     hand: 'thrown',
     settingsInPlay: 'main',
-    settings: { main: [{ setting: 1, value: 0 }], loop: null },
+    settings: { main: [{ setting: SETTING.VOICE_1_MUTE, value: 1 }], loop: null },
     readyFrames: [0, 100],
     grid: { beatFrames: 8, beatOneFrame: 2 },
     rate: { exactCallsPerFrame: 1, nominalIntervalUs: 19950 },

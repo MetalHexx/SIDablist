@@ -64,7 +64,7 @@ describe('presses and releases', () => {
     { kind: 'play', deck: 'a' },
     { kind: 'speed', deck: 'a', value: 1.2 },
     { kind: 'nudge', deck: 'a', amount: 0.05 },
-    { kind: 'key', deck: 'a', target: LOOP_A },
+    { kind: 'hot-cue', deck: 'a', target: LOOP_A },
     { kind: 'hand-touch', deck: 'a', atMs: 0 },
   ];
 
@@ -136,7 +136,7 @@ describe('a load', () => {
     // The hand goes down before the loop starts, so both are in play at the load.
     await send(rig, { kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });
     rig.advance(60);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
     expect(rig.picture()).toMatchObject({ hand: 'down', loop: { startFrame: 500, endFrame: 520 } });
 
@@ -195,11 +195,11 @@ describe('a subtune change on a paused deck', () => {
 describe('a cue fired in a loop', () => {
   it('waits for the end of the pass, which plays on until then', async () => {
     const rig = await playing([500, 1500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: CUE });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: CUE });
     rig.advance(600);
-    const pressed = rig.landed('key')[1];
+    const pressed = rig.landed('hot-cue')[1];
 
     expect(pressed).toMatchObject({ resolved: 'queue' });
     const landing = rig.ofKind('jump-landed')[0];
@@ -216,7 +216,7 @@ describe('a cue fired in a loop', () => {
 describe('an edit to a running loop', () => {
   it('waits for the end of the pass, while WRAP changes at once and no end lets it go at once', async () => {
     const rig = await playing([500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
 
     await send(rig, { kind: 'loop-bounds', deck: 'a', startFrame: 500, endFrame: 510 });
@@ -327,7 +327,7 @@ describe('the live looper', () => {
     await rig.settle();
     rig.send({ kind: 'slip', deck: 'a', on: true });
     rig.advance(300);
-    for (const id of ['a', 'c']) rig.send({ kind: 'key', deck: id, target: UNDER });
+    for (const id of ['a', 'c']) rig.send({ kind: 'hot-cue', deck: id, target: UNDER });
     await rig.microtasks();
     rig.advance(200);
     rig.send({ kind: 'live-loop-size', deck: 'a', lengthFrames: 60 });
@@ -362,16 +362,16 @@ describe('the live looper', () => {
 describe('what the package does without the engine’s help', () => {
   it('tells a landing by `jump-landed`, and says nothing of a queue that goes without landing', async () => {
     const rig = await playing([500, 1000, 1500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_B });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_B });
     expect(rig.picture().queued).toEqual(LOOP_B);
     await send(rig, { kind: 'cancel-queued', deck: 'a' });
     rig.advance(300);
     expect(rig.picture().queued).toBeNull();
     expect(rig.ofKind('jump-landed')).toEqual([]);
 
-    await send(rig, { kind: 'key', deck: 'a', target: CUE });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: CUE });
     rig.advance(600);
     const landed = rig.ofKind('jump-landed');
     expect(landed).toHaveLength(1);
@@ -382,11 +382,11 @@ describe('what the package does without the engine’s help', () => {
 
   it('keeps a queued jump and a pending edit together, and plays the jump at the wrap', async () => {
     const rig = await playing([500, 1000]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
     await send(rig, { kind: 'loop-bounds', deck: 'a', startFrame: 500, endFrame: 510 });
     rig.advance(20);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_B });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_B });
     expect(rig.picture().queued).toEqual(LOOP_B);
     expect(rig.picture().pendingBounds).toEqual({ startFrame: 500, endFrame: 510 });
 
@@ -407,9 +407,9 @@ describe('what the package does without the engine’s help', () => {
     const rig = await playing([200, 300], { tune: 'insid3-out' });
     // The main settings mute voice 3; the loop's own mute voice 2 instead.
     await send(rig, { kind: 'setting', deck: 'a', setting: 3, value: 1 });
-    await send(rig, { kind: 'key', deck: 'a', target: OWN });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: SHARED });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: SHARED });
     rig.advance(600);
 
     const landing = rig.ofKind('jump-landed').at(-1);

@@ -63,9 +63,9 @@ function script(seed: number): Step[] {
   const hand = (rig: Rig): number => rig.time.ms;
   return [
     // a loop with its own settings: the main ones are held aside
-    at(100, (_, when) => ({ kind: 'key', deck: DECK, target: OWN, ...when })),
+    at(100, (_, when) => ({ kind: 'hot-cue', deck: DECK, target: OWN, ...when })),
     // a queue, an edit beside it, and the queue landing at the end of a pass
-    at(400, (_, when) => ({ kind: 'key', deck: DECK, target: SHARED, ...when })),
+    at(400, (_, when) => ({ kind: 'hot-cue', deck: DECK, target: SHARED, ...when })),
     at(450, (_, when) => ({
       kind: 'loop-bounds',
       deck: DECK,
@@ -95,17 +95,17 @@ function script(seed: number): Step[] {
       frames: [100, 160, 200, 250, 350],
       ...when,
     })),
-    at(1505, (_, when) => ({ kind: 'key', deck: DECK, target: WAITED, ...when })),
+    at(1505, (_, when) => ({ kind: 'hot-cue', deck: DECK, target: WAITED, ...when })),
     // slip, with a loop, the hand and a throw
     at(1700, (_, when) => ({ kind: 'slip', deck: DECK, on: true, ...when })),
-    at(1720, (_, when) => ({ kind: 'key', deck: DECK, target: SLIPPED, ...when })),
+    at(1720, (_, when) => ({ kind: 'hot-cue', deck: DECK, target: SLIPPED, ...when })),
     at(1800, (rig) => ({ kind: 'hand-touch', deck: DECK, atMs: hand(rig) })),
     at(1840, (rig) => ({ kind: 'hand-move', deck: DECK, travelFrames: -6, atMs: hand(rig) })),
     at(1900, (rig) => ({ kind: 'hand-move', deck: DECK, travelFrames: -2, atMs: hand(rig) })),
     at(1940, (rig) => ({ kind: 'hand-lift', deck: DECK, atMs: hand(rig), gripSeconds: 0.4 })),
     at(2200, (_, when) => ({ kind: 'stop-loop', deck: DECK, ...when })),
     // the live looper over a loop, resized, ended
-    at(2300, (_, when) => ({ kind: 'key', deck: DECK, target: UNDER, ...when })),
+    at(2300, (_, when) => ({ kind: 'hot-cue', deck: DECK, target: UNDER, ...when })),
     at(2500, (_, when) => ({ kind: 'live-loop', deck: DECK, ...when })),
     at(2640, (_, when) => ({ kind: 'live-loop-size', deck: DECK, lengthFrames: 20, ...when })),
     at(2760, (_, when) => ({ kind: 'live-loop-size', deck: DECK, lengthFrames: 60, ...when })),
@@ -170,7 +170,7 @@ describe('a deck replayed from the commands that landed', () => {
       });
       const landedKinds = new Set(kept.map((item) => item.command.kind));
       for (const kind of [
-        'key',
+        'hot-cue',
         'loop-bounds',
         'jump',
         'hand-touch',

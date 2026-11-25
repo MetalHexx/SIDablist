@@ -8,7 +8,9 @@ supplies everything environmental.
 ## How it works
 
 - `src/messages/` — the message contract: `commands.ts` (what a host sends), `reports.ts` (what a deck
-  tells the host), `validate.ts` (`validateInbound`, the guard for untrusted input).
+  tells the host), `validate.ts` (`validateInbound`, the guard for untrusted input) and `setting-table.ts` (`SETTING`, the
+  fixed numbered settings, and `describeSetting`: each one's kind, chip field, voice and range; a number
+  is never reused, and the validator and the deck both read the table).
 - `src/plugs.ts` — the plugs a host supplies (`DjPlugs`, `Wake`, `HeavyWork`, `DeckOutput`) and the
   `Dj` surface.
 - `src/dj.ts` — `createDj`: decks kept by id, validation and the refusal log, and the one wake that
@@ -19,7 +21,7 @@ supplies everything environmental.
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
   `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
   `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
-  jumps, the key press, letting go, edits to the running loop and the loop's own settings),
+  jumps, the hot cue press, letting go, edits to the running loop and the loop's own settings),
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
   the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
   on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
@@ -109,7 +111,7 @@ supplies everything environmental.
   prepared, so a re-render would find a waiting target ready earlier than it first was. A waiting
   seek's or jump's landing frame is fixed once, when it is first seen ready, and a re-render lands
   it there.
-- **A key press is resolved at its landing frame.** A `key` is a start, a queue, a cancel or a
+- **A hot cue is resolved at its landing frame.** A `hot-cue` is a start, a queue, a cancel or a
   let-go by what the deck holds on the frame it lands on, never by what it held when it was sent, so
   a replay at that frame (`fixed` is always `{ at: 'frame' }` for it) resolves the same way. A
   `jump` sent for `pass-end` is the exception: it lands on its `from` frame and the engine's queue
@@ -125,7 +127,7 @@ supplies everything environmental.
   A jump now that replaces the loop drops the queue on purpose; a stab (`seek` alone) and a change of
   wrap (`setActiveLoop` with the same bounds, then `queueJump` and `changeLoopAt` again) keep them.
   A new caller that sets the loop and forgets to re-queue loses a queued jump with no error.
-- **A frame past the tune is refused at the deck, not the validator.** A seek, a `jump` or `key`
+- **A frame past the tune is refused at the deck, not the validator.** A seek, a `jump` or `hot-cue`
   target's start and a `loop-bounds` start above the bound are refused with a reason
   (`Deck.refusal`); a `targets` list drops such frames with a warning (`Deck.receive`). The bound is
   the greatest of the engine's jump ceiling (a fixed 300 s of play calls, `JUMP_CEILING_SECONDS` in

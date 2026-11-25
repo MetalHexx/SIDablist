@@ -30,12 +30,9 @@ export type When =
 export interface NumberedSetting {
   /** The setting's number: one of the `SETTING` values. */
   readonly setting: number;
-  /** The setting's value: 0 or 1 for the voice mutes. */
+  /** The setting's value, in the setting's own units: see `describeSetting`. */
   readonly value: number;
 }
-
-/** This iteration's settings: the voice mutes, 0 sounding, 1 muted. */
-export const SETTING = { VOICE_1_MUTE: 1, VOICE_2_MUTE: 2, VOICE_3_MUTE: 3 } as const;
 
 /** A loop (`endFrame` set) or a cue (`endFrame` null), in tune frames, carrying everything it lands with. */
 export interface JumpTarget {
@@ -125,8 +122,34 @@ export type DeckCommand = CommandBase &
     | { readonly kind: 'speed-jump'; readonly amount: number }
     /** Turns repeat on or off: whether the tune starts over when it ends. */
     | { readonly kind: 'repeat'; readonly on: boolean }
-    /** Sets one numbered setting on the deck's main settings. */
+    /** Sets one numbered setting in the settings playing. */
     | { readonly kind: 'setting'; readonly setting: number; readonly value: number }
+    /**
+     * Several setting changes landing together on one frame, in the settings named: the main ones or the
+     * playing loop's own. Dropped when those are not the ones playing on its landing frame. A host's panic is
+     * one of these.
+     */
+    | {
+        readonly kind: 'settings';
+        readonly settingsIn: 'main' | 'loop';
+        readonly changes: readonly NumberedSetting[];
+      }
+    /**
+     * Kill and Punch: while held, voice 0–2 inverts its latched mute (a sounding voice is silenced, a muted
+     * one sounds). Never kept: a load clears it, and no load, loop or picture carries it.
+     */
+    | { readonly kind: 'voice-hold'; readonly voice: number; readonly held: boolean }
+    /**
+     * A one-bit switch's lock, against what the tune has it at when this lands. With `lock` absent it is
+     * a press: an unlocked switch locks to the opposite of the tune, and a locked one is handed back. With
+     * `lock: true` it locks to the opposite of the tune unless it is already locked, which stays as it
+     * is. With `lock: false` it hands the switch back. The set forms are a controller's on and off.
+     */
+    | { readonly kind: 'flip-lock'; readonly setting: number; readonly lock?: boolean }
+    /** A tap of the beat, at host time `atMs`: the deck marks where its playhead was then. */
+    | { readonly kind: 'tap'; readonly atMs: number }
+    /** The host's run of taps is over: the deck forgets its taps. */
+    | { readonly kind: 'tap-end' }
     /**
      * Names the tune frames the deck keeps ready so a jump to one lands without delay. At most 256
      * frames: a longer list is refused at the door.
@@ -134,8 +157,8 @@ export type DeckCommand = CommandBase &
     | { readonly kind: 'targets'; readonly frames: readonly number[] }
     /** Jumps to a loop or cue, in tune frames, when the command lands. */
     | { readonly kind: 'jump'; readonly target: JumpTarget }
-    /** A hot-key press on a loop or cue: starts it, queues it, cancels it or lets go. */
-    | { readonly kind: 'key'; readonly target: JumpTarget }
+    /** A hot cue: a saved loop's or cue's button pressed. It starts it, queues it, cancels it or lets go. */
+    | { readonly kind: 'hot-cue'; readonly target: JumpTarget }
     /** Cancels a jump waiting for the end of the pass. */
     | { readonly kind: 'cancel-queued' }
     /** Lets go of the running loop, so play carries on past its end. */

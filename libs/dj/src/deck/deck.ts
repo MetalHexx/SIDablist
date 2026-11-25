@@ -64,6 +64,8 @@ import { DeckHand } from './hand.js';
 import { DeckLiveLoop, type LiveLoopHost } from './live-loop.js';
 import {
   DeckLoops,
+  LAND_IGNORED,
+  LAND_OVER_LOOP,
   RESOLVED_CANCEL,
   RESOLVED_LET_GO,
   RESOLVED_NONE,
@@ -90,12 +92,12 @@ interface DeckHost {
 type LoadCommand = Extract<DeckCommand, { kind: 'load' }>;
 type LandedEvent = Extract<DeckEvent, { kind: 'landed' }>;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
-type KeyResolution = NonNullable<LandedEvent['resolved']>;
+type HotCueResolution = NonNullable<LandedEvent['resolved']>;
 type Phase = 'empty' | 'loading' | 'failed' | 'ready';
 type Ends = 'playing' | 'paused' | 'stopped';
 
-/** A `key` press's resolution, by the code the event queue carries it as. */
-const RESOLUTIONS: Readonly<Record<number, KeyResolution>> = {
+/** A `hot-cue` press's resolution, by the code the event queue carries it as. */
+const RESOLUTIONS: Readonly<Record<number, HotCueResolution>> = {
   [RESOLVED_START]: 'start',
   [RESOLVED_QUEUE]: 'queue',
   [RESOLVED_CANCEL]: 'cancel',
@@ -124,7 +126,7 @@ function halts(entry: LogEntry): boolean {
 
 /**
  * Whether applying `command` always ends the loop that is running, and with it the pass in
- * progress. The commands that end it only sometimes (a jump over a loop, a key, a let-go) say so
+ * progress. The commands that end it only sometimes (a jump over a loop, a hot cue, a let-go) say so
  * when they land.
  */
 function endsLoop(command: DeckCommand): boolean {
@@ -341,7 +343,7 @@ export class Deck {
         frame = command.frame;
         break;
       case 'jump':
-      case 'key':
+      case 'hot-cue':
         frame = command.target.startFrame;
         break;
       case 'loop-bounds':
@@ -825,8 +827,8 @@ export class Deck {
       case 'jump':
         endedLoop = this.loops.jump(entry, command.target);
         break;
-      case 'key':
-        endedLoop = this.loops.key(entry, command.target);
+      case 'hot-cue':
+        endedLoop = this.loops.hotCue(entry, command.target);
         break;
       case 'cancel-queued':
         this.loops.cancelQueued();
@@ -890,7 +892,7 @@ export class Deck {
   private startsFirst(entry: LogEntry): boolean {
     const command = entry.command;
     if (command === null || entry.started) return false;
-    if (command.kind !== 'jump' && command.kind !== 'key') return false;
+    if (command.kind !== 'jump' && command.kind !== 'hot-cue') return false;
     if (this.player.getSnapshot().transport === 'playing') return false;
     if (command.kind === 'jump') return true;
     const resolved = this.loops.resolve(command.target);
@@ -907,7 +909,7 @@ export class Deck {
     event.entry = entry.index;
     event.seq = entry.seq;
     event.dueMs = dueMs;
-    event.a = entry.command?.kind === 'key' ? this.loops.resolved : RESOLVED_NONE;
+    event.a = entry.command?.kind === 'hot-cue' ? this.loops.resolved : RESOLVED_NONE;
     event.b = this.state.ownInPlay ? 2 : 1;
     entry.eventState = EVENT_QUEUED;
   }
@@ -980,19 +982,20 @@ export class Deck {
     return false;
   }
 
-  private seekPrepared(target: ReturnType<typeof frames>): void {
+  /** Seeks to `target` when its image is held, and says whether it did; otherwise warns and seeks nothing. */
+  private seekPrepared(target: ReturnType<typeof frames>): boolean {
     if (this.player.getSnapshot().tune?.preparedFrames.includes(target)) {
       void this.player.seek(target);
-    } else {
-      this.plugs.log?.warn(
-        `dj: deck ${this.id} ignored a seek to ${target}: its image is not held`,
-      );
+      return true;
     }
+    this.plugs.log?.warn(`dj: deck ${this.id} ignored a seek to ${target}: its image is not held`);
+    return false;
   }
 
   /**
-   * Lands a waiting seek or jump on the frame its readiness fixed. A jump that replaced a running
-   * loop ends that loop's pass. A seek that a live loop's fold-in waited for sets the loop it left
+   * Lands a waiting seek or jump on the frame its readiness fixed, and reports `jump-landed` only
+   * when it landed: one whose image was withdrawn since is ignored with a warning. A jump that
+   * replaced a running loop ends that loop's pass. A seek that a live loop's fold-in waited for sets the loop it left
    * underneath again first.
    */
   private landReady(index: number, frame: number): void {
@@ -1002,21 +1005,26 @@ export class Deck {
     const seq = state.waitingSeq;
     state.stopWaiting();
     let endedLoop = false;
+    let landed: boolean;
     if (target === null) {
       // A fold-in's landing: the loop it left underneath comes back, set before the seek as a jump's is.
       if (state.underneath !== null) {
         this.loops.resumeUnderneath(null);
         state.underneath = null;
       }
-      this.seekPrepared(frames(this.landingTune[index]));
+      landed = this.seekPrepared(frames(this.landingTune[index]));
     } else {
-      endedLoop = this.loops.land(target, settings);
+      const outcome = this.loops.land(target, settings);
+      landed = outcome !== LAND_IGNORED;
+      endedLoop = outcome === LAND_OVER_LOOP;
     }
-    const event = this.events.push(KIND_JUMP_LANDED, frame);
-    if (event !== null) {
-      event.a = target === null ? this.landingTune[index] : target.startFrame;
-      event.b = target === null || target.endFrame === null ? -1 : target.endFrame;
-      event.c = 1;
+    if (landed) {
+      const event = this.events.push(KIND_JUMP_LANDED, frame);
+      if (event !== null) {
+        event.a = target === null ? this.landingTune[index] : target.startFrame;
+        event.b = target === null || target.endFrame === null ? -1 : target.endFrame;
+        event.c = 1;
+      }
     }
     if (endedLoop) this.endPass(frame, seq);
   }
@@ -1595,7 +1603,7 @@ export class Deck {
           waitMs: Number.isNaN(entry.pressedAtMs) ? null : event.dueMs - entry.pressedAtMs,
         };
         if (command.kind === 'setting') landed.settingsIn = event.b === 2 ? 'loop' : 'main';
-        if (command.kind === 'key') landed.resolved = RESOLUTIONS[event.a];
+        if (command.kind === 'hot-cue') landed.resolved = RESOLUTIONS[event.a];
         return landed;
       }
       case KIND_LOADED:

@@ -74,12 +74,12 @@ describe('slip with a loop', () => {
     rig.advance(20);
     expect(rig.picture('a').slip).toEqual({ on: true, departed: false });
 
-    await sendTo(rig, ['a', 'c'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a', 'c'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(300);
     expect(rig.picture('a')).toMatchObject({ slip: { on: true, departed: true } });
     expect(rig.picture('a').loop).toMatchObject({ startFrame: 100, endFrame: 117.4 });
-    const keyed = rig.landed('key').find((event) => event.deck === 'a')!.frame;
-    expect(differences(rig, 'a', 'c', keyed + 1, 12)).toEqual([]);
+    const pressed = rig.landed('hot-cue').find((event) => event.deck === 'a')!.frame;
+    expect(differences(rig, 'a', 'c', pressed + 1, 12)).toEqual([]);
     // While it runs, slip reports the frame it would land on: the plain deck's.
     const latest = rig.ofKind('update', 'a').at(-1)!;
     expect(latest.slipPosition).toBe(playheads(rig, 'b').get(latest.streamFrame));
@@ -97,7 +97,7 @@ describe('slip with a loop', () => {
 
   it('plays on from where the loop was with slip off', async () => {
     const rig = await playing(['a', 'b']);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(300);
     expect(rig.picture('a').slip).toEqual({ on: false, departed: false });
 
@@ -112,7 +112,7 @@ describe('slip with a loop', () => {
     const rig = await playing(['a', 'b']);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(300);
 
     await sendTo(rig, ['a'], (deck) => ({ kind: 'stop-loop', deck }));
@@ -127,9 +127,9 @@ describe('slip with a loop', () => {
     const rig = await playing(['a', 'b']);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(100);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: WHOLE }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: WHOLE }));
     rig.advance(600);
     expect(rig.ofKind('jump-landed', 'a')).toHaveLength(1);
     expect(rig.picture('a')).toMatchObject({ slip: { departed: true }, loop: { startFrame: 200 } });
@@ -142,20 +142,20 @@ describe('slip with a loop', () => {
 
   it('counts a loop queued behind one slip did not begin with as the line from the landing on, and drops a cancelled queue', async () => {
     const rig = await playing(['a']);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(100);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
     expect(departed(rig, 'a')).toBe(false);
 
     // Queued: the departure begins, counting laps of the loop the deck is in.
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: WHOLE }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: WHOLE }));
     await sendTo(rig, ['a'], (deck) => ({ kind: 'cancel-queued', deck }));
     rig.advance(100);
     expect(departed(rig, 'a')).toBe(false);
     expect(rig.picture('a').loop).toMatchObject({ startFrame: 100 });
 
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: WHOLE }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: WHOLE }));
     rig.advance(20);
     expect(departed(rig, 'a')).toBe(true);
     const counted = [...slipPositions(rig, 'a').values()].filter((p): p is number => p !== null);
@@ -164,7 +164,7 @@ describe('slip with a loop', () => {
     rig.advance(1000);
     expect(rig.picture('a').loop).toMatchObject({ startFrame: 200 });
     // The loop it was lapping is replaced, so the count carries on past its end, up the line.
-    const after = rig.landed('key')[2].frame + 40;
+    const after = rig.landed('hot-cue')[2].frame + 40;
     const line = slipPositions(rig, 'a').get(after)!;
     expect(line).toBeGreaterThan(117.4);
     expect(slipPositions(rig, 'a').get(after + 1)).toBe(line + 1);
@@ -175,7 +175,7 @@ describe('slip with a loop', () => {
     const rig = await playing(['a', 'b']);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(100);
     expect(departed(rig, 'a')).toBe(true);
 
@@ -191,7 +191,7 @@ describe('slip with a loop', () => {
 
   it('is begun by a stab at the running loop, and lands on the count at the let-go', async () => {
     const rig = await playing(['a', 'b']);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(100);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
@@ -219,7 +219,7 @@ describe('slip with a loop', () => {
     const rig = await playing(['a']);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
-    await sendTo(rig, ['a'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(100);
     expect(departed(rig, 'a')).toBe(true);
 
@@ -336,7 +336,7 @@ describe('slip with the hand', () => {
     const rig = await playing(['a', 'b', 'c']);
     await sendTo(rig, ['a'], (deck) => ({ kind: 'slip', deck, on: true }));
     rig.advance(20);
-    await sendTo(rig, ['a', 'c'], (deck) => ({ kind: 'key', deck, target: FRACTIONAL }));
+    await sendTo(rig, ['a', 'c'], (deck) => ({ kind: 'hot-cue', deck, target: FRACTIONAL }));
     rig.advance(300);
 
     await touch(rig, ['a']);

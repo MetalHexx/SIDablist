@@ -1,5 +1,6 @@
-import { SETTING } from './commands.js';
 import type { DeckCommand, DjInbound, DjRequest } from './commands.js';
+import { describeSetting } from './setting-table.js';
+import type { SettingInfo } from './setting-table.js';
 
 /** The verdict on one inbound message: the message itself, or why it was refused. */
 export type ValidationResult =
@@ -75,33 +76,37 @@ function record(kind: string, field: string, v: unknown, allowed: readonly strin
   return v;
 }
 
-const SETTING_NUMBERS: readonly number[] = Object.values(SETTING);
-
 /**
  * The most frames one `targets` command may declare. Core holds about 68 KB per declared frame
  * (`libs/core/AGENTS.md`), so 256 frames are about 17 MB a deck.
  */
 const MAX_TARGET_FRAMES = 256;
 
-function settingNumber(kind: string, field: string, v: unknown): number {
-  oneOf(kind, field, v, SETTING_NUMBERS);
-  return v as number;
+function settingInfo(kind: string, field: string, v: unknown): SettingInfo {
+  const info = typeof v === 'number' ? describeSetting(v) : null;
+  if (info === null) fail(kind, field, 'must be a setting number');
+  return info;
 }
 
-function settingValue(kind: string, field: string, v: unknown): void {
-  oneOf(kind, field, v, [0, 1]);
+function settingValue(kind: string, field: string, info: SettingInfo, v: unknown): void {
+  const range = `from ${info.min} to ${info.max}`;
+  if (typeof v !== 'number' || !Number.isFinite(v) || (info.whole && !Number.isInteger(v))) {
+    fail(kind, field, `must be ${info.whole ? 'a whole' : 'a finite'} number ${range}`);
+  }
+  if (v < info.min || v > info.max) fail(kind, field, `must be ${range}`);
 }
 
-function settingList(kind: string, field: string, v: unknown): void {
+function settingList(kind: string, field: string, v: unknown, nonEmpty = false): void {
   if (!Array.isArray(v)) fail(kind, field, 'must be an array');
+  if (nonEmpty && v.length === 0) fail(kind, field, 'must not be empty');
   const seen = new Set<number>();
   v.forEach((entry: unknown, i) => {
     const at = `${field}[${i}]`;
     const e = record(kind, at, entry, ['setting', 'value']);
-    const setting = settingNumber(kind, `${at}.setting`, e.setting);
-    if (seen.has(setting)) fail(kind, `${at}.setting`, 'is repeated');
-    seen.add(setting);
-    settingValue(kind, `${at}.value`, e.value);
+    const info = settingInfo(kind, `${at}.setting`, e.setting);
+    if (seen.has(info.setting)) fail(kind, `${at}.setting`, 'is repeated');
+    seen.add(info.setting);
+    settingValue(kind, `${at}.value`, info, e.value);
   });
 }
 
@@ -204,10 +209,40 @@ const COMMANDS = {
   setting: {
     fields: ['setting', 'value'],
     check(o, kind) {
-      settingNumber(kind, 'setting', o.setting);
-      settingValue(kind, 'value', o.value);
+      settingValue(kind, 'value', settingInfo(kind, 'setting', o.setting), o.value);
     },
   },
+  settings: {
+    fields: ['settingsIn', 'changes'],
+    check(o, kind) {
+      oneOf(kind, 'settingsIn', o.settingsIn, ['main', 'loop']);
+      settingList(kind, 'changes', o.changes, true);
+    },
+  },
+  'voice-hold': {
+    fields: ['voice', 'held'],
+    check(o, kind) {
+      if (typeof o.voice !== 'number' || !Number.isInteger(o.voice) || o.voice < 0 || o.voice > 2) {
+        fail(kind, 'voice', 'must be an integer from 0 to 2');
+      }
+      bool(kind, 'held', o.held);
+    },
+  },
+  'flip-lock': {
+    fields: ['setting', 'lock'],
+    check(o, kind) {
+      const info = settingInfo(kind, 'setting', o.setting);
+      if (info.kind !== 'hold' || info.max !== 1) {
+        fail(kind, 'setting', 'must be the hold of a one-bit switch');
+      }
+      if (has(o, 'lock')) bool(kind, 'lock', o.lock);
+    },
+  },
+  tap: {
+    fields: ['atMs'],
+    check: (o, kind) => void finite(kind, 'atMs', o.atMs),
+  },
+  'tap-end': { fields: [] },
   targets: {
     fields: ['frames'],
     check(o, kind) {
@@ -222,7 +257,7 @@ const COMMANDS = {
     fields: ['target'],
     check: (o, kind) => jumpTarget(kind, o.target),
   },
-  key: {
+  'hot-cue': {
     fields: ['target'],
     check: (o, kind) => jumpTarget(kind, o.target),
   },

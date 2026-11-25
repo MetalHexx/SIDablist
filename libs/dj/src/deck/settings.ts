@@ -1,5 +1,5 @@
-import { SETTING } from '../messages/commands.js';
 import type { NumberedSetting } from '../messages/commands.js';
+import { SETTING } from '../messages/setting-table.js';
 
 /** The voices a deck mutes: the main settings are one mute per voice. */
 export const VOICE_COUNT = 3;

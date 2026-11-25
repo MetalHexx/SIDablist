@@ -96,7 +96,7 @@ async function looping(target: JumpTarget): Promise<Rig> {
   rig.send({ kind: 'targets', deck: 'a', frames: [500, 1000] });
   await rig.settle();
   rig.advance(300);
-  rig.send({ kind: 'key', deck: 'a', target });
+  rig.send({ kind: 'hot-cue', deck: 'a', target });
   await rig.microtasks();
   rig.advance(100);
   expect(rig.picture().loop).toMatchObject({ startFrame: target.startFrame });
@@ -137,8 +137,8 @@ describe('the frame path with a loop running', () => {
     const rig = await looping(LOOP_A);
     const { time, wake, dj } = rig;
     const sink = rig.sinks.get('a')!;
-    const queueB = { kind: 'key', deck: 'a', target: LOOP_B } as const;
-    const queueA = { kind: 'key', deck: 'a', target: LOOP_A } as const;
+    const queueB = { kind: 'hot-cue', deck: 'a', target: LOOP_B } as const;
+    const queueA = { kind: 'hot-cue', deck: 'a', target: LOOP_A } as const;
     const pass = (): void => {
       for (let i = 0; i < HAND_OFFS; i++) {
         dj.send(i % 2 === 0 ? queueB : queueA);
@@ -192,7 +192,7 @@ describe('the frame path with the hand on the record', () => {
     await rig.settle();
     rig.advance(300);
     rig.send({ kind: 'slip', deck: 'a', on: true });
-    rig.send({ kind: 'key', deck: 'a', target: WRAPPING });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: WRAPPING });
     await rig.microtasks();
     rig.advance(100);
     rig.send({ kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });

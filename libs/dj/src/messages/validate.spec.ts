@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { INBOUND_SAMPLES } from '../testing/samples.js';
+import { HOLD_RELEASED, SETTING } from './setting-table.js';
 import { validateInbound } from './validate.js';
 
 /** A copy of a sample with fields changed; `undefined` removes a field. */
@@ -107,15 +108,15 @@ describe('validateInbound', () => {
       'target.endFrame',
     ],
     [
-      'a key target with a non-boolean wraps',
-      variant('key', { target: { startFrame: 1, endFrame: 5, wraps: 'yes' } }),
-      'key',
+      'a hot-cue target with a non-boolean wraps',
+      variant('hot-cue', { target: { startFrame: 1, endFrame: 5, wraps: 'yes' } }),
+      'hot-cue',
       'target.wraps',
     ],
     [
-      'a key target missing its end',
-      variant('key', { target: { startFrame: 1 } }),
-      'key',
+      'a hot-cue target missing its end',
+      variant('hot-cue', { target: { startFrame: 1 } }),
+      'hot-cue',
       'target.endFrame',
     ],
     [
@@ -137,8 +138,112 @@ describe('validateInbound', () => {
       'hand-move',
       'travelFrames',
     ],
-    ['an unknown setting', variant('setting', { setting: 9 }), 'setting', 'setting'],
-    ['a setting value other than 0 or 1', variant('setting', { value: 2 }), 'setting', 'value'],
+    ['an unknown setting', variant('setting', { setting: 74 }), 'setting', 'setting'],
+    ['a mute value other than 0 or 1', variant('setting', { value: 2 }), 'setting', 'value'],
+    [
+      'a number past the table in a settings list',
+      variant('load', { settings: [{ setting: SETTING.KEY + 1, value: 0 }] }),
+      'load',
+      'settings[0].setting',
+    ],
+    [
+      'a setting number that is not whole',
+      variant('setting', { setting: 1.5, value: 0 }),
+      'setting',
+      'setting',
+    ],
+    [
+      'a fractional value for a whole setting',
+      variant('setting', { setting: SETTING.VOICE_1_FREQUENCY_OFFSET, value: 2.5 }),
+      'setting',
+      'value',
+    ],
+    [
+      'a fractional key',
+      variant('setting', { setting: SETTING.KEY, value: 0.5 }),
+      'setting',
+      'value',
+    ],
+    [
+      'a hold below HOLD_RELEASED',
+      variant('setting', { setting: SETTING.CUTOFF_HOLD, value: HOLD_RELEASED - 1 }),
+      'setting',
+      'value',
+    ],
+    [
+      'a hold above the field ceiling',
+      variant('setting', { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: 16 }),
+      'setting',
+      'value',
+    ],
+    [
+      'a fine tuning out of range',
+      variant('setting', { setting: SETTING.VOICE_3_FINE, value: 100.5 }),
+      'setting',
+      'value',
+    ],
+    [
+      'a fine tuning that is not finite',
+      variant('setting', { setting: SETTING.VOICE_3_FINE, value: Number.NaN }),
+      'setting',
+      'value',
+    ],
+    ['an empty settings change list', variant('settings', { changes: [] }), 'settings', 'changes'],
+    [
+      'a settings change in neither settings',
+      variant('settings', { settingsIn: 'both' }),
+      'settings',
+      'settingsIn',
+    ],
+    [
+      'a repeated setting in a settings change',
+      variant('settings', {
+        changes: [
+          { setting: 2, value: 0 },
+          { setting: 2, value: 1 },
+        ],
+      }),
+      'settings',
+      'changes[1].setting',
+    ],
+    ['a voice-hold on voice 3', variant('voice-hold', { voice: 3 }), 'voice-hold', 'voice'],
+    [
+      'a voice-hold with a fractional voice',
+      variant('voice-hold', { voice: 0.5 }),
+      'voice-hold',
+      'voice',
+    ],
+    [
+      'a voice-hold with a non-boolean held',
+      variant('voice-hold', { held: 1 }),
+      'voice-hold',
+      'held',
+    ],
+    [
+      'a flip-lock on a numeric hold',
+      variant('flip-lock', { setting: SETTING.CUTOFF_HOLD }),
+      'flip-lock',
+      'setting',
+    ],
+    [
+      'a flip-lock on an offset',
+      variant('flip-lock', { setting: SETTING.VOLUME_OFFSET }),
+      'flip-lock',
+      'setting',
+    ],
+    [
+      'a flip-lock with a non-boolean lock',
+      variant('flip-lock', { lock: 'yes' }),
+      'flip-lock',
+      'lock',
+    ],
+    [
+      'a tap with a non-finite time',
+      variant('tap', { atMs: Number.POSITIVE_INFINITY }),
+      'tap',
+      'atMs',
+    ],
+    ['a tap-end with a field of its own', variant('tap-end', { atMs: 1 }), 'tap-end', 'atMs'],
     [
       'a repeated setting in a list',
       variant('load', {
@@ -207,6 +312,18 @@ describe('validateInbound', () => {
     const reason = reasonFor(message);
     expect(reason).toContain(kind);
     expect(reason).toContain(field);
+  });
+
+  it('accepts a flip-lock on each kind of one-bit switch and refuses none of them', () => {
+    for (const setting of [
+      SETTING.VOICE_3_TEST_HOLD,
+      SETTING.VOICE_2_RING_MOD_HOLD,
+      SETTING.VOICE_1_FILTERED_HOLD,
+      SETTING.EXTERNAL_FILTERED_HOLD,
+      SETTING.VOICE_3_OFF_HOLD,
+    ]) {
+      expect(validateInbound(variant('flip-lock', { setting, lock: undefined })).ok).toBe(true);
+    }
   });
 
   it('accepts exactly 256 targets', () => {
