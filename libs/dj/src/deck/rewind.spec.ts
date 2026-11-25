@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DeckCommand, DeckId, JumpTarget } from '../messages/commands.js';
+import type { DeckCommand, DeckId, JumpTarget, When } from '../messages/commands.js';
 import { HOLD_RELEASED, SETTING } from '../messages/setting-table.js';
 import { compareRewound, type Press } from '../testing/compare.js';
 import type { Rig } from '../testing/harness.js';
@@ -1252,6 +1252,202 @@ describe('a deck rewound by live loop presses at random moments', () => {
       });
 
       expect(difference).toBeNull();
+    });
+  }
+});
+
+/**
+ * Taps on Insid3-out, whose note starts fall every 12 frames (from 5) at a frame every 10 ms, and
+ * whose frame `f` delivers the position `f + 1`. A tap names the position it means to mark, and
+ * sends the host time that frame fell due at, which the press reads off the rewound deck.
+ */
+const TAP_TUNE = 'insid3-out';
+/** The grid a tapped deck starts on: the straight deck is sent the live loop up front, which a deck with no grid refuses. */
+const TAP_GRID = { beatFrames: 20, beatOneFrame: 0 };
+/** Where the tap targets are pressed from: the register record's reach covers all of them. */
+const tapOn =
+  (position: number, offsetMs = 0) =>
+  (deck: DeckId, rig: Rig): DeckCommand => {
+    const update = rig.ofKind('update', deck).find((item) => item.position === position);
+    if (update === undefined) throw new Error(`no frame delivered position ${position} yet`);
+    return { kind: 'tap', deck, atMs: update.dueAtMs + offsetMs };
+  };
+const tapEnd = (deck: DeckId): DeckCommand => ({ kind: 'tap-end', deck });
+const nudgeZero = (deck: DeckId): DeckCommand => ({ kind: 'nudge', deck, amount: 0 });
+
+/**
+ * A press of nothing a few milliseconds after the one before it: it lands on the same frame while
+ * that frame is still held, so the rewind re-applies what landed there before it.
+ */
+const justAfter = (atMs: number): Press[] => [
+  press(atMs + 1, nudgeZero),
+  press(atMs + 2, nudgeZero),
+  press(atMs + 4, nudgeZero),
+];
+
+/** Whether a press of nothing landed on the frame of every tap: each was rewound across and applied again. */
+function everyTapRewoundAcross(rig: Rig): boolean {
+  const nudges = new Set(rig.landed('nudge').map((event) => event.frame));
+  return rig.landed('tap').every((event) => nudges.has(event.frame));
+}
+
+describe('a deck rewound with taps', () => {
+  it('fits a grid from taps landing among held frames, and starts a live loop on it', async () => {
+    const presses: Press[] = [
+      press(700, tapOn(65)),
+      ...justAfter(700),
+      press(820, tapOn(77, 3)),
+      ...justAfter(820),
+      press(940, tapOn(89)),
+      ...justAfter(940),
+      press(1060, tapOn(101, 2)),
+      ...justAfter(1060),
+      ...rewindsEvery(1070, 1190, 17),
+      press(1200, tapOn(113)),
+      ...justAfter(1200),
+      ...rewindsEvery(1210, 1290, 19),
+      press(1300, liveSize(24)),
+      press(1400, liveStart),
+      ...rewindsEvery(1410, 1750, 23),
+      press(1760, liveEnd),
+      ...rewindsEvery(1770, 1950, 23),
+    ];
+    const { difference, rewound } = await compareRewound({
+      tune: TAP_TUNE,
+      load: { grid: TAP_GRID },
+      presses,
+      runMs: 2100,
+    });
+
+    expect(difference).toBeNull();
+    expect(everyTapRewoundAcross(rewound)).toBe(true);
+    const fits = rewound.ofKind('grid-fitted');
+    expect(fits.map((event) => event.taps)).toEqual([4, 5]);
+    expect(fits[0].grid).toEqual(fits[1].grid);
+    expect(rewound.picture().grid).toEqual(fits[0].grid);
+    expect(rewound.ofKind('picture').some((picture) => picture.loop?.live === true)).toBe(true);
+    expect(rewound.warnings).toEqual([]);
+  });
+
+  it('plays on through a second fitted grid, after a run was closed', async () => {
+    const { difference, rewound } = await compareRewound({
+      tune: TAP_TUNE,
+      load: { grid: TAP_GRID },
+      presses: [
+        press(700, tapOn(65)),
+        ...justAfter(700),
+        press(820, tapOn(77)),
+        ...justAfter(820),
+        press(940, tapOn(89)),
+        ...justAfter(940),
+        press(1060, tapOn(101)),
+        ...justAfter(1060),
+        ...rewindsEvery(1070, 1200, 17),
+        press(1210, tapEnd),
+        press(1250, tapOn(65, 1)),
+        ...justAfter(1250),
+        press(1320, tapOn(89)),
+        ...justAfter(1320),
+        press(1400, tapOn(113)),
+        ...justAfter(1400),
+        press(1480, tapOn(137)),
+        ...justAfter(1480),
+        ...rewindsEvery(1490, 1600, 19),
+        press(1620, liveSize(48)),
+        press(1700, liveStart),
+        ...rewindsEvery(1710, 1950, 23),
+      ],
+      runMs: 2100,
+    });
+
+    expect(difference).toBeNull();
+    expect(everyTapRewoundAcross(rewound)).toBe(true);
+    const fits = rewound.ofKind('grid-fitted');
+    expect(fits.map((event) => event.taps)).toEqual([4, 4]);
+    expect(fits[0].grid).not.toEqual(fits[1].grid);
+    expect(rewound.picture().grid).toEqual(fits[1].grid);
+    expect(rewound.warnings).toEqual([]);
+  });
+});
+
+describe('a deck rewound across a run that was closed and begun again', () => {
+  it('puts the old run back for the tap that lands before the tap-end that closed it', async () => {
+    const aheadOf = (rig: Rig, frames: number): When => ({
+      at: 'frame',
+      frame: nextUnsent(rig) + frames,
+    });
+    const { difference, rewound, straight } = await compareRewound({
+      tune: TAP_TUNE,
+      lookaheadMs: 120,
+      presses: [
+        press(700, tapOn(65)),
+        press(780, tapOn(77)),
+        press(860, tapOn(89)),
+        // The run closes and a new one begins in frames still held, over the old run's marks.
+        press(1300, (deck, rig) => ({ ...tapEnd(deck), when: aheadOf(rig, 4) })),
+        press(1300, (deck, rig) => ({ ...tapOn(17)(deck, rig), when: aheadOf(rig, 5) })),
+        press(1300, (deck, rig) => ({ ...tapOn(29)(deck, rig), when: aheadOf(rig, 6) })),
+        // The old run's fourth tap lands before all of them, so the rewind puts three marks back.
+        press(1303, tapOn(113)),
+        ...rewindsEvery(1310, 1500, 17),
+      ],
+      runMs: 1700,
+    });
+
+    expect(difference).toBeNull();
+    const fits = rewound.ofKind('grid-fitted');
+    expect(fits.map((event) => event.taps)).toEqual([4]);
+    expect(fits[0].grid.beatOneFrame).toBeGreaterThan(60);
+    expect(fits).toEqual(straight.ofKind('grid-fitted'));
+  });
+});
+
+/** A tap on the position nearest a note start that lies a `fraction` of the way through what the deck has delivered, `jitter` frames off it. */
+const tapNearBeat =
+  (fraction: number, jitter: number) =>
+  (deck: DeckId, rig: Rig): DeckCommand => {
+    const updates = rig.ofKind('update', deck);
+    const newest = updates[updates.length - 1].position;
+    const position = 5 + 12 * Math.round((newest * fraction - 5) / 12) + jitter;
+    const update = updates.find((item) => item.position === position);
+    return { kind: 'tap', deck, atMs: update === undefined ? rig.time.ms : update.dueAtMs };
+  };
+
+describe('a deck rewound by taps at random moments', () => {
+  for (let seed = 1; seed <= 12; seed++) {
+    it(`reports and plays on what a straight deck does (seed ${seed})`, async () => {
+      const next = random(seed * 32452843);
+      const presses: Press[] = [];
+      for (let i = 0, count = 14 + Math.floor(next() * 10); i < count; i++) {
+        const atMs = 800 + Math.floor(next() * 1000);
+        const kind = Math.floor(next() * 10);
+        const fraction = 0.4 + next() * 0.6;
+        const jitter = Math.floor(next() * 5) - 2;
+        const ahead = next() < 0.3 ? Math.floor(next() * 5) : -1;
+        const rewoundAfter = next() < 0.6;
+        presses.push(
+          press(atMs, (deck, rig): DeckCommand => {
+            const when =
+              ahead < 0 ? {} : { when: { at: 'frame' as const, frame: nextUnsent(rig) + ahead } };
+            if (kind < 6) return { ...tapNearBeat(fraction, jitter)(deck, rig), ...when };
+            if (kind === 6) return { ...tapEnd(deck), ...when };
+            return { ...nudgeZero(deck), ...when };
+          }),
+        );
+        if (rewoundAfter) presses.push(...justAfter(atMs));
+      }
+
+      const { difference, rewound, straight } = await compareRewound({
+        tune: TAP_TUNE,
+        lookaheadMs: 60 + Math.floor(next() * 3) * 30,
+        presses,
+        runMs: 2000,
+      });
+
+      expect(difference).toBeNull();
+      // What a tap reports and leaves behind is what a deck that was never rewound reports and leaves.
+      expect(rewound.ofKind('grid-fitted')).toEqual(straight.ofKind('grid-fitted'));
+      expect(rewound.picture().grid).toEqual(straight.picture().grid);
     });
   }
 });

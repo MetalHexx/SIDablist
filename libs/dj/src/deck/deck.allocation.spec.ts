@@ -346,3 +346,79 @@ describe('the frame path with the hand on the record', () => {
     rig.dispose();
   });
 });
+
+/**
+ * A quiet rig playing Insid3-out (a frame every 9.975 ms from time 1000, a note start every 12
+ * frames) with a run of taps held and the grid they fitted in force: both are in every restore
+ * point, and every delivered frame is written into the history a tap marks from.
+ */
+async function tapped(lookaheadMs: number): Promise<Rig> {
+  const rig = new Rig({ quiet: true });
+  rig.addDeck('a', { lookaheadMs });
+  await rig.load('a', 'insid3-out', { ends: 'playing' });
+  rig.advance(2500);
+  // Frame 64 delivers the position 65, a note start; each tap after it is a beat (12 frames) on.
+  const firstMs = 1000 + 9.975 * 64 + 1;
+  for (let beat = 0; beat < 5; beat++) {
+    rig.send({ kind: 'tap', deck: 'a', atMs: firstMs + 119.7 * beat });
+    await rig.microtasks();
+    rig.advance(20);
+  }
+  rig.advance(500);
+  expect(rig.picture().grid).toMatchObject({ beatFrames: 12 });
+  return rig;
+}
+
+/** Insid3-out delivers two frames a tick of 20 ms, so a pass of half the ticks renders as many frames as the others. */
+const TAPPED_TICKS = FRAMES / 2;
+
+describe(
+  'the frame path with a run of taps and the grid they fitted',
+  { timeout: LONG_RUN_MS },
+  () => {
+    it('allocates nothing over plain play', async () => {
+      const rig = await tapped(60);
+      const { time, wake } = rig;
+      const sink = rig.sinks.get('a')!;
+
+      const { heapGrowthBytes, scavenges } = await measureAllocation(
+        () => {
+          for (let i = 0; i < TAPPED_TICKS; i++) {
+            time.ms += 20;
+            sink.advanceTo(time.ms);
+            wake.fire();
+          }
+        },
+        { warmup: WARMUP_FRAMES },
+      );
+
+      expect(scavenges).toBe(0);
+      expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+      rig.dispose();
+    });
+
+    it('allocates nothing in the saves of presses that rewind it', async () => {
+      const rig = await tapped(120);
+      const { time, wake, dj } = rig;
+      const sink = rig.sinks.get('a')!;
+      const release = { kind: 'nudge', deck: 'a', amount: 0 } as const;
+
+      const { heapGrowthBytes, scavenges } = await measureAllocation(
+        () => {
+          for (let i = 0; i < PRESSES; i++) {
+            time.ms += 20;
+            sink.advanceTo(time.ms);
+            dj.send(release);
+            wake.fire();
+          }
+        },
+        { warmup: WARMUP_PRESSES },
+      );
+
+      expect(rig.picture().timing.rewinds).toBeGreaterThan(PRESSES * 4);
+      expect(scavenges).toBe(0);
+      expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+      rig.dispose();
+    });
+  },
+);

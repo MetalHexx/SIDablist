@@ -15,8 +15,8 @@ supplies everything environmental.
   `Dj` surface.
 - `src/dj.ts` — `createDj`: decks kept by id, validation and the refusal log, and the one wake that
   follows whichever decks are rendering.
-- `src/deck/` — one deck. `deck.ts` is the deck: the command log, the flush and rewind, loading, events
-  and the picture. Around it: `driven-clock.ts` (the engine's `FrameClock`, ticked only by the deck),
+- `src/deck/` — one deck. `deck.ts` is the deck: the command log, the flush and rewind, loading, taps,
+  events and the picture. Around it: `driven-clock.ts` (the engine's `FrameClock`, ticked only by the deck),
   `sink-tap.ts` (the engine's `SidSink`, mapping the output's counts onto stream frames),
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
   `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` (the
@@ -174,6 +174,31 @@ supplies everything environmental.
   was saved under, so declaring new ones makes the restore ring again, between ticks and after the
   command's own engine calls (the ring is seeded with the state the command leaves). Lines already
   declared change nothing.
+- **The grid and the tap run are saved state.** `DeckState.grid` (by reference: a load's grid and a fit
+  are immutable) and the run of taps (the positions its taps marked, and how many) are in every restore
+  point and both copy methods. The grid is read from there by the live looper, the gate and the picture;
+  a copy kept anywhere else restores almost exactly. `tap-end` and a load empty the run.
+- **A tap's mark and its fit are first answers.** Both are kept on the log entry and reused when a
+  rewind applies the tap again: the history behind the mark (each delivered frame's due time and
+  position, by `frame % 512`, outside `DeckState`) is overwritten by re-renders, and fitting allocates.
+  A fit that changes the grid sets it and declares the lines after the tap's own state changes, so the
+  restore point the new ring is seeded with holds them; every fit, changed or not, queues its
+  `grid-fitted` beside the `landed`, which a rewind discards and makes again once.
+- **A tap's mark searches only the frames before its own landing frame.** Never the held frames a
+  flush is about to re-render: searching from the newest render would mark a frame the replay, which
+  sees only the frames before the landing frame, never sees, and a replay at the fixed frame would
+  mark another position.
+- **A tap's mark replays exactly only where due times do.** The mark is the position of the latest
+  frame due at or before the tap's host time, so a replay agrees across stretches with no resume
+  (`play` after a pause) and no catch-up skip, the same limit as every other due time.
+- **Each distinct fitted grid rebuilds the restore ring.** A new ring is a whole engine state per slot,
+  allocated between ticks inside the flush, never on the frame path, so memory in proportion to its
+  slots and images is made again for each grid; taps that keep fitting the same grid rebuild nothing.
+  What a rebuild costs in time on a heavy tune is measured on the bench.
+- **Note starts are derived from the record, and the gate reads the engine's record.** They are made
+  once when the register record's own log entry applies and kept by record identity outside
+  `DeckState`, because they are a pure function of a record the engine's saved state holds. A tap
+  before the engine holds a record, or on a deck that is not playing, does nothing and says so once.
 - **A live loop's start is found one frame past the playhead.** A wrap falls due a frame before the
   end, so a line at the playhead's own frame could never be met by a loop ending there; the search
   is for the last line at or behind `floor(position) + 1`. A start behind the playhead with no image

@@ -1,5 +1,5 @@
 import type { RegisterRecord } from '@sidablist/core';
-import type { DeckCommand } from '../messages/commands.js';
+import type { DeckCommand, Grid } from '../messages/commands.js';
 
 /**
  * How many entries a deck's log holds. Past it a sweepable command folds into the one before it,
@@ -63,6 +63,16 @@ export interface LogEntry {
   ready: number;
   /** A press that starts a deck that is not playing has asked the engine to play; it asks once. */
   started: boolean;
+  /**
+   * A tap's first answers, which re-applying reuses: the position it marked (`NaN` until asked) and
+   * the grid its run fitted (null for none, once `fitAsked`). The history a mark reads is rewritten
+   * by re-renders, and a fit allocates.
+   */
+  mark: number;
+  fit: Grid | null;
+  fitAsked: boolean;
+  /** A tap that did nothing has said why, once. */
+  warned: boolean;
 }
 
 /**
@@ -97,6 +107,10 @@ export class CommandLog {
       eventState: EVENT_NONE,
       ready: ANSWER_UNASKED,
       started: false,
+      mark: Number.NaN,
+      fit: null,
+      fitAsked: false,
+      warned: false,
     }));
     for (let i = 0; i < LOG_CAPACITY; i++) this.free[i] = LOG_CAPACITY - 1 - i;
   }
@@ -135,6 +149,10 @@ export class CommandLog {
     entry.eventState = EVENT_NONE;
     entry.ready = ANSWER_UNASKED;
     entry.started = false;
+    entry.mark = Number.NaN;
+    entry.fit = null;
+    entry.fitAsked = false;
+    entry.warned = false;
     this.order[this.count++] = entry.index;
     return entry;
   }

@@ -149,6 +149,7 @@ export interface DeckPicture {
   };
   /** The tune frames whose targets are ready to land on. */
   readonly readyFrames: readonly number[];
+  /** The grid the deck plays on: the load's, or the latest a run of taps fitted. */
   readonly grid: Grid | null;
   /** The tune's play rate; null before a tune is loaded. */
   readonly rate: { readonly exactCallsPerFrame: number; readonly nominalIntervalUs: number } | null;

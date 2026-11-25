@@ -1,5 +1,5 @@
 import type { ActiveLoop, JumpSettings, PlayerSnapshot } from '@sidablist/core';
-import type { JumpTarget } from '../messages/commands.js';
+import type { Grid, JumpTarget } from '../messages/commands.js';
 import { SETTING, SETTING_SLOTS } from '../messages/setting-table.js';
 import { homeList } from './settings.js';
 
@@ -58,7 +58,8 @@ const SLIP_ON = HAND_THROW_STARTED + 1;
 export const SLIP_INTS_AT = SLIP_ON + 1;
 export const SLIP_INT_STRIDE = 4;
 const LIVE_ON = SLIP_INTS_AT + SLIP_DEPARTURES * SLIP_INT_STRIDE;
-const INT_COUNT = LIVE_ON + 1;
+const TAP_COUNT = LIVE_ON + 1;
+const INT_COUNT = TAP_COUNT + 1;
 
 type RunningLoop = Exclude<ActiveLoop, null>;
 
@@ -69,6 +70,9 @@ export const HAND_THROWN = 2;
 
 /** The samples the hand keeps for its release speed. */
 export const HAND_SAMPLES = 8;
+
+/** The marks a run of taps keeps; past it the oldest goes. */
+export const TAP_RUN_CAPACITY = 256;
 
 /** `waitingFrame` and `waitingSeq` while no seek waits for its target. */
 export const NOT_WAITING = -1;
@@ -81,6 +85,8 @@ export interface DeckStateImage {
   readonly handTimes: Float64Array;
   readonly mainSettings: Float64Array;
   readonly loopSettings: Float64Array;
+  readonly tapMarks: Float64Array;
+  grid: Grid | null;
   snapshot: PlayerSnapshot | null;
   varispeed: boolean;
   queued: JumpTarget | null;
@@ -115,6 +121,8 @@ export interface DeckStateImage {
  *   underneath (by reference) and the size the next one starts at;
  * - slip: whether it is on, and the departure running and the one outside it, each held as numbers
  *   (kind, queued, the lap it returns into, the count it left) so a save copies and builds nothing;
+ * - the grid the deck plays on, by reference (a load's and a fit's are immutable), and the run of
+ *   taps: the positions its taps marked, oldest first, and how many;
  * - whether the slot was saved in varispeed, which decides whether a restore into a paused engine
  *   is allowed.
  *
@@ -133,6 +141,10 @@ export class DeckState implements Saveable<DeckStateImage> {
   readonly mainSettings = new Float64Array(SETTING_SLOTS);
   /** The same for the loop's own settings; meaningful while `ownInPlay`. */
   readonly loopSettings = new Float64Array(SETTING_SLOTS);
+  /** The positions the run's taps marked, oldest first; the first `tapCount` are meaningful. */
+  readonly tapMarks = new Float64Array(TAP_RUN_CAPACITY);
+  /** The beat grid in force: the load's, or the latest a run of taps fitted. */
+  grid: Grid | null = null;
   /** The engine snapshot the between-tick logic last read. */
   snapshot: PlayerSnapshot | null = null;
   varispeed = false;
@@ -316,6 +328,30 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.underneath = null;
   }
 
+  /** How many marks the run of taps holds. */
+  get tapCount(): number {
+    return this.ints[TAP_COUNT];
+  }
+  /** Adds a tap's mark to the run; past `TAP_RUN_CAPACITY` the oldest goes. Allocates nothing. */
+  addTapMark(position: number): void {
+    const count = this.ints[TAP_COUNT];
+    if (count === TAP_RUN_CAPACITY) {
+      this.tapMarks.copyWithin(0, 1);
+      this.tapMarks[count - 1] = position;
+      return;
+    }
+    this.tapMarks[count] = position;
+    this.ints[TAP_COUNT] = count + 1;
+  }
+  /** The run's marks, oldest first, as a new array. */
+  tapRun(): number[] {
+    return Array.from(this.tapMarks.subarray(0, this.ints[TAP_COUNT]));
+  }
+  /** Ends the run: the next tap starts a new one. */
+  endTapRun(): void {
+    this.ints[TAP_COUNT] = 0;
+  }
+
   get lastHandOffs(): number {
     return this.ints[LAST_HAND_OFFS];
   }
@@ -331,6 +367,8 @@ export class DeckState implements Saveable<DeckStateImage> {
       handTimes: new Float64Array(HAND_SAMPLES),
       mainSettings: new Float64Array(SETTING_SLOTS),
       loopSettings: new Float64Array(SETTING_SLOTS),
+      tapMarks: new Float64Array(TAP_RUN_CAPACITY),
+      grid: null,
       snapshot: null,
       varispeed: false,
       queued: null,
@@ -349,6 +387,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     target.handTimes.set(this.handTimes);
     target.mainSettings.set(this.mainSettings);
     target.loopSettings.set(this.loopSettings);
+    target.tapMarks.set(this.tapMarks);
+    target.grid = this.grid;
     target.snapshot = this.snapshot;
     target.varispeed = this.varispeed;
     target.queued = this.queued;
@@ -366,6 +406,8 @@ export class DeckState implements Saveable<DeckStateImage> {
     this.handTimes.set(source.handTimes);
     this.mainSettings.set(source.mainSettings);
     this.loopSettings.set(source.loopSettings);
+    this.tapMarks.set(source.tapMarks);
+    this.grid = source.grid;
     this.snapshot = source.snapshot;
     this.varispeed = source.varispeed;
     this.queued = source.queued;
