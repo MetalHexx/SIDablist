@@ -262,11 +262,13 @@ supplies everything environmental.
 - **`flip-lock` reads `written`, not `sent`.** A lock is the opposite of what the tune wrote in the
   last frame rendered before its landing frame, before any shaping; `sent` is the package's own
   shaped output and would lock against itself.
-- **A command is a press unless `Deck.refusal` lists it as a release.** A press is refused on a deck
-  that is empty, loading or failed; a release (`voice-hold` with `held: false`, `tap-end`, `nudge` 0,
-  `hand-lift`, `let-go`, `stop-loop`, `cancel-queued`) and a `settings` never are. A new command that
-  should be a release but is not listed there is refused exactly when a host's key-up needs it, and a
-  hold stays down.
+- **A command is a press unless `Deck.refusal` lets it through.** A press is refused on a deck that is
+  empty, loading or failed. Four kinds of command pass with no phase check: `load`; the releases
+  (`voice-hold` with `held: false`, `tap-end`, `nudge` 0, `hand-lift`, `let-go`, `stop-loop`,
+  `cancel-queued`); `settings`, which is a host's panic; and the moves and switches that need no tune
+  (`repeat`, `targets`, `slip`, `hand-move`). Anything else is a press. A new release that is not
+  listed there is refused exactly when a host's key-up needs it, and a hold stays down; a new
+  command that needs no tune joins the last group on purpose.
 - **A `settings` names its list and is dropped when that list is not in play on its landing frame.**
   `landed` then carries `dropped: true` and no `settingsIn`. It is never applied to the other list,
   however a host a frame behind saw the loop; `setting` and `flip-lock` have no name and go to the list

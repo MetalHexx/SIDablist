@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { DeckCommand, Grid, JumpTarget } from '../messages/commands.js';
 import { SETTING, SETTING_NUMBERS, describeSetting } from '../messages/setting-table.js';
 import { Rig, multiSongTune } from '../testing/harness.js';
+import { COPY_TABLE, GATE_RISES, STEADY, psid } from '../testing/steady-tune.js';
 
 /**
  * Behaviours a DJ would notice missing, each in its own spec and written to fail when the rule is
@@ -442,37 +443,6 @@ describe('what the package does without the engine’s help', () => {
   });
 });
 
-/** A PSID whose play routine is `code`, at $1010, with `table` at $1020 for it to read. */
-function psid(code: readonly number[], table: readonly number[] = []): Uint8Array {
-  const header = new Uint8Array(0x7c);
-  const view = new DataView(header.buffer);
-  header.set([0x50, 0x53, 0x49, 0x44]);
-  view.setUint16(0x04, 2);
-  view.setUint16(0x06, 0x7c);
-  view.setUint16(0x08, 0x1000);
-  view.setUint16(0x0a, 0x1000);
-  view.setUint16(0x0c, 0x1010);
-  view.setUint16(0x0e, 1);
-  view.setUint16(0x10, 1);
-  const payload = new Uint8Array(0x40);
-  payload[0] = 0x60;
-  payload.set(code, 0x10);
-  payload.set(table, 0x20);
-  const bytes = new Uint8Array(header.length + payload.length);
-  bytes.set(header);
-  bytes.set(payload, header.length);
-  return bytes;
-}
-
-/** Copies the 25 bytes at $1020 to the chip every frame: LDX #24; LDA $1020,X; STA $D400,X; DEX; BPL; RTS. */
-const COPY_TABLE = [0xa2, 0x18, 0xbd, 0x20, 0x10, 0x9d, 0x00, 0xd4, 0xca, 0x10, 0xf7, 0x60];
-/** Every voice pulse and gated, a low-pass filter at cutoff 256 on all three, full volume; never moves. */
-const STEADY = [
-  0x45, 0x1d, 0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x20, 0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x30,
-  0x00, 0x08, 0x41, 0x29, 0xa4, 0x00, 0x20, 0x47, 0x1f,
-];
-/** Writes voice 1's gate high from the 30th play call on: INC $FB; LDA $FB; CMP #30; LDA #0; ROL A; STA $D404; RTS. */
-const GATE_RISES = [0xe6, 0xfb, 0xa5, 0xfb, 0xc9, 0x1e, 0xa9, 0x00, 0x2a, 0x8d, 0x04, 0xd4, 0x60];
 const CONTROL = [4, 11, 18];
 const CUTOFF: SidField = { name: 'cutoff' };
 const frequency = (voice: number): SidField => ({ name: 'frequency', voice });
@@ -723,5 +693,118 @@ describe('a panic', () => {
       expect(wrote(rig, panic.frame - 1, register)).not.toBe(STEADY[register]);
     }
     rig.dispose();
+  });
+});
+
+describe('an edit while a loop’s own settings play', () => {
+  it('goes to the loop’s list and not the main one, which comes back whole on the let-go', async () => {
+    const OWN: JumpTarget = {
+      startFrame: 100,
+      endFrame: 130,
+      settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+    };
+    const rig = await shaped({ settings: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] });
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
+    rig.advance(100);
+    expect(rig.picture().settingsInPlay).toBe('loop');
+
+    await send(rig, { kind: 'setting', deck: 'a', setting: SETTING.CUTOFF_OFFSET, value: 100 });
+    await send(rig, { kind: 'flip-lock', deck: 'a', setting: SETTING.VOICE_1_GATE_HOLD });
+    rig.advance(100);
+
+    expect(rig.landed('setting')[0]).toMatchObject({ settingsIn: 'loop' });
+    expect(rig.landed('flip-lock')[0]).toMatchObject({ settingsIn: 'loop' });
+    const picture = rig.picture();
+    expect(picture.settings.loop).toEqual(
+      expect.arrayContaining([
+        { setting: SETTING.VOICE_2_MUTE, value: 1 },
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+      ]),
+    );
+    expect((picture.settings.loop ?? []).map((entry) => entry.setting)).toContain(
+      SETTING.VOICE_1_GATE_HOLD,
+    );
+    expect(picture.settings.main).toEqual([{ setting: SETTING.VOICE_3_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'let-go', deck: 'a' });
+    rig.advance(100);
+    const now = chip(rig);
+    expect(rig.picture()).toMatchObject({
+      settingsInPlay: 'main',
+      settings: { main: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] },
+    });
+    expect(readSidField(now.sent, CUTOFF)).toBe(readSidField(now.written, CUTOFF));
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    rig.dispose();
+  });
+});
+
+describe('a tap', () => {
+  /**
+   * A deck on Insid3-out whose first tap lands while frames are held, then three taps on later note starts
+   * behind the frontier. `firstMark` gives the host time the first tap is sent with.
+   */
+  async function tapRun(
+    firstMark: (
+      due: ReadonlyMap<number, { dueAtMs: number; position: number }>,
+      rig: Rig,
+      before: number,
+    ) => number,
+  ): Promise<{ grid: Grid | null; position: number; atMs: number; heldDueAtMs: number }> {
+    const rig = new Rig();
+    rig.addDeck('a', { lookaheadMs: 60 });
+    await rig.load('a', 'insid3-out', { ends: 'playing' });
+    rig.advance(700);
+    const frames = (): Map<number, { dueAtMs: number; position: number }> =>
+      new Map(
+        rig
+          .ofKind('update', 'a')
+          .map((u) => [u.streamFrame, { dueAtMs: u.dueAtMs, position: u.position }]),
+      );
+    const heldFrom = (): number => {
+      const updates = rig.ofKind('update', 'a');
+      return updates[updates.length - 1].streamFrame + 1 - (rig.picture().output?.heldFrames ?? 0);
+    };
+    // Wait for a moment when the frame before the first held one falls 2 frames short of a note start (position 10 of 12),
+    // so marking a held frame instead shows in the grid.
+    for (let guard = 0; guard < 400; guard++) {
+      if ((frames().get(heldFrom() - 1)?.position ?? 0) % 12 === 10) break;
+      rig.advance(5);
+    }
+    const before = frames().get(heldFrom() - 1);
+    expect(before).toBeDefined();
+    const position = before?.position ?? 0;
+    const atMs = firstMark(frames(), rig, position);
+    const heldDueAtMs = frames().get(heldFrom())?.dueAtMs ?? Infinity;
+
+    await send(rig, { kind: 'tap', deck: 'a', atMs });
+    rig.advance(400);
+    for (const ahead of [7, 19, 31]) {
+      const frame = [...frames().values()].find((f) => f.position === position + ahead);
+      expect(frame, `a frame at position ${position + ahead}`).toBeDefined();
+      await send(rig, { kind: 'tap', deck: 'a', atMs: frame?.dueAtMs ?? 0 });
+      rig.advance(20);
+    }
+    rig.advance(100);
+    const grid = rig.picture().grid;
+    rig.dispose();
+    return { grid, position, atMs, heldDueAtMs };
+  }
+
+  it('marks the playhead at the moment it happened, not at the render frontier', async () => {
+    // A tap sent with a time that falls on a held frame marks the frame before the one it lands on ...
+    const held = await tapRun((_frames, rig) => rig.time.ms + 45);
+    expect(held.heldDueAtMs).toBeLessThanOrEqual(held.atMs);
+    // ... which is what a tap naming that earlier frame's own due time marks.
+    const named = await tapRun((frames, _rig, position) => {
+      const frame = [...frames.values()].find((f) => f.position === position);
+      return frame?.dueAtMs ?? 0;
+    });
+    expect(named.grid).not.toBeNull();
+    expect(held.position).toBe(named.position);
+    expect(held.grid).toEqual(named.grid);
   });
 });
