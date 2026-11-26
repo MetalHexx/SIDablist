@@ -472,7 +472,7 @@ describe('the hand inside a loop', () => {
 
   async function inLoop(loop: JumpTarget): Promise<Fixture> {
     const fixture = await deckOn('playing', { targets: [100] });
-    await send(fixture.rig, fixture.deck, { kind: 'key', deck: 'a', target: loop });
+    await send(fixture.rig, fixture.deck, { kind: 'hot-cue', deck: 'a', target: loop });
     fixture.rig.advance(200);
     expect(pictureOf(fixture.rig, fixture.deck).loop).toMatchObject({ startFrame: 100 });
     return fixture;

@@ -6,21 +6,27 @@ import {
   milliseconds,
   parseSidFile,
 } from '@sidablist/core';
+import type { SidPlayer } from '@sidablist/core';
 import { describe, expect, it } from 'vitest';
 import { BUNDLED_TUNES, decodeBundledTune } from '../__fixtures__/index.js';
 import { createInlineHeavyWork } from '../heavy-work/inline.js';
-import type { DeckCommand } from '../messages/commands.js';
+import type { DeckCommand, NumberedSetting } from '../messages/commands.js';
+import { SETTING } from '../messages/setting-table.js';
 import { firstFrameDifference } from '../testing/compare.js';
 import { Rig } from '../testing/harness.js';
 import type { WireEvent, WireFrame } from '../testing/holding-sink.js';
 
 const FRAMES = 3000;
 
-/** Frames a bare engine delivered when ticked at `dueTimes`, in the shape the holding sink's far end keeps. */
+/**
+ * Frames a bare engine delivered when ticked at `dueTimes`, in the shape the holding sink's far end
+ * keeps. `shape` makes the engine calls a deck's settings stand for, after `loadTune`.
+ */
 async function bareFrames(
   tune: string,
   speed: number,
   dueTimes: readonly number[],
+  shape?: (player: SidPlayer) => void,
 ): Promise<{ readonly frames: WireFrame[]; readonly effectiveIntervalUs: number }> {
   const sink = new FakeSink();
   const clock = new FakeClock();
@@ -34,6 +40,7 @@ async function bareFrames(
   if (bundled === undefined) throw new Error(`no bundled tune ${tune}`);
   player.setRepeatTrack(true);
   player.loadTune(parseSidFile(decodeBundledTune(bundled.base64)));
+  shape?.(player);
   player.setTargetClock(PAL_PHI2_HZ);
   player.setTempo(speed);
   await player.play();
@@ -79,6 +86,64 @@ describe('a deck with no commands', () => {
         rig.dispose();
       });
     }
+  }
+});
+
+const KEY = 3;
+const COARSE = 7;
+const FINE = 30;
+/** A list off home in every way the engine takes: an offset, two holds, Key, a voice's tuning and a mute. */
+const OFF_HOME: readonly NumberedSetting[] = [
+  { setting: SETTING.CUTOFF_OFFSET, value: 300 },
+  { setting: SETTING.VOICE_1_WAVEFORM_HOLD, value: 2 },
+  { setting: SETTING.VOICE_2_PULSE_WIDTH_HOLD, value: 1024 },
+  { setting: SETTING.KEY, value: KEY },
+  { setting: SETTING.VOICE_2_COARSE, value: COARSE },
+  { setting: SETTING.VOICE_2_FINE, value: FINE },
+  { setting: SETTING.VOICE_3_MUTE, value: 1 },
+];
+
+/** The engine calls `OFF_HOME` stands for, made directly on a bare engine. */
+function shapeLikeOffHome(player: SidPlayer): void {
+  player.setFieldOffset({ name: 'cutoff' }, 300);
+  player.holdField({ name: 'waveform', voice: 0 }, 2);
+  player.holdField({ name: 'pulseWidth', voice: 1 }, 1024);
+  for (let voice = 0; voice < 3; voice++) {
+    const coarse = voice === 1 ? COARSE : 0;
+    const fine = voice === 1 ? FINE : 0;
+    player.setVoicePitch(voice, 2 ** ((KEY + coarse + fine / 100) / 12));
+  }
+  player.setVoiceMuted(2, true);
+}
+
+describe('a deck loaded with settings off home', () => {
+  for (const tune of BUNDLED_TUNES) {
+    it(`delivers what a bare engine given the same calls does on ${tune.id}, over ${FRAMES} frames`, async () => {
+      const rig = new Rig();
+      rig.addDeck('a', { lookaheadMs: 60 });
+      await rig.load('a', tune.id, { ends: 'playing', settings: OFF_HOME });
+      rig.advance(61_500);
+      const delivered = rig.frames().slice(0, FRAMES);
+      expect(delivered).toHaveLength(FRAMES);
+      expect(rig.picture().settings.main).toHaveLength(OFF_HOME.length);
+
+      const { frames: bare } = await bareFrames(
+        tune.id,
+        1,
+        delivered.map((frame) => frame.dueAtMs),
+        shapeLikeOffHome,
+      );
+      expect(firstFrameDifference(delivered, bare)).toBeNull();
+
+      // The settings changed something: a deck with none gives other frames.
+      const plain = new Rig();
+      plain.addDeck('a', { lookaheadMs: 60 });
+      await plain.load('a', tune.id, { ends: 'playing' });
+      plain.advance(61_500);
+      expect(firstFrameDifference(delivered, plain.frames().slice(0, FRAMES))).not.toBeNull();
+      rig.dispose();
+      plain.dispose();
+    });
   }
 });
 

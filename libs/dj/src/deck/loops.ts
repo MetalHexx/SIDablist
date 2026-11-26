@@ -1,17 +1,22 @@
 import { frames, isUsableLoopLength } from '@sidablist/core';
 import type { ActiveLoop, JumpSettings, QueuedJump, SidPlayer } from '@sidablist/core';
-import type { DeckCommand, JumpTarget } from '../messages/commands.js';
+import type { DeckCommand, JumpTarget, NumberedSetting } from '../messages/commands.js';
 import { ANSWER_NO, ANSWER_UNASKED, ANSWER_YES, LOOP_YES, type LogEntry } from './command-log.js';
 import type { DeckState } from './deck-state.js';
-import { mutesAsBooleans, mutesOfSettings, VOICE_COUNT } from './settings.js';
+import { applyDifferences, applySetting, jumpSettingsOf, listOf, readList } from './settings.js';
 import type { DeckSlip } from './slip.js';
 
-/** How a `key` press resolved, as the event queue carries it: 0 for a command that is not a key. */
+/** How a `hot-cue` press resolved, as the event queue carries it: 0 for a command that is not a hot cue. */
 export const RESOLVED_NONE = 0;
 export const RESOLVED_START = 1;
 export const RESOLVED_QUEUE = 2;
 export const RESOLVED_CANCEL = 3;
 export const RESOLVED_LET_GO = 4;
+
+/** What `land` did: ignored the jump, landed it, or landed it over (replacing) a running loop. */
+export const LAND_IGNORED = 0;
+export const LAND_LANDED = 1;
+export const LAND_OVER_LOOP = 2;
 
 /** The largest tune frame a seek keeps waiting for: it is stored in the deck state's 32-bit slots. */
 const MAX_TUNE_FRAME = 0x7fffffff;
@@ -71,12 +76,13 @@ function canRun(target: JumpTarget): boolean {
 
 /**
  * The loops a deck plays, between ticks: jumps that land now, at the end of the pass or when their
- * target is ready, the four-way key press, letting go, edits to the running loop and the loop's own
- * settings. The engine holds the loop itself; this holds what the engine does not say (the target
+ * target is ready, the four-way hot cue press, letting go, edits to the running loop and the loop's own
+ * settings (a complete list of its own, swapped in on its landing frame and out on its let-go). The
+ * engine holds the loop itself; this holds what the engine does not say (the target
  * queued and what it carries, the change named, whose settings are in play) in `DeckState`, so a
  * rewind puts it back with the engine. It tells slip where a loop begins, lands and ends.
  *
- * A live loop counts as a loop running: a key queues behind it and a jump lands at its end of pass,
+ * A live loop counts as a loop running: a hot cue queues behind it and a jump lands at its end of pass,
  * ending it. The loop under a live loop is kept in `DeckState` with its queue and pending change,
  * and an edit to it waits.
  *
@@ -84,7 +90,7 @@ function canRun(target: JumpTarget): boolean {
  * landing the engine makes inside a tick is learnt afterwards, from the hand-offs it counts.
  */
 export class DeckLoops {
-  /** How the last `key` resolved. */
+  /** How the last `hot-cue` resolved. */
   resolved = RESOLVED_NONE;
 
   constructor(
@@ -95,7 +101,7 @@ export class DeckLoops {
   ) {}
 
   /**
-   * What a `key` on `target` does, from the deck's state alone, so a replay at the same frame
+   * What a `hot-cue` on `target` does, from the deck's state alone, so a replay at the same frame
    * resolves the same way: the running loop lets go, a target already queued or waiting is
    * cancelled, any other queues while a loop runs, and otherwise it starts.
    */
@@ -123,8 +129,8 @@ export class DeckLoops {
     return this.start(entry, target);
   }
 
-  /** A hot-key press, resolved at its landing frame. Returns whether it ended the running loop. */
-  key(entry: LogEntry, target: JumpTarget): boolean {
+  /** A hot cue press, resolved at its landing frame. Returns whether it ended the running loop. */
+  hotCue(entry: LogEntry, target: JumpTarget): boolean {
     const resolved = this.resolve(target);
     this.resolved = resolved;
     switch (resolved) {
@@ -174,7 +180,7 @@ export class DeckLoops {
 
   /**
    * Releases the running loop and the target queued behind it, and puts the main settings back on
-   * this frame, with no slip landing (a stop, a seek or a load abandon slip themselves). The queue
+   * this frame (every setting the loop's own list moved off the main one), with no slip landing (a stop, a seek or a load abandon slip themselves). The queue
    * goes because with no loop there is no end of pass for it to land at, and the engine ignores
    * one. A waiting target stays. Returns whether a loop was running.
    */
@@ -264,28 +270,38 @@ export class DeckLoops {
     if (!named) this.host.warn('lost the loop change it had named: the engine took it no more');
   }
 
-  /** A main setting changes the loop's own while those play, and the main ones otherwise. */
-  setSetting(voice: number, muted: boolean): void {
+  /**
+   * Sets one setting in the settings in play: the loop's own list while those play, the main list
+   * otherwise. It writes the list and applies the setting to the engine.
+   */
+  setSetting(setting: number, value: number): void {
     const state = this.state;
-    if (state.ownInPlay) {
-      state.setLoopMuted(voice, muted);
-    } else {
-      state.setMuted(voice, muted);
-    }
-    this.player.setVoiceMuted(voice, muted);
-    if (!state.ownInPlay) this.refreshCarried();
+    const list = state.ownInPlay ? state.loopSettings : state.mainSettings;
+    list[setting] = value;
+    applySetting(this.player, list, setting);
+  }
+
+  /**
+   * Sets each of `changes`, in order, in the settings in play, when `settingsIn` names them.
+   * Otherwise changes nothing and returns false: a command sent for the list that has since stopped
+   * playing must not land on the other one.
+   */
+  setSettings(settingsIn: 'main' | 'loop', changes: readonly NumberedSetting[]): boolean {
+    if ((settingsIn === 'loop') !== this.state.ownInPlay) return false;
+    for (const { setting, value } of changes) this.setSetting(setting, value);
+    return true;
   }
 
   /**
    * Lands `target`, whose image is ready: the loop, the playhead and the settings it carries.
-   * Returns whether it replaced a running loop. An image a later declaration has since withdrawn
+   * Returns `LAND_OVER_LOOP` when it replaced a running loop, else `LAND_LANDED`. An image a later declaration has since withdrawn
    * would be replayed off the frame path, whose landing time would depend on the worker: the jump
-   * is ignored instead.
+   * is ignored instead (`LAND_IGNORED`).
    */
-  land(target: JumpTarget, settings: JumpSettings | null): boolean {
+  land(target: JumpTarget, settings: JumpSettings | null): number {
     if (!this.isReady(target)) {
       this.host.warn(`ignored a jump to ${target.startFrame}: its image is not held`);
-      return false;
+      return LAND_IGNORED;
     }
     const looping = this.player.getSnapshot().loop !== null;
     const isLoop = target.endFrame !== null;
@@ -296,11 +312,11 @@ export class DeckLoops {
     this.state.queued = null;
     this.state.queuedSettings = null;
     this.state.pending = null;
-    this.swapIn(target, settings);
+    this.swapIn(target);
     this.seek(target, settings);
     if (isLoop) this.slip.loopLanded();
     else this.slip.cueLanded();
-    return looping;
+    return looping ? LAND_OVER_LOOP : LAND_LANDED;
   }
 
   /**
@@ -312,11 +328,10 @@ export class DeckLoops {
     state.pending = null;
     const target = state.queued;
     if (target === null) return;
-    const settings = state.queuedSettings;
     state.clearLive();
     state.queued = null;
     state.queuedSettings = null;
-    this.swapIn(target, settings);
+    this.swapIn(target);
     if (target.endFrame === null) this.slip.cueLanded();
     else this.slip.loopLanded();
     this.host.jumpLanded(frame, target);
@@ -408,14 +423,14 @@ export class DeckLoops {
     if (loop !== null && target.endFrame !== null && sameBounds(loop, target)) {
       this.adoptLive();
       this.slip.begin('loop');
-      this.swapIn(target, settings);
+      this.swapIn(target);
       this.seek(target, settings);
       return false;
     }
     if (entry.ready === ANSWER_UNASKED) {
       entry.ready = this.isReady(target) ? ANSWER_YES : ANSWER_NO;
     }
-    if (entry.ready === ANSWER_YES) return this.land(target, settings);
+    if (entry.ready === ANSWER_YES) return this.land(target, settings) === LAND_OVER_LOOP;
     if (this.state.queued !== null) this.dropQueue();
     if (target.endFrame !== null) this.slip.begin('loop', true);
     this.host.wait(tuneFrameOf(target.startFrame), entry.seq, target, settings);
@@ -493,13 +508,14 @@ export class DeckLoops {
   }
 
   /**
-   * What a jump into `target` carries, built here and never at the landing: its own settings; the
-   * main ones when it has none of its own and a loop's own are in play, which is how they come
-   * back on the jump's frame; otherwise nothing.
+   * What a jump into `target` carries, built here and never at the landing: the complete list of
+   * its own settings (home, but for the ones it names); the complete main list when it has none of
+   * its own and a loop's own are in play, which is how the main settings come back on the jump's
+   * frame; otherwise nothing.
    */
   private carriedBy(target: JumpTarget): JumpSettings | null {
-    if (target.settings !== undefined) return { voiceMutes: mutesOfSettings(target.settings) };
-    return this.state.ownInPlay ? { voiceMutes: mutesAsBooleans(this.state.mutes) } : null;
+    if (target.settings !== undefined) return jumpSettingsOf(listOf(target.settings));
+    return this.state.ownInPlay ? jumpSettingsOf(this.state.mainSettings) : null;
   }
 
   /**
@@ -507,12 +523,10 @@ export class DeckLoops {
    * applied again. Its own settings come into play with the main ones held aside; a target with
    * none of its own carried the main ones back.
    */
-  private swapIn(target: JumpTarget, settings: JumpSettings | null): void {
+  private swapIn(target: JumpTarget): void {
     const state = this.state;
     if (target.settings !== undefined) {
-      for (let voice = 0; voice < VOICE_COUNT; voice++) {
-        state.setLoopMuted(voice, settings?.voiceMutes?.[voice] === true);
-      }
+      readList(target.settings, state.loopSettings);
       state.ownInPlay = true;
     } else {
       state.ownInPlay = false;
@@ -520,21 +534,24 @@ export class DeckLoops {
     this.refreshCarried();
   }
 
-  /** Puts the main settings back, on this frame, when a loop's own are in play. */
+  /**
+   * Puts the main settings back, on this frame, when a loop's own are in play: every setting whose
+   * main value differs from the loop's is applied. A jump never comes through here: one with no
+   * settings of its own carries the main list back itself, so it is applied once.
+   */
   private releaseSettings(): void {
     const state = this.state;
     if (!state.ownInPlay) return;
     state.ownInPlay = false;
-    for (let voice = 0; voice < VOICE_COUNT; voice++) {
-      this.player.setVoiceMuted(voice, state.muted(voice));
-    }
+    applyDifferences(this.player, state.mainSettings, state.loopSettings);
     this.refreshCarried();
   }
 
   /**
-   * Builds again what the queued and the waiting target carry when the main settings or whether a
-   * loop's own are in play moved under them, so each lands with what is true then. A queued target
-   * is named to the engine again, which replaces it.
+   * Builds again what the queued and the waiting target carry when whether a loop's own settings
+   * are in play moved under them, so each lands with what is true then. The main list cannot change
+   * while they play, so nothing else moves them. A queued target is named to the engine again, which
+   * replaces it.
    */
   private refreshCarried(): void {
     const state = this.state;
@@ -548,15 +565,12 @@ export class DeckLoops {
     }
   }
 
-  /** Whether `held` is not what a jump into `target` would carry now. A target's own settings never move. */
+  /**
+   * Whether `held` is not what a jump into `target` would carry now. A target's own settings never
+   * move, and one without carries the main list exactly while a loop's own are in play.
+   */
   private stale(target: JumpTarget, held: JumpSettings | null): boolean {
     if (target.settings !== undefined) return false;
-    const state = this.state;
-    if (!state.ownInPlay) return held !== null;
-    if (held === null) return true;
-    for (let voice = 0; voice < VOICE_COUNT; voice++) {
-      if ((held.voiceMutes?.[voice] === true) !== state.muted(voice)) return true;
-    }
-    return false;
+    return this.state.ownInPlay !== (held !== null);
   }
 }

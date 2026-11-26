@@ -45,12 +45,12 @@ const TARGETS = [100, 300, 500];
 const PRESSES: readonly (readonly [number, (deck: string) => DeckCommand])[] = [
   [200, (deck) => ({ kind: 'speed', deck, value: 1.3 })],
   [350, (deck) => ({ kind: 'setting', deck, setting: 1, value: 1 })],
-  [500, (deck) => ({ kind: 'key', deck, target: LOOP })],
-  [800, (deck) => ({ kind: 'key', deck, target: CUE })],
+  [500, (deck) => ({ kind: 'hot-cue', deck, target: LOOP })],
+  [800, (deck) => ({ kind: 'hot-cue', deck, target: CUE })],
   [1300, (deck) => ({ kind: 'nudge', deck, amount: 0.05 })],
   [1500, (deck) => ({ kind: 'nudge', deck, amount: 0 })],
   [1700, (deck) => ({ kind: 'seek', deck, frame: 500 })],
-  [2000, (deck) => ({ kind: 'key', deck, target: LOOP })],
+  [2000, (deck) => ({ kind: 'hot-cue', deck, target: LOOP })],
   [2300, (deck) => ({ kind: 'stop-loop', deck })],
   [2500, (deck) => ({ kind: 'setting', deck, setting: 1, value: 0 })],
 ];

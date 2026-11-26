@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { JumpTarget } from '../messages/commands.js';
+import { SETTING } from '../messages/setting-table.js';
 import { Rig } from '../testing/harness.js';
 import { ALLOCATION_NOISE_BYTES, measureAllocation } from '../testing/measure-allocation.js';
 
@@ -72,6 +73,81 @@ describe('the frame path', { timeout: LONG_RUN_MS }, () => {
   });
 });
 
+/** A quiet rig playing with offsets, holds, a pitch, a mute and a voice hold in force. */
+async function shaped(lookaheadMs: number): Promise<Rig> {
+  const rig = new Rig({ quiet: true });
+  rig.addDeck('a', { lookaheadMs });
+  await rig.load('a', 'still-time', { ends: 'playing' });
+  rig.send({
+    kind: 'settings',
+    deck: 'a',
+    settingsIn: 'main',
+    changes: [
+      { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+      { setting: SETTING.VOICE_1_FREQUENCY_OFFSET, value: 30 },
+      { setting: SETTING.VOICE_2_WAVEFORM_HOLD, value: 4 },
+      { setting: SETTING.VOLUME_HOLD, value: 9 },
+      { setting: SETTING.KEY, value: 3 },
+      { setting: SETTING.VOICE_1_COARSE, value: 2 },
+      { setting: SETTING.VOICE_3_FINE, value: 20 },
+      { setting: SETTING.VOICE_3_MUTE, value: 1 },
+    ],
+  });
+  rig.send({ kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+  await rig.microtasks();
+  rig.advance(500);
+  expect(rig.picture().settings.main).toHaveLength(8);
+  return rig;
+}
+
+describe('the frame path with the tune shaped', { timeout: LONG_RUN_MS }, () => {
+  it('allocates nothing over plain play with offsets, holds, a pitch and a voice hold in force', async () => {
+    const rig = await shaped(60);
+    const { time, wake } = rig;
+    const sink = rig.sinks.get('a')!;
+
+    const { heapGrowthBytes, scavenges } = await measureAllocation(
+      () => {
+        for (let i = 0; i < FRAMES; i++) {
+          time.ms += 20;
+          sink.advanceTo(time.ms);
+          wake.fire();
+        }
+      },
+      { warmup: WARMUP_FRAMES },
+    );
+
+    expect(scavenges).toBe(0);
+    expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+    rig.dispose();
+  });
+
+  it('allocates nothing in the saves of presses that rewind it', async () => {
+    const rig = await shaped(120);
+    const { time, wake, dj } = rig;
+    const sink = rig.sinks.get('a')!;
+    const release = { kind: 'nudge', deck: 'a', amount: 0 } as const;
+
+    const { heapGrowthBytes, scavenges } = await measureAllocation(
+      () => {
+        for (let i = 0; i < PRESSES; i++) {
+          time.ms += 20;
+          sink.advanceTo(time.ms);
+          dj.send(release);
+          wake.fire();
+        }
+      },
+      { warmup: WARMUP_PRESSES },
+    );
+
+    const rewinds = rig.picture().timing.rewinds;
+    expect(rewinds).toBeGreaterThan(PRESSES * 8);
+    expect(scavenges).toBe(0);
+    expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+    rig.dispose();
+  });
+});
+
 /**
  * A deck with a loop running boxes the `lapProgress` of every update it reports (and, for a length
  * that is not whole, the lap phase and length it is worked out from): up to about 70 bytes a frame
@@ -96,7 +172,7 @@ async function looping(target: JumpTarget): Promise<Rig> {
   rig.send({ kind: 'targets', deck: 'a', frames: [500, 1000] });
   await rig.settle();
   rig.advance(300);
-  rig.send({ kind: 'key', deck: 'a', target });
+  rig.send({ kind: 'hot-cue', deck: 'a', target });
   await rig.microtasks();
   rig.advance(100);
   expect(rig.picture().loop).toMatchObject({ startFrame: target.startFrame });
@@ -137,8 +213,8 @@ describe('the frame path with a loop running', () => {
     const rig = await looping(LOOP_A);
     const { time, wake, dj } = rig;
     const sink = rig.sinks.get('a')!;
-    const queueB = { kind: 'key', deck: 'a', target: LOOP_B } as const;
-    const queueA = { kind: 'key', deck: 'a', target: LOOP_A } as const;
+    const queueB = { kind: 'hot-cue', deck: 'a', target: LOOP_B } as const;
+    const queueA = { kind: 'hot-cue', deck: 'a', target: LOOP_A } as const;
     const pass = (): void => {
       for (let i = 0; i < HAND_OFFS; i++) {
         dj.send(i % 2 === 0 ? queueB : queueA);
@@ -192,7 +268,7 @@ describe('the frame path with the hand on the record', () => {
     await rig.settle();
     rig.advance(300);
     rig.send({ kind: 'slip', deck: 'a', on: true });
-    rig.send({ kind: 'key', deck: 'a', target: WRAPPING });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: WRAPPING });
     await rig.microtasks();
     rig.advance(100);
     rig.send({ kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });
@@ -270,3 +346,79 @@ describe('the frame path with the hand on the record', () => {
     rig.dispose();
   });
 });
+
+/**
+ * A quiet rig playing Insid3-out (a frame every 9.975 ms from time 1000, a note start every 12
+ * frames) with a run of taps held and the grid they fitted in force: both are in every restore
+ * point, and every delivered frame is written into the history a tap marks from.
+ */
+async function tapped(lookaheadMs: number): Promise<Rig> {
+  const rig = new Rig({ quiet: true });
+  rig.addDeck('a', { lookaheadMs });
+  await rig.load('a', 'insid3-out', { ends: 'playing' });
+  rig.advance(2500);
+  // Frame 64 delivers the position 65, a note start; each tap after it is a beat (12 frames) on.
+  const firstMs = 1000 + 9.975 * 64 + 1;
+  for (let beat = 0; beat < 5; beat++) {
+    rig.send({ kind: 'tap', deck: 'a', atMs: firstMs + 119.7 * beat });
+    await rig.microtasks();
+    rig.advance(20);
+  }
+  rig.advance(500);
+  expect(rig.picture().grid).toMatchObject({ beatFrames: 12 });
+  return rig;
+}
+
+/** Insid3-out delivers two frames a tick of 20 ms, so a pass of half the ticks renders as many frames as the others. */
+const TAPPED_TICKS = FRAMES / 2;
+
+describe(
+  'the frame path with a run of taps and the grid they fitted',
+  { timeout: LONG_RUN_MS },
+  () => {
+    it('allocates nothing over plain play', async () => {
+      const rig = await tapped(60);
+      const { time, wake } = rig;
+      const sink = rig.sinks.get('a')!;
+
+      const { heapGrowthBytes, scavenges } = await measureAllocation(
+        () => {
+          for (let i = 0; i < TAPPED_TICKS; i++) {
+            time.ms += 20;
+            sink.advanceTo(time.ms);
+            wake.fire();
+          }
+        },
+        { warmup: WARMUP_FRAMES },
+      );
+
+      expect(scavenges).toBe(0);
+      expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+      rig.dispose();
+    });
+
+    it('allocates nothing in the saves of presses that rewind it', async () => {
+      const rig = await tapped(120);
+      const { time, wake, dj } = rig;
+      const sink = rig.sinks.get('a')!;
+      const release = { kind: 'nudge', deck: 'a', amount: 0 } as const;
+
+      const { heapGrowthBytes, scavenges } = await measureAllocation(
+        () => {
+          for (let i = 0; i < PRESSES; i++) {
+            time.ms += 20;
+            sink.advanceTo(time.ms);
+            dj.send(release);
+            wake.fire();
+          }
+        },
+        { warmup: WARMUP_PRESSES },
+      );
+
+      expect(rig.picture().timing.rewinds).toBeGreaterThan(PRESSES * 4);
+      expect(scavenges).toBe(0);
+      expect(heapGrowthBytes, `grew ${heapGrowthBytes}`).toBeLessThan(ALLOCATION_NOISE_BYTES);
+      rig.dispose();
+    });
+  },
+);

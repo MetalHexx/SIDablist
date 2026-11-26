@@ -19,8 +19,8 @@ export interface DeckUpdate {
   readonly slipPosition: number | null;
 }
 
-/** How a `key` press resolved. */
-export type KeyResolution = 'start' | 'queue' | 'cancel' | 'let-go';
+/** How a `hot-cue` press resolved. */
+export type HotCueResolution = 'start' | 'queue' | 'cancel' | 'let-go';
 
 /** Something that happened to a deck. */
 export type DeckEvent =
@@ -39,10 +39,15 @@ export type DeckEvent =
       readonly frame: number;
       /** Milliseconds from the press to the landing; null when the command carried no press time. */
       readonly waitMs: number | null;
-      /** For a `key` command: how the press resolved. */
-      readonly resolved?: KeyResolution;
-      /** Which settings the deck plays with after this landing. */
+      /** For a `hot-cue`: how the press resolved. */
+      readonly resolved?: HotCueResolution;
+      /** For `setting`, `settings` and `flip-lock`: the settings the change went to. */
       readonly settingsIn?: 'main' | 'loop';
+      /**
+       * For `settings`: true when the settings it named were not the ones playing on its landing frame,
+       * so nothing changed.
+       */
+      readonly dropped?: boolean;
     }
   | {
       /** A tune finished loading. */
@@ -70,6 +75,15 @@ export type DeckEvent =
       readonly via: 'pass-end' | 'ready';
       readonly startFrame: number;
       readonly endFrame: number | null;
+    }
+  | {
+      /** Taps fitted a grid; the deck plays on it from `frame`. */
+      readonly kind: 'grid-fitted';
+      readonly deck: DeckId;
+      readonly frame: number;
+      readonly grid: Grid;
+      /** Taps in the run the fit used. */
+      readonly taps: number;
     }
   | {
       /** The playhead was captured. */
@@ -128,12 +142,14 @@ export interface DeckPicture {
   /** Where the hand is: off the record, on it, or the record thrown. */
   readonly hand: 'up' | 'down' | 'thrown';
   readonly settingsInPlay: 'main' | 'loop';
+  /** Each list holds every setting off home, in number order; a setting not listed is at home. */
   readonly settings: {
     readonly main: readonly NumberedSetting[];
     readonly loop: readonly NumberedSetting[] | null;
   };
   /** The tune frames whose targets are ready to land on. */
   readonly readyFrames: readonly number[];
+  /** The grid the deck plays on: the load's, or the latest a run of taps fitted. */
   readonly grid: Grid | null;
   /** The tune's play rate; null before a tune is loaded. */
   readonly rate: { readonly exactCallsPerFrame: number; readonly nominalIntervalUs: number } | null;

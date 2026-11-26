@@ -63,6 +63,14 @@ export interface LogEntry {
   ready: number;
   /** A press that starts a deck that is not playing has asked the engine to play; it asks once. */
   started: boolean;
+  /**
+   * The position a tap marked (`NaN` until asked), which re-applying reuses: the history a mark
+   * reads is rewritten by re-renders. The fit is not kept, because the run it fits can differ on a
+   * replay.
+   */
+  mark: number;
+  /** A tap that did nothing has said why, once. */
+  warned: boolean;
 }
 
 /**
@@ -97,6 +105,8 @@ export class CommandLog {
       eventState: EVENT_NONE,
       ready: ANSWER_UNASKED,
       started: false,
+      mark: Number.NaN,
+      warned: false,
     }));
     for (let i = 0; i < LOG_CAPACITY; i++) this.free[i] = LOG_CAPACITY - 1 - i;
   }
@@ -135,6 +145,8 @@ export class CommandLog {
     entry.eventState = EVENT_NONE;
     entry.ready = ANSWER_UNASKED;
     entry.started = false;
+    entry.mark = Number.NaN;
+    entry.warned = false;
     this.order[this.count++] = entry.index;
     return entry;
   }

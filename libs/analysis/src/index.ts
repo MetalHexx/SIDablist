@@ -17,6 +17,27 @@ export {
   lapPhaseOfFold,
   type LadderSize,
 } from './grid-lines.js';
+export {
+  inGridSpan,
+  nearestBeat,
+  onBeat,
+  nextBeat,
+  snapToBeat,
+  beatsPerMinute,
+  type HeldGrid,
+} from './beats.js';
+export {
+  resizeLoop,
+  setLoopLength,
+  stepLoopLength,
+  moveLoop,
+  shiftLoop,
+  loopLapPhase,
+  CUE_LENGTH_BEATS,
+  type LoopBounds,
+  type LoopEdit,
+  type LoopEditRefusal,
+} from './loop-edits.js';
 export { formatCents, formatDuration } from './format.js';
 export {
   readFrameFeatures,

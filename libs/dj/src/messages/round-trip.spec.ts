@@ -9,6 +9,7 @@ const REPORT_KINDS = {
   loaded: 0,
   'load-failed': 0,
   'jump-landed': 0,
+  'grid-fitted': 0,
   captured: 0,
   picture: 0,
   registers: 0,

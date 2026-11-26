@@ -52,6 +52,16 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   alternating whole-frame lengths, and `shrinkLanding`, `foldIntoLoop` and the two phase helpers take
   an optional lap phase and count laps through core's `lapLength`, `lapSpan` and `lapsWithin`,
   imported from `@sidablist/core`; without one they count whole laps of `endFrame - startFrame`.
+- `beats.ts` and `loop-edits.ts` — `grid-lines.ts`'s neighbours: frame arithmetic with no notion of what
+  a person wants, reusing the ladder and core's lap rule. `beats.ts` holds the beat lookups over a
+  `HeldGrid` (a scan's grid, which holds over its span, or a bare tapped one, which holds from frame 0):
+  `inGridSpan`, `nearestBeat`, `onBeat`, `nextBeat`, `snapToBeat`, and `beatsPerMinute`. `loop-edits.ts`
+  holds the edits a host saves its loops with, each a `LoopEdit` that is the new bounds or a
+  `LoopEditRefusal` code and never a word: `resizeLoop` (halve or double along the ladder),
+  `setLoopLength`, `stepLoopLength` (a beat more or less), `moveLoop` (by beats, or to the next beat),
+  `shiftLoop` (a frame), and `loopLapPhase` (a loop's lap phase on the grid). Frames in and out are
+  resolved frames: a host that saves an edge in its own form converts before and after. An end need
+  not be a whole frame, and `isUsableLoopLength` from core decides which are too short to lap.
 - `tune-index.model.ts` — `TuneIndexRecord` and `TUNE_INDEX_FORMAT_VERSION`, the persisted shape
   and its compatibility gate.
 - `tune-index-readouts.ts`, `tune-length.ts`, `marker-moments.ts`, `format.ts` — display-facing
@@ -93,6 +103,11 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
 - **A record's voice control columns are the chip's, not the shadow's.** The shadow keeps the first
   byte of a doubled write; `controlBytes` holds the last, and `toRegisterRecord` swaps it in. Entry
   `i` is the chip after play call `i + 1`; off by one plays the tune a frame late.
+- **`beatsPerMinute` takes the play-call interval at tempo 1, and the tempo apart from it.** From a
+  deck's picture that interval is `rate.nominalIntervalUs / rate.exactCallsPerFrame`; a deck's
+  `update.intervalUs` is already paced at the tempo, so handing it over applies the tempo twice. A grid
+  from a scan holds over a span and answers nothing outside it (`inGridSpan`); whether to show a BPM
+  there is the host's call, not this package's.
 - **The dependency arrow is `analysis → core` only.** `core` must never import from this package.
   `indexTune` receiving the `sidHash` as a parameter, rather than reaching for a hashing routine
   itself, is what keeps that arrow one-directional — see Conventions above.
@@ -132,9 +147,15 @@ The public surface is `src/index.ts`; nothing under `__fixtures__` is exported f
   `Math.round` as `gridLine`, and the tracker and the shadow count laps by them; a helper here that
   counts laps another way compiles and passes the type-checker while a host's folded count or landing
   sits a frame off the lap the player is actually in, and a rung that drops below core's
-  `MIN_FRACTIONAL_LOOP_FRAMES` while not whole is a loop the player refuses. Change both and run this module's
-  `grid-lines.spec.ts`, and core's `timeline/active-loop.spec.ts` and `timeline/shadow-position.spec.ts`.
+  `MIN_FRACTIONAL_LOOP_FRAMES` while not whole is a loop the player refuses. A rung or lap change also
+  moves the answers of `loop-edits.ts` (`resizeLoop`, `setLoopLength`, `stepLoopLength`, `loopLapPhase`),
+  which read the ladder and `lapPhaseAt`. Change both and run this module's
+  `grid-lines.spec.ts` and `loop-edits.spec.ts`, and core's `timeline/active-loop.spec.ts` and `timeline/shadow-position.spec.ts`.
   Detail: [`libs/core/AGENTS.md`](../core/AGENTS.md).
+
+- **Changed `noteStarts` or `fitBeatGrid` (`beat-grid.ts`)?** `libs/dj`'s taps fit the deck's grid with
+  them, so a tapped grid moves with no compile error. Run `pnpm --filter @sidablist/dj test`. Detail:
+  [`libs/dj/AGENTS.md`](../dj/AGENTS.md).
 
 - **Changed `recordRegisters` or the grid-line helpers (`loopStartAtOrBefore`, `gridLine`, `lapPhaseAt`,
   `shrinkLanding`, `foldIntoLoop`, `lapPhaseOfFold`)?** `libs/dj`'s live looper and hand build on them,

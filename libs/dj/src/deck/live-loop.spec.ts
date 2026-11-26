@@ -154,7 +154,7 @@ async function push(fixture: Fixture, lengthFrames: number): Promise<void> {
 /** A deck with `UNDER` running, so a live loop can be pushed over it. */
 async function overLoop(options: Options = {}): Promise<Fixture> {
   const fixture = await playing(options);
-  await send(fixture.rig, fixture.deck, { kind: 'key', deck: 'a', target: UNDER });
+  await send(fixture.rig, fixture.deck, { kind: 'hot-cue', deck: 'a', target: UNDER });
   fixture.rig.advance(200);
   expect(pictureOf(fixture.rig, fixture.deck).loop).toMatchObject({ startFrame: 100 });
   return fixture;
@@ -346,7 +346,7 @@ describe('ending a live loop with none underneath', () => {
     const { rig, deck, seen } = await playing({ slip: true });
     await push({ rig, deck, seen }, 20);
     expect(pictureOf(rig, deck).slip).toEqual({ on: true, departed: true });
-    await send(rig, deck, { kind: 'key', deck: 'a', target: QUEUED });
+    await send(rig, deck, { kind: 'hot-cue', deck: 'a', target: QUEUED });
     expect(pictureOf(rig, deck).queued).toEqual(QUEUED);
     seen.order.length = 0;
 
@@ -373,7 +373,7 @@ describe('ending a live loop over a loop', () => {
     await rig.settle();
     rig.send({ kind: 'slip', deck: 'a', on: true });
     rig.advance(300);
-    for (const id of ['a', 'c']) rig.send({ kind: 'key', deck: id, target: UNDER });
+    for (const id of ['a', 'c']) rig.send({ kind: 'hot-cue', deck: id, target: UNDER });
     await rig.microtasks();
     rig.advance(200);
     return rig;
@@ -458,7 +458,7 @@ describe('ending a live loop over a loop', () => {
   it('folds a length that is not whole carrying the lap phase of the lap it lands in', async () => {
     const fractional: JumpTarget = { startFrame: 100, endFrame: 117.4 };
     const { rig, deck, seen } = await playing();
-    await send(rig, deck, { kind: 'key', deck: 'a', target: fractional });
+    await send(rig, deck, { kind: 'hot-cue', deck: 'a', target: fractional });
     rig.advance(200);
     await send(rig, deck, sizeOf(60));
     await send(rig, deck, LIVE);
@@ -481,7 +481,7 @@ describe('ending a live loop over a loop', () => {
       const { rig, deck, seen } = await overLoop({ rig: { scan: 'held' } });
       await send(rig, deck, sizeOf(60));
       await send(rig, deck, LIVE);
-      await send(rig, deck, { kind: 'key', deck: 'a', target: QUEUED });
+      await send(rig, deck, { kind: 'hot-cue', deck: 'a', target: QUEUED });
       rig.advance(100 + waitMs);
       seen.lands.length = 0;
       const loopsBefore = seen.loops.length;
@@ -522,10 +522,10 @@ describe('ending a live loop over a loop', () => {
 });
 
 describe('a loop that lands over a live loop', () => {
-  it('queued by a key lands at the live loop’s end of pass and ends it', async () => {
+  it('queued by a hot cue lands at the live loop’s end of pass and ends it', async () => {
     const { rig, deck, seen } = await overLoop();
     await push({ rig, deck, seen }, 20);
-    await send(rig, deck, { kind: 'key', deck: 'a', target: QUEUED });
+    await send(rig, deck, { kind: 'hot-cue', deck: 'a', target: QUEUED });
     expect(pictureOf(rig, deck)).toMatchObject({ queued: QUEUED, liveLoop: { overLoop: true } });
     rig.advance(400);
     const picture = pictureOf(rig, deck);
@@ -683,7 +683,7 @@ describe('the loop underneath a live loop', () => {
 
   it('keeps a loop queued before it, and puts the queue back when the live loop ends', async () => {
     const { rig, deck, seen } = await overLoop();
-    await send(rig, deck, { kind: 'key', deck: 'a', target: QUEUED });
+    await send(rig, deck, { kind: 'hot-cue', deck: 'a', target: QUEUED });
     await push({ rig, deck, seen }, 60);
     expect(pictureOf(rig, deck).queued).toEqual(QUEUED);
     await send(rig, deck, END);

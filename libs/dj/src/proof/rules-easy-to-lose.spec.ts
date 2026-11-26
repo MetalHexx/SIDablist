@@ -1,7 +1,11 @@
 import { loopStartAtOrBefore } from '@sidablist/analysis';
+import { readSidField } from '@sidablist/core';
+import type { SidField } from '@sidablist/core';
 import { describe, expect, it } from 'vitest';
 import type { DeckCommand, Grid, JumpTarget } from '../messages/commands.js';
+import { SETTING, SETTING_NUMBERS, describeSetting } from '../messages/setting-table.js';
 import { Rig, multiSongTune } from '../testing/harness.js';
+import { COPY_TABLE, GATE_RISES, STEADY, psid } from '../testing/steady-tune.js';
 
 /**
  * Behaviours a DJ would notice missing, each in its own spec and written to fail when the rule is
@@ -59,13 +63,26 @@ describe('presses and releases', () => {
     { kind: 'nudge', deck: 'a', amount: 0 },
     { kind: 'hand-lift', deck: 'a', atMs: 0, gripSeconds: 0.25 },
     { kind: 'stop-loop', deck: 'a' },
+    { kind: 'voice-hold', deck: 'a', voice: 0, held: false },
+    { kind: 'tap-end', deck: 'a' },
+    // A host's panic is always accepted.
+    {
+      kind: 'settings',
+      deck: 'a',
+      settingsIn: 'main',
+      changes: [{ setting: SETTING.KEY, value: 1 }],
+    },
   ];
   const PRESSES: DeckCommand[] = [
     { kind: 'play', deck: 'a' },
     { kind: 'speed', deck: 'a', value: 1.2 },
     { kind: 'nudge', deck: 'a', amount: 0.05 },
-    { kind: 'key', deck: 'a', target: LOOP_A },
+    { kind: 'hot-cue', deck: 'a', target: LOOP_A },
     { kind: 'hand-touch', deck: 'a', atMs: 0 },
+    { kind: 'setting', deck: 'a', setting: SETTING.KEY, value: 2 },
+    { kind: 'flip-lock', deck: 'a', setting: SETTING.VOICE_1_GATE_HOLD },
+    { kind: 'voice-hold', deck: 'a', voice: 0, held: true },
+    { kind: 'tap', deck: 'a', atMs: 0 },
   ];
 
   it('land only on a settled deck, while a release goes through on an empty, a loading and a failed one', async () => {
@@ -136,7 +153,7 @@ describe('a load', () => {
     // The hand goes down before the loop starts, so both are in play at the load.
     await send(rig, { kind: 'hand-touch', deck: 'a', atMs: rig.time.ms });
     rig.advance(60);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
     expect(rig.picture()).toMatchObject({ hand: 'down', loop: { startFrame: 500, endFrame: 520 } });
 
@@ -148,7 +165,7 @@ describe('a load', () => {
     const waiting = rig.picture();
     expect(waiting.transport).toBe('loading');
     expect(waiting.tempo).toEqual({ speed: 1, nudge: 0, jump: 0, effective: 1 });
-    expect(waiting.settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(waiting.settings.main).toEqual([]);
     expect(waiting.readyFrames).toEqual([]);
     expect(waiting.loop).toBeNull();
     expect(waiting.hand).toBe('up');
@@ -160,7 +177,7 @@ describe('a load', () => {
     expect(failed.tempo.effective).toBe(1);
     expect(failed.loop).toBeNull();
     expect(failed.hand).toBe('up');
-    expect(failed.settings.main.every((setting) => setting.value === 0)).toBe(true);
+    expect(failed.settings.main).toEqual([]);
     rig.dispose();
   });
 });
@@ -195,11 +212,11 @@ describe('a subtune change on a paused deck', () => {
 describe('a cue fired in a loop', () => {
   it('waits for the end of the pass, which plays on until then', async () => {
     const rig = await playing([500, 1500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: CUE });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: CUE });
     rig.advance(600);
-    const pressed = rig.landed('key')[1];
+    const pressed = rig.landed('hot-cue')[1];
 
     expect(pressed).toMatchObject({ resolved: 'queue' });
     const landing = rig.ofKind('jump-landed')[0];
@@ -216,7 +233,7 @@ describe('a cue fired in a loop', () => {
 describe('an edit to a running loop', () => {
   it('waits for the end of the pass, while WRAP changes at once and no end lets it go at once', async () => {
     const rig = await playing([500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
 
     await send(rig, { kind: 'loop-bounds', deck: 'a', startFrame: 500, endFrame: 510 });
@@ -327,7 +344,7 @@ describe('the live looper', () => {
     await rig.settle();
     rig.send({ kind: 'slip', deck: 'a', on: true });
     rig.advance(300);
-    for (const id of ['a', 'c']) rig.send({ kind: 'key', deck: id, target: UNDER });
+    for (const id of ['a', 'c']) rig.send({ kind: 'hot-cue', deck: id, target: UNDER });
     await rig.microtasks();
     rig.advance(200);
     rig.send({ kind: 'live-loop-size', deck: 'a', lengthFrames: 60 });
@@ -362,16 +379,16 @@ describe('the live looper', () => {
 describe('what the package does without the engine’s help', () => {
   it('tells a landing by `jump-landed`, and says nothing of a queue that goes without landing', async () => {
     const rig = await playing([500, 1000, 1500]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_B });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_B });
     expect(rig.picture().queued).toEqual(LOOP_B);
     await send(rig, { kind: 'cancel-queued', deck: 'a' });
     rig.advance(300);
     expect(rig.picture().queued).toBeNull();
     expect(rig.ofKind('jump-landed')).toEqual([]);
 
-    await send(rig, { kind: 'key', deck: 'a', target: CUE });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: CUE });
     rig.advance(600);
     const landed = rig.ofKind('jump-landed');
     expect(landed).toHaveLength(1);
@@ -382,11 +399,11 @@ describe('what the package does without the engine’s help', () => {
 
   it('keeps a queued jump and a pending edit together, and plays the jump at the wrap', async () => {
     const rig = await playing([500, 1000]);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_A });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_A });
     rig.advance(100);
     await send(rig, { kind: 'loop-bounds', deck: 'a', startFrame: 500, endFrame: 510 });
     rig.advance(20);
-    await send(rig, { kind: 'key', deck: 'a', target: LOOP_B });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: LOOP_B });
     expect(rig.picture().queued).toEqual(LOOP_B);
     expect(rig.picture().pendingBounds).toEqual({ startFrame: 500, endFrame: 510 });
 
@@ -407,9 +424,9 @@ describe('what the package does without the engine’s help', () => {
     const rig = await playing([200, 300], { tune: 'insid3-out' });
     // The main settings mute voice 3; the loop's own mute voice 2 instead.
     await send(rig, { kind: 'setting', deck: 'a', setting: 3, value: 1 });
-    await send(rig, { kind: 'key', deck: 'a', target: OWN });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
     rig.advance(100);
-    await send(rig, { kind: 'key', deck: 'a', target: SHARED });
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: SHARED });
     rig.advance(600);
 
     const landing = rig.ofKind('jump-landed').at(-1);
@@ -419,11 +436,375 @@ describe('what the package does without the engine’s help', () => {
     expect(wrote(rig, frame, VOICE_2_CONTROL)).toBe(SOUNDING);
     expect(wrote(rig, frame, VOICE_3_CONTROL)).toBeNull();
     expect(rig.picture()).toMatchObject({ settingsInPlay: 'main' });
-    expect(rig.picture().settings.main).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 0 },
-      { setting: 3, value: 1 },
-    ]);
+    const main = rig.picture().settings.main;
+    expect(main.find((s) => s.setting === 3)).toEqual({ setting: 3, value: 1 });
+    expect(main.find((s) => s.setting === 2)).toBeUndefined();
     rig.dispose();
+  });
+});
+
+const CONTROL = [4, 11, 18];
+const CUTOFF: SidField = { name: 'cutoff' };
+const frequency = (voice: number): SidField => ({ name: 'frequency', voice });
+
+/** A deck on the steady tune, loaded with `load` and playing. */
+async function shaped(load: Partial<Extract<DeckCommand, { kind: 'load' }>> = {}): Promise<Rig> {
+  const rig = new Rig();
+  rig.addTune('steady', psid(COPY_TABLE, STEADY));
+  rig.addDeck('a');
+  await rig.load('a', 'steady', { ends: 'playing', ...load });
+  rig.advance(200);
+  return rig;
+}
+
+/** The chip's registers as the tune wrote them and as they are sent, at the render frontier. */
+function chip(rig: Rig): { written: Uint8Array; sent: Uint8Array } {
+  rig.send({ kind: 'registers', deck: 'a' });
+  const answers = rig.ofKind('registers');
+  return answers[answers.length - 1];
+}
+
+describe('a load that is overtaken', () => {
+  it('leaves nothing of the shaping behind: offsets, holds, pitch, mutes and a voice hold are home', async () => {
+    const rig = await shaped({
+      settings: [
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+        { setting: SETTING.VOICE_2_FREQUENCY_HOLD, value: 900 },
+        { setting: SETTING.KEY, value: 5 },
+        { setting: SETTING.VOICE_3_MUTE, value: 1 },
+      ],
+    });
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    const before = chip(rig);
+    expect(Array.from(before.sent)).not.toEqual(Array.from(before.written));
+    expect(before.sent[CONTROL[0]]).toBe(0);
+
+    rig.addTune('steady-b', psid(COPY_TABLE, STEADY));
+    rig.addTune('steady-c', psid(COPY_TABLE, STEADY));
+    const slow = rig.holdFetch('steady-b');
+    rig.send({ kind: 'load', deck: 'a', tune: 'steady-b', subtune: 1, ends: 'playing' });
+    await rig.microtasks();
+    // Reset before the first wait: the picture and the engine are home while the fetch is out.
+    expect(rig.picture().settings.main).toEqual([]);
+    const waiting = chip(rig);
+    expect(Array.from(waiting.sent)).toEqual(Array.from(waiting.written));
+
+    rig.send({ kind: 'load', deck: 'a', tune: 'steady-c', subtune: 1, ends: 'playing' });
+    await rig.settle();
+    slow.release();
+    await rig.settle();
+    rig.advance(200);
+
+    const now = chip(rig);
+    expect(rig.picture().tune?.tune).toBe('steady-c');
+    expect(rig.picture().settings.main).toEqual([]);
+    expect(Array.from(now.sent)).toEqual(Array.from(now.written));
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    rig.dispose();
+  });
+});
+
+describe('a voice hold', () => {
+  const OWN: JumpTarget = {
+    startFrame: 100,
+    endFrame: 130,
+    settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+  };
+
+  it('is never carried: it outlives a loop’s own settings and a let-go untouched, and a load releases it', async () => {
+    const rig = await shaped({ settings: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] });
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
+    rig.advance(100);
+    // The loop's list swapped the mutes under the hold: voice 2 muted, voice 3 sounding, voice 1 still held.
+    let now = chip(rig);
+    expect(rig.picture().settingsInPlay).toBe('loop');
+    expect(now.sent[CONTROL[0]]).toBe(0);
+    expect(now.sent[CONTROL[1]]).toBe(0);
+    expect(now.sent[CONTROL[2]]).toBe(0x41);
+    expect(rig.picture().settings.loop).toEqual([{ setting: SETTING.VOICE_2_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: false });
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    await send(rig, { kind: 'let-go', deck: 'a' });
+    rig.advance(100);
+    now = chip(rig);
+    expect(rig.picture().settingsInPlay).toBe('main');
+    expect(now.sent[CONTROL[0]]).toBe(0);
+    expect(now.sent[CONTROL[1]]).toBe(0x41);
+    expect(now.sent[CONTROL[2]]).toBe(0);
+
+    // Let go, the voice sounds as its list says: the hold left no mute in either list.
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: false });
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    expect(rig.picture().settings.main).toEqual([{ setting: SETTING.VOICE_3_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'voice-hold', deck: 'a', voice: 0, held: true });
+    rig.advance(100);
+    expect(chip(rig).sent[CONTROL[0]]).toBe(0);
+    await rig.load('a', 'steady', { ends: 'playing' });
+    rig.advance(200);
+    now = chip(rig);
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    expect(rig.picture().settings.main).toEqual([]);
+    rig.dispose();
+  });
+});
+
+describe('a settings list that names the list that has just stopped playing', () => {
+  it('is dropped, and not applied to the one that took its place', async () => {
+    const OWN: JumpTarget = {
+      startFrame: 100,
+      endFrame: 130,
+      settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+    };
+    const rig = await shaped();
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+
+    // The loop's own list is in play from the frame before the list is sent, as seen by a host a frame behind.
+    const updates = rig.ofKind('update');
+    const at = updates[updates.length - 1].streamFrame + 1 - (rig.sinks.get('a')?.holding ?? 0) + 2;
+    rig.send({ kind: 'hot-cue', deck: 'a', target: OWN, when: { at: 'frame', frame: at } });
+    rig.send({
+      kind: 'settings',
+      deck: 'a',
+      settingsIn: 'main',
+      changes: [{ setting: SETTING.CUTOFF_OFFSET, value: 100 }],
+      when: { at: 'frame', frame: at + 1 },
+    });
+    await rig.microtasks();
+    rig.advance(100);
+
+    const [late] = rig.landed('settings');
+    expect(late).toMatchObject({ dropped: true, frame: at + 1 });
+    expect(rig.picture()).toMatchObject({
+      settingsInPlay: 'loop',
+      settings: { main: [], loop: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }] },
+    });
+    const now = chip(rig);
+    expect(readSidField(now.sent, CUTOFF)).toBe(readSidField(now.written, CUTOFF));
+    rig.dispose();
+  });
+});
+
+describe('a lock flip', () => {
+  /** A deck on the tune whose gate rises in a known play call, paused with a flip waiting at stream frame `at`. */
+  async function flippedAt(at: number): Promise<Rig> {
+    const rig = new Rig();
+    rig.addTune('rises', psid(GATE_RISES));
+    rig.addDeck('a');
+    await rig.load('a', 'rises', { ends: 'paused' });
+    rig.send({
+      kind: 'flip-lock',
+      deck: 'a',
+      setting: SETTING.VOICE_1_GATE_HOLD,
+      when: { at: 'frame', frame: at },
+    });
+    await rig.microtasks();
+    rig.send({ kind: 'play', deck: 'a' });
+    await rig.settle();
+    rig.advance(1500);
+    return rig;
+  }
+
+  const gate = (rig: Rig, frame: number): number => (wrote(rig, frame, 4) ?? -1) & 1;
+
+  it('reads the tune as it stands on its landing frame: the frame before it, not the last one a host saw', async () => {
+    const probe = new Rig();
+    probe.addTune('rises', psid(GATE_RISES));
+    probe.addDeck('a');
+    await probe.load('a', 'rises', { ends: 'playing' });
+    probe.advance(1500);
+    const rise = probe
+      .frames()
+      .findIndex((frame) => (frame.values[frame.registers.indexOf(4)] & 1) === 1);
+    probe.dispose();
+    expect(rise).toBeGreaterThan(2);
+
+    // The tune writes the new gate in frame `rise`. A flip landing on the next frame locks to the opposite of it.
+    const after = await flippedAt(rise + 1);
+    expect(after.landed('flip-lock')[0].frame).toBe(rise + 1);
+    expect(after.picture().settings.main).toEqual([
+      { setting: SETTING.VOICE_1_GATE_HOLD, value: 0 },
+    ]);
+    expect(gate(after, rise)).toBe(1);
+    expect(gate(after, rise + 1)).toBe(0);
+    after.dispose();
+
+    // Landing on `rise` itself, it reads the frame before, which still wrote the old gate.
+    const on = await flippedAt(rise);
+    expect(on.picture().settings.main).toEqual([{ setting: SETTING.VOICE_1_GATE_HOLD, value: 1 }]);
+    expect(gate(on, rise - 1)).toBe(0);
+    expect(gate(on, rise)).toBe(1);
+    on.dispose();
+  });
+});
+
+describe('a panic', () => {
+  it('is one settings list at home: the panel goes home on one frame, and mutes and speed stay', async () => {
+    const rig = await shaped({
+      speed: 1.3,
+      settings: [
+        { setting: SETTING.VOICE_2_MUTE, value: 1 },
+        { setting: SETTING.KEY, value: 5 },
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+        { setting: SETTING.VOICE_1_WAVEFORM_HOLD, value: 2 },
+        { setting: SETTING.VOICE_3_COARSE, value: -7 },
+        { setting: SETTING.VOICE_2_FINE, value: 40 },
+      ],
+    });
+    const shapedChip = chip(rig);
+    expect(readSidField(shapedChip.sent, frequency(0))).not.toBe(
+      readSidField(shapedChip.written, frequency(0)),
+    );
+
+    // What panic puts back is the host's list: every setting but the mutes, at its home.
+    const changes = SETTING_NUMBERS.flatMap((setting) => {
+      const info = describeSetting(setting);
+      return info === null || info.kind === 'mute' ? [] : [{ setting, value: info.home }];
+    });
+    await send(rig, { kind: 'settings', deck: 'a', settingsIn: 'main', changes });
+    rig.advance(100);
+
+    const [panic] = rig.landed('settings');
+    expect(panic.settingsIn).toBe('main');
+    const now = chip(rig);
+    const homeSent = Array.from(now.written);
+    homeSent[CONTROL[1]] = 0;
+    expect(Array.from(now.sent)).toEqual(homeSent);
+    expect(rig.picture().settings.main).toEqual([{ setting: SETTING.VOICE_2_MUTE, value: 1 }]);
+    expect(rig.picture().tempo.speed).toBe(1.3);
+    // One frame: everything but the mutes is home from the landing frame on, and was shaped the frame before.
+    for (const register of [0, 1, 22]) {
+      expect(wrote(rig, panic.frame, register)).toBe(STEADY[register]);
+      expect(wrote(rig, panic.frame - 1, register)).not.toBe(STEADY[register]);
+    }
+    rig.dispose();
+  });
+});
+
+describe('an edit while a loop’s own settings play', () => {
+  it('goes to the loop’s list and not the main one, which comes back whole on the let-go', async () => {
+    const OWN: JumpTarget = {
+      startFrame: 100,
+      endFrame: 130,
+      settings: [{ setting: SETTING.VOICE_2_MUTE, value: 1 }],
+    };
+    const rig = await shaped({ settings: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] });
+    rig.send({ kind: 'targets', deck: 'a', frames: [100] });
+    await rig.settle();
+    rig.advance(100);
+    await send(rig, { kind: 'hot-cue', deck: 'a', target: OWN });
+    rig.advance(100);
+    expect(rig.picture().settingsInPlay).toBe('loop');
+
+    await send(rig, { kind: 'setting', deck: 'a', setting: SETTING.CUTOFF_OFFSET, value: 100 });
+    await send(rig, { kind: 'flip-lock', deck: 'a', setting: SETTING.VOICE_1_GATE_HOLD });
+    rig.advance(100);
+
+    expect(rig.landed('setting')[0]).toMatchObject({ settingsIn: 'loop' });
+    expect(rig.landed('flip-lock')[0]).toMatchObject({ settingsIn: 'loop' });
+    const picture = rig.picture();
+    expect(picture.settings.loop).toEqual(
+      expect.arrayContaining([
+        { setting: SETTING.VOICE_2_MUTE, value: 1 },
+        { setting: SETTING.CUTOFF_OFFSET, value: 100 },
+      ]),
+    );
+    expect((picture.settings.loop ?? []).map((entry) => entry.setting)).toContain(
+      SETTING.VOICE_1_GATE_HOLD,
+    );
+    expect(picture.settings.main).toEqual([{ setting: SETTING.VOICE_3_MUTE, value: 1 }]);
+
+    await send(rig, { kind: 'let-go', deck: 'a' });
+    rig.advance(100);
+    const now = chip(rig);
+    expect(rig.picture()).toMatchObject({
+      settingsInPlay: 'main',
+      settings: { main: [{ setting: SETTING.VOICE_3_MUTE, value: 1 }] },
+    });
+    expect(readSidField(now.sent, CUTOFF)).toBe(readSidField(now.written, CUTOFF));
+    expect(now.sent[CONTROL[0]]).toBe(0x41);
+    rig.dispose();
+  });
+});
+
+describe('a tap', () => {
+  /**
+   * A deck on Insid3-out whose first tap lands while frames are held, then three taps on later note starts
+   * behind the frontier. `firstMark` gives the host time the first tap is sent with.
+   */
+  async function tapRun(
+    firstMark: (
+      due: ReadonlyMap<number, { dueAtMs: number; position: number }>,
+      rig: Rig,
+      before: number,
+    ) => number,
+  ): Promise<{ grid: Grid | null; position: number; atMs: number; heldDueAtMs: number }> {
+    const rig = new Rig();
+    rig.addDeck('a', { lookaheadMs: 60 });
+    await rig.load('a', 'insid3-out', { ends: 'playing' });
+    rig.advance(700);
+    const frames = (): Map<number, { dueAtMs: number; position: number }> =>
+      new Map(
+        rig
+          .ofKind('update', 'a')
+          .map((u) => [u.streamFrame, { dueAtMs: u.dueAtMs, position: u.position }]),
+      );
+    const heldFrom = (): number => {
+      const updates = rig.ofKind('update', 'a');
+      return updates[updates.length - 1].streamFrame + 1 - (rig.picture().output?.heldFrames ?? 0);
+    };
+    // Wait for a moment when the frame before the first held one falls 2 frames short of a note start (position 10 of 12),
+    // so marking a held frame instead shows in the grid.
+    for (let guard = 0; guard < 400; guard++) {
+      if ((frames().get(heldFrom() - 1)?.position ?? 0) % 12 === 10) break;
+      rig.advance(5);
+    }
+    const before = frames().get(heldFrom() - 1);
+    expect(before).toBeDefined();
+    const position = before?.position ?? 0;
+    const atMs = firstMark(frames(), rig, position);
+    const heldDueAtMs = frames().get(heldFrom())?.dueAtMs ?? Infinity;
+
+    await send(rig, { kind: 'tap', deck: 'a', atMs });
+    rig.advance(400);
+    for (const ahead of [7, 19, 31]) {
+      const frame = [...frames().values()].find((f) => f.position === position + ahead);
+      expect(frame, `a frame at position ${position + ahead}`).toBeDefined();
+      await send(rig, { kind: 'tap', deck: 'a', atMs: frame?.dueAtMs ?? 0 });
+      rig.advance(20);
+    }
+    rig.advance(100);
+    const grid = rig.picture().grid;
+    rig.dispose();
+    return { grid, position, atMs, heldDueAtMs };
+  }
+
+  it('marks the playhead at the moment it happened, not at the render frontier', async () => {
+    // A tap sent with a time that falls on a held frame marks the frame before the one it lands on ...
+    const held = await tapRun((_frames, rig) => rig.time.ms + 45);
+    expect(held.heldDueAtMs).toBeLessThanOrEqual(held.atMs);
+    // ... which is what a tap naming that earlier frame's own due time marks.
+    const named = await tapRun((frames, _rig, position) => {
+      const frame = [...frames.values()].find((f) => f.position === position);
+      return frame?.dueAtMs ?? 0;
+    });
+    expect(named.grid).not.toBeNull();
+    expect(held.position).toBe(named.position);
+    expect(held.grid).toEqual(named.grid);
   });
 });

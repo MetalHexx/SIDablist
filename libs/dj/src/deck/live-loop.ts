@@ -27,7 +27,7 @@ type RunningLoop = Exclude<ActiveLoop, null>;
 
 /** What a deck asks of the part of it that holds the live loop. */
 export interface LiveLoopHost {
-  /** The grid the load carried; null with none. */
+  /** The grid the deck plays on: the load's, or the latest a run of taps fitted; null with none. */
   grid(): Grid | null;
   /** Makes the restore ring again: a state is only good for the crossing lines it was saved under. */
   rebuildRing(): void;
@@ -77,8 +77,9 @@ function sameLines(a: readonly CrossingLines[], b: readonly CrossingLines[]): bo
 }
 
 /**
- * The live looper on the grid a load carries: a loop of the kept size pushed over whatever plays,
- * resized on the grid, and ended back into the loop running underneath.
+ * The live looper on the grid the deck plays on (the load's, or the latest a run of taps fitted): a
+ * loop of the kept size pushed over whatever plays, resized on the grid, and ended back into the
+ * loop running underneath.
  *
  * The engine keeps the images of the last grid crossings (`declareCaptures`), so a push starts from
  * an image taken on a line and replays nothing. A push starts on the last line at or behind the

@@ -6,6 +6,7 @@ export const KIND_LOADED = 1;
 export const KIND_LOAD_FAILED = 2;
 export const KIND_JUMP_LANDED = 3;
 export const KIND_CAPTURED = 4;
+export const KIND_GRID_FITTED = 5;
 
 /** An event waiting to go out, as plain fields: the report object is built when it is sent. */
 export interface QueuedEvent {

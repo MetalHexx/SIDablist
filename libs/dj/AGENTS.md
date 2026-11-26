@@ -8,18 +8,22 @@ supplies everything environmental.
 ## How it works
 
 - `src/messages/` — the message contract: `commands.ts` (what a host sends), `reports.ts` (what a deck
-  tells the host), `validate.ts` (`validateInbound`, the guard for untrusted input).
+  tells the host), `validate.ts` (`validateInbound`, the guard for untrusted input) and `setting-table.ts` (`SETTING`, the
+  fixed numbered settings, and `describeSetting`: each one's kind, chip field, voice and range; a number
+  is never reused, and the validator and the deck both read the table).
 - `src/plugs.ts` — the plugs a host supplies (`DjPlugs`, `Wake`, `HeavyWork`, `DeckOutput`) and the
   `Dj` surface.
 - `src/dj.ts` — `createDj`: decks kept by id, validation and the refusal log, and the one wake that
   follows whichever decks are rendering.
-- `src/deck/` — one deck. `deck.ts` is the deck: the command log, the flush and rewind, loading, events
-  and the picture. Around it: `driven-clock.ts` (the engine's `FrameClock`, ticked only by the deck),
+- `src/deck/` — one deck. `deck.ts` is the deck: the command log, the flush and rewind, loading, taps,
+  events and the picture. Around it: `driven-clock.ts` (the engine's `FrameClock`, ticked only by the deck),
   `sink-tap.ts` (the engine's `SidSink`, mapping the output's counts onto stream frames),
   `restore-ring.ts` (the restore points), `deck-state.ts` (`DeckState`, the package's own saved state),
-  `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` and
-  `settings.ts` (the tempo layers, the main settings and the loop's own), `loops.ts` (`DeckLoops`:
-  jumps, the key press, letting go, edits to the running loop and the loop's own settings),
+  `command-log.ts` and `event-queue.ts` (preallocated, outside the saved state), `tempo.ts` (the
+  tempo layers) and `settings.ts` (the settings lists, applying one setting to the engine and what a
+  jump carries; the table itself lives in `messages/setting-table.ts`), `loops.ts` (`DeckLoops`:
+  jumps, the hot cue press, letting go, edits to the running loop, and the settings in play, with a
+  loop's own swapped in on its landing frame and out on its let-go),
   `hand.ts` (`DeckHand`: the touch, the moves and the lift as varispeed, and the throw that slows to
   the deck's own speed), `slip.ts` (`DeckSlip`: the departures, the second count and the landing
   on it; `loops.ts` and `hand.ts` tell it where a departure begins and ends) and `live-loop.ts`
@@ -42,8 +46,9 @@ supplies everything environmental.
   `src/__fixtures__/` holds the tunes cleared for redistribution (`still-time`, `insid3-out`); no
   other HVSC tune goes in the repo.
 - `src/proof/` — specs only, across the whole package: `equivalence.spec.ts` (a deck against a bare
-  engine, and two decks told the same commands), `determinism.spec.ts` (a run replayed from its
-  `landed` events), `asid-sink.spec.ts` (the real ASID sink over a fake port) and
+  engine, with and without a settings list off home, and two decks told the same commands),
+  `determinism.spec.ts` (a run replayed from its `landed` events, taps and their `grid-fitted` events
+  included), `asid-sink.spec.ts` (the real ASID sink over a fake port) and
   `rules-easy-to-lose.spec.ts` (the behaviours a rewrite drops quietly).
 
 ## Conventions
@@ -109,7 +114,7 @@ supplies everything environmental.
   prepared, so a re-render would find a waiting target ready earlier than it first was. A waiting
   seek's or jump's landing frame is fixed once, when it is first seen ready, and a re-render lands
   it there.
-- **A key press is resolved at its landing frame.** A `key` is a start, a queue, a cancel or a
+- **A hot cue is resolved at its landing frame.** A `hot-cue` is a start, a queue, a cancel or a
   let-go by what the deck holds on the frame it lands on, never by what it held when it was sent, so
   a replay at that frame (`fixed` is always `{ at: 'frame' }` for it) resolves the same way. A
   `jump` sent for `pass-end` is the exception: it lands on its `from` frame and the engine's queue
@@ -125,7 +130,7 @@ supplies everything environmental.
   A jump now that replaces the loop drops the queue on purpose; a stab (`seek` alone) and a change of
   wrap (`setActiveLoop` with the same bounds, then `queueJump` and `changeLoopAt` again) keep them.
   A new caller that sets the loop and forgets to re-queue loses a queued jump with no error.
-- **A frame past the tune is refused at the deck, not the validator.** A seek, a `jump` or `key`
+- **A frame past the tune is refused at the deck, not the validator.** A seek, a `jump` or `hot-cue`
   target's start and a `loop-bounds` start above the bound are refused with a reason
   (`Deck.refusal`); a `targets` list drops such frames with a warning (`Deck.receive`). The bound is
   the greatest of the engine's jump ceiling (a fixed 300 s of play calls, `JUMP_CEILING_SECONDS` in
@@ -170,6 +175,33 @@ supplies everything environmental.
   was saved under, so declaring new ones makes the restore ring again, between ticks and after the
   command's own engine calls (the ring is seeded with the state the command leaves). Lines already
   declared change nothing.
+- **The grid and the tap run are saved state.** `DeckState.grid` (by reference: a load's grid and a fit
+  are immutable) and the run of taps (the positions its taps marked, and how many) are in every restore
+  point and both copy methods. The grid is read from there by the live looper, the gate and the picture;
+  a copy kept anywhere else restores almost exactly. `tap-end` and a load empty the run.
+- **A tap's mark is a first answer; its fit is not.** The mark is kept on the log entry and reused when
+  a rewind applies the tap again: the history behind it (each delivered frame's due time and position,
+  by `frame % 512`, outside `DeckState`) is overwritten by re-renders. The fit is made again on every
+  application, because it is a function of the whole run in force and a replay's run can differ: a
+  tap landing ahead of one already applied adds a mark before it, and a cached fit would set the grid
+  from the shorter run. A fit that changes the grid sets it and declares the lines after the tap's own
+  state changes, so the restore point the new ring is seeded with holds them; every fit, changed or
+  not, queues its `grid-fitted` beside the `landed`, which a rewind discards and makes again once.
+- **A tap's mark searches only the frames before its own landing frame.** Never the held frames a
+  flush is about to re-render: searching from the newest render would mark a frame the replay, which
+  sees only the frames before the landing frame, never sees, and a replay at the fixed frame would
+  mark another position.
+- **A tap's mark replays exactly only where due times do.** The mark is the position of the latest
+  frame due at or before the tap's host time, so a replay agrees across stretches with no resume
+  (`play` after a pause) and no catch-up skip, the same limit as every other due time.
+- **Each distinct fitted grid rebuilds the restore ring.** A new ring is a whole engine state per slot,
+  allocated between ticks inside the flush, never on the frame path, so memory in proportion to its
+  slots and images is made again for each grid; taps that keep fitting the same grid rebuild nothing.
+  What a rebuild costs in time on a heavy tune is measured on the bench.
+- **Note starts are derived from the record, and the gate reads the engine's record.** They are made
+  once when the register record's own log entry applies and kept by record identity outside
+  `DeckState`, because they are a pure function of a record the engine's saved state holds. A tap
+  before the engine holds a record, or on a deck that is not playing, does nothing and says so once.
 - **A live loop's start is found one frame past the playhead.** A wrap falls due a frame before the
   end, so a line at the playhead's own frame could never be met by a loop ending there; the search
   is for the last line at or behind `floor(position) + 1`. A start behind the playhead with no image
@@ -211,6 +243,39 @@ supplies everything environmental.
   lap phase and length it is worked out from, which the loop specs' shorter pass allows for. A
   landing the engine makes is read after the tick from `tune.handOffs` with number compares and
   builds nothing but the picture and the event it reports.
+- **A setting's number is fixed forever.** A new setting takes the next number; an old one is never
+  reused or renumbered, because a recording, a stored list and `validateInbound` all mean the number.
+- **Both settings lists are saved state.** `DeckState.mainSettings` and `loopSettings`, each the value
+  of every setting by number, are in every restore point and both copy methods; a setting kept
+  anywhere else restores almost exactly.
+- **A loop's own list and the main list are each complete: unnamed means home.** A jump into a target
+  with settings of its own carries every field the package owns (pitch and mutes for three voices, an
+  offset for every offset setting, a hold for every hold), built when the command lands; a jump with
+  none, landing while a loop's own play, carries the main list back whole. A jump never goes through
+  `releaseSettings`, which the end of a loop does (let-go, stop-loop, a seek, a stop, a load), so the
+  main list is applied once.
+- **The engine carries holds and offsets across a load, so a load writes the whole list.** At its
+  landing frame it puts both lists and the engine home, with a tune or without (a `settings` can land
+  on an empty deck), and at install it writes the main list over home, which also overwrites a
+  `settings` that landed while the load waited. Writing only what the load names leaves the last
+  tune's holds and offsets in force.
+- **`flip-lock` reads `written`, not `sent`.** A lock is the opposite of what the tune wrote in the
+  last frame rendered before its landing frame, before any shaping; `sent` is the package's own
+  shaped output and would lock against itself.
+- **A command is a press unless `Deck.refusal` lets it through.** A press is refused on a deck that is
+  empty, loading or failed. Four kinds of command pass with no phase check: `load`; the releases
+  (`voice-hold` with `held: false`, `tap-end`, `nudge` 0, `hand-lift`, `let-go`, `stop-loop`,
+  `cancel-queued`); `settings`, which is a host's panic; and the moves and switches that need no tune
+  (`repeat`, `targets`, `slip`, `hand-move`). Anything else is a press. A new release that is not
+  listed there is refused exactly when a host's key-up needs it, and a hold stays down; a new
+  command that needs no tune joins the last group on purpose.
+- **A `settings` names its list and is dropped when that list is not in play on its landing frame.**
+  `landed` then carries `dropped: true` and no `settingsIn`. It is never applied to the other list,
+  however a host a frame behind saw the loop; `setting` and `flip-lock` have no name and go to the list
+  in play on their landing frame, reporting it as `settingsIn`.
+- **`voice-hold` is the engine's and is never carried.** The engine inverts the voice's latched mute
+  while it is held and keeps the hold in its own saved state. It is in no settings list, no jump's
+  settings and no picture, and a load releases it.
 
 ## When a change here ripples
 
@@ -220,12 +285,24 @@ supplies everything environmental.
   across `postMessage`. Update `messages/validate.ts`, run `messages/validate.spec.ts` and
   `messages/round-trip.spec.ts`, and update the adapter (`src/browser/carry.ts`). Detail:
   [`src/messages/validate.ts`](./src/messages/validate.ts)
+- **Changed the setting table (`messages/setting-table.ts`: numbers, fields or ranges)?** It changes
+  what a recording means and what `validateInbound` refuses, and `deck/settings.ts` builds every list,
+  engine call and carried jump from it. Run `messages/setting-table.spec.ts`, the validate and
+  round-trip specs, and the whole dj suite. Detail:
+  [`src/messages/setting-table.ts`](./src/messages/setting-table.ts)
 - **Changed how a command lands, or a field the deck keeps that decides frames (`deck/deck.ts`,
-  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/hand.ts`, `deck/slip.ts`,
-  `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
+  `deck/deck-state.ts`, `deck/command-log.ts`, `deck/loops.ts`, `deck/settings.ts`, `deck/hand.ts`,
+  `deck/slip.ts`, `deck/live-loop.ts`)?** The rewind must still give exactly the frames a
   deck that ran straight gives, due times and frame numbers included. Run `deck/rewind.spec.ts` (it
   plays the two decks against each other) and `deck/deck.spec.ts`, and `deck/deck.allocation.spec.ts`
   for what the frame path allocates. Detail: [`src/deck/deck.ts`](./src/deck/deck.ts)
+
+- **Changed what a tap marks or fits (`deck/deck.ts`'s tap path, the run in `deck/deck-state.ts`)?**
+  `fitBeatGrid` reads a mark as a position on the register record's entry basis, against `noteStarts`
+  of the same record, and every fitted grid rebuilds the restore ring; a mark on another basis fits a
+  grid from nothing, or a wrong one, with no error. Run `deck/taps.spec.ts`, `deck/rewind.spec.ts`,
+  `proof/determinism.spec.ts` and `libs/analysis`'s `beat-grid.spec.ts`. Detail:
+  [`libs/analysis/AGENTS.md`](../analysis/AGENTS.md)
 
 - **Changed what a deck delivers: a landing rule, `fixed`, the `landed` event, the sink tap, or how
   the deck reads a sink's `passedCount` and `replaceFrom` (`deck/`, `testing/holding-sink.ts`)?**

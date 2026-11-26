@@ -16,7 +16,13 @@ import type {
   SidModel,
   SidPlayer,
 } from '@sidablist/core';
-import { ScanFailedError, recordRegisters } from '@sidablist/analysis';
+import {
+  ScanFailedError,
+  fitBeatGrid,
+  noteStarts,
+  recordRegisters,
+  type NoteStarts,
+} from '@sidablist/analysis';
 import type { DeckCommand, DeckId, DjRequest, Grid, JumpTarget } from '../messages/commands.js';
 import type {
   DeckDeliveries,
@@ -26,6 +32,7 @@ import type {
   DeckUpdate,
 } from '../messages/reports.js';
 import type { DeckOutput, DjPlugs } from '../plugs.js';
+import { HOLD_RELEASED, SETTING_SLOTS } from '../messages/setting-table.js';
 import {
   ANSWER_NO,
   ANSWER_UNASKED,
@@ -54,6 +61,7 @@ import { DrivenClock } from './driven-clock.js';
 import {
   EventQueue,
   KIND_CAPTURED,
+  KIND_GRID_FITTED,
   KIND_JUMP_LANDED,
   KIND_LANDED,
   KIND_LOADED,
@@ -64,6 +72,8 @@ import { DeckHand } from './hand.js';
 import { DeckLiveLoop, type LiveLoopHost } from './live-loop.js';
 import {
   DeckLoops,
+  LAND_IGNORED,
+  LAND_OVER_LOOP,
   RESOLVED_CANCEL,
   RESOLVED_LET_GO,
   RESOLVED_NONE,
@@ -73,7 +83,7 @@ import {
   type LoopsHost,
 } from './loops.js';
 import { NOTHING_APPLIED, RestoreRing, type RestoreSlot } from './restore-ring.js';
-import { isMainSetting, mutesAsSettings, readMutes, voiceOf, VOICE_COUNT } from './settings.js';
+import { applyList, homeList, offHome, oppositeOfTune, readList, VOICE_COUNT } from './settings.js';
 import { SinkTap } from './sink-tap.js';
 import { DeckSlip } from './slip.js';
 import { effectiveTempo } from './tempo.js';
@@ -90,12 +100,12 @@ interface DeckHost {
 type LoadCommand = Extract<DeckCommand, { kind: 'load' }>;
 type LandedEvent = Extract<DeckEvent, { kind: 'landed' }>;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
-type KeyResolution = NonNullable<LandedEvent['resolved']>;
+type HotCueResolution = NonNullable<LandedEvent['resolved']>;
 type Phase = 'empty' | 'loading' | 'failed' | 'ready';
 type Ends = 'playing' | 'paused' | 'stopped';
 
-/** A `key` press's resolution, by the code the event queue carries it as. */
-const RESOLUTIONS: Readonly<Record<number, KeyResolution>> = {
+/** A `hot-cue` press's resolution, by the code the event queue carries it as. */
+const RESOLUTIONS: Readonly<Record<number, HotCueResolution>> = {
   [RESOLVED_START]: 'start',
   [RESOLVED_QUEUE]: 'queue',
   [RESOLVED_CANCEL]: 'cancel',
@@ -103,6 +113,9 @@ const RESOLUTIONS: Readonly<Record<number, KeyResolution>> = {
 };
 
 const NO_FRAME = Number.MAX_SAFE_INTEGER;
+
+/** The bytes of the chip's registers, which `readRegisters` fills. */
+const REGISTER_BYTES = 25;
 
 /** Slots in `Deck.times`: the doubles the picture's timing reports, kept where a store never boxes. */
 const WORST_LATE_MS = 0;
@@ -113,8 +126,20 @@ const WORST_REWIND_MS = 2;
 const SEEK_FRAMES_KEPT = 8;
 const LANDINGS_KEPT = 8;
 
+/** Delivered frames whose due time and position are kept, for a tap's mark to look back through. */
+const HISTORY_FRAMES = 512;
+
+/** The mark at which a run of taps first fits a grid. */
+const FIT_FROM_TAPS = 4;
+
 /** A deck's `load` register-record margin, in seconds of tune past what the engine measures. */
 const RECORD_MARGIN_SECONDS = 5;
+
+/** Whether two settings lists differ, element by element. */
+function differs(a: Float64Array, b: Float64Array): boolean {
+  for (let i = 1; i < SETTING_SLOTS; i++) if (a[i] !== b[i]) return true;
+  return false;
+}
 
 /** Whether `command` halts the engine's output: its stop drops every frame the sink still holds. */
 function halts(entry: LogEntry): boolean {
@@ -124,7 +149,7 @@ function halts(entry: LogEntry): boolean {
 
 /**
  * Whether applying `command` always ends the loop that is running, and with it the pass in
- * progress. The commands that end it only sometimes (a jump over a loop, a key, a let-go) say so
+ * progress. The commands that end it only sometimes (a jump over a loop, a hot cue, a let-go) say so
  * when they land.
  */
 function endsLoop(command: DeckCommand): boolean {
@@ -189,10 +214,24 @@ export class Deck {
   private bytes: Uint8Array | null = null;
   private chipModel: SidModel | null = null;
   private hasTune = false;
-  private grid: Grid | null = null;
   private error: string | null = null;
   private generation = 0;
   private deliveryCapacity = 0;
+
+  /**
+   * The due time and the position of each delivered frame, by frame % `HISTORY_FRAMES`, which a tap
+   * marks from. Outside `DeckState` on purpose: a rewind re-renders frames and overwrites their
+   * entries, and the re-render is the truth. `historyFrom` is the first frame delivered since the
+   * load and `historyTop` the newest ever written, so a frame older than `historyTop` by the
+   * length of the history has been overwritten; both are -1 while nothing has been delivered.
+   */
+  private readonly sentDueMs = new Float64Array(HISTORY_FRAMES);
+  private readonly sentPosition = new Float64Array(HISTORY_FRAMES);
+  private historyFrom = -1;
+  private historyTop = -1;
+  /** The record's note starts: made once when it lands, and kept by the record they come from. */
+  private noteStartsOf: { readonly record: RegisterRecord; readonly starts: NoteStarts } | null =
+    null;
 
   /** The frames the host declared with `targets`, and the frames of recent seeks (see `declare`). */
   private hostTargets: readonly number[] = [];
@@ -214,10 +253,17 @@ export class Deck {
 
   private readonly update: Mutable<DeckUpdate>;
   private lastPictureSnapshot: PlayerSnapshot | null = null;
-  private readonly pictureKey = new Float64Array(16);
+  private readonly pictureKey = new Float64Array(15);
+  /** The settings lists as the last picture showed them, which the next change check compares against in place. */
+  private readonly pictureMain = new Float64Array(SETTING_SLOTS);
+  private readonly pictureLoop = new Float64Array(SETTING_SLOTS);
+  /** The two buffers a lock reads the registers into, made once so a press allocates none. */
+  private readonly lockWritten = new Uint8Array(REGISTER_BYTES);
+  private readonly lockSent = new Uint8Array(REGISTER_BYTES);
   private pictureError: string | null = null;
   private pictureQueued: JumpTarget | null = null;
   private pictureWaiting: JumpTarget | null = null;
+  private pictureGrid: Grid | null = null;
   private picturePending: object | null = null;
 
   /** Keeps the queued events a rewind to `rewindLanding` does not undo; one closure, made once. */
@@ -287,8 +333,10 @@ export class Deck {
 
   /**
    * Why a command is refused, or null. A press needs a settled deck: not empty, loading or failed.
-   * A load, the deck's own settings, slip, the hand's moves and the releases always pass: a move
-   * the deck cannot take is ignored when it lands. The live looper is off on a deck with no grid.
+   * A load, a `settings` (a host's panic is always accepted, and on a deck with no tune it only
+   * changes the main list, which the next load replaces), slip, the hand's moves and the releases
+   * (a `voice-hold` with `held: false` and a `tap-end` among them) always pass: a move the deck
+   * cannot take is ignored when it lands. The live looper is off on a deck with no grid.
    */
   refusal(command: DeckCommand): string | null {
     const kind = command.kind;
@@ -297,11 +345,14 @@ export class Deck {
       (kind === 'nudge' && command.amount === 0) ||
       kind === 'hand-lift' ||
       kind === 'cancel-queued' ||
+      kind === 'tap-end' ||
       kind === 'let-go' ||
-      kind === 'stop-loop';
+      kind === 'stop-loop' ||
+      (kind === 'voice-hold' && !command.held);
     if (
       release ||
       kind === 'repeat' ||
+      kind === 'settings' ||
       kind === 'targets' ||
       kind === 'slip' ||
       kind === 'hand-move'
@@ -310,7 +361,7 @@ export class Deck {
     }
     if (this.phase !== 'ready') return `${kind} on a deck that is ${this.phase}`;
     if (this.player.getSnapshot().transport === 'error') return `${kind} on a deck that is failed`;
-    if (kind === 'live-loop' && this.grid === null) return 'live-loop on a deck with no grid';
+    if (kind === 'live-loop' && this.state.grid === null) return 'live-loop on a deck with no grid';
     const far = this.farFrame(command);
     if (far !== null) {
       return `frame ${far} is past the end of the tune (the deck holds frames up to ${this.frameCeiling()})`;
@@ -341,7 +392,7 @@ export class Deck {
         frame = command.frame;
         break;
       case 'jump':
-      case 'key':
+      case 'hot-cue':
         frame = command.target.startFrame;
         break;
       case 'loop-bounds':
@@ -777,11 +828,17 @@ export class Deck {
     if (entry.seq > this.watermark) this.watermark = entry.seq;
     const command = entry.command;
     if (command === null) {
-      if (entry.record !== null) this.player.setRegisterRecord(entry.record);
+      if (entry.record !== null) {
+        this.player.setRegisterRecord(entry.record);
+        if (this.noteStartsOf?.record !== entry.record) {
+          this.noteStartsOf = { record: entry.record, starts: noteStarts(entry.record) };
+        }
+      }
       return;
     }
     const player = this.player;
     let endedLoop = endsLoop(command);
+    let dropped = false;
     switch (command.kind) {
       case 'play':
         if (player.getSnapshot().transport !== 'playing') this.settleOn(player.play());
@@ -811,9 +868,16 @@ export class Deck {
         player.setRepeatTrack(command.on);
         break;
       case 'setting':
-        if (isMainSetting(command.setting)) {
-          this.loops.setSetting(voiceOf(command.setting), command.value === 1);
-        }
+        this.loops.setSetting(command.setting, command.value);
+        break;
+      case 'settings':
+        dropped = !this.loops.setSettings(command.settingsIn, command.changes);
+        break;
+      case 'voice-hold':
+        player.setVoiceHeld(command.voice, command.held);
+        break;
+      case 'flip-lock':
+        this.flipLock(command.setting, command.lock);
         break;
       case 'targets':
         this.hostTargets = [...command.frames];
@@ -825,8 +889,8 @@ export class Deck {
       case 'jump':
         endedLoop = this.loops.jump(entry, command.target);
         break;
-      case 'key':
-        endedLoop = this.loops.key(entry, command.target);
+      case 'hot-cue':
+        endedLoop = this.loops.hotCue(entry, command.target);
         break;
       case 'cancel-queued':
         this.loops.cancelQueued();
@@ -846,6 +910,12 @@ export class Deck {
         break;
       case 'capture':
         this.queueCaptured(entry, frame, player.capturePosition());
+        break;
+      case 'tap':
+        this.applyTap(entry, frame, command.atMs);
+        break;
+      case 'tap-end':
+        this.state.endTapRun();
         break;
       case 'hand-touch':
         if (this.phase === 'ready') {
@@ -879,8 +949,31 @@ export class Deck {
         // The rest never get here.
         break;
     }
-    this.queueLanded(entry, frame, dueMs);
+    this.queueLanded(entry, frame, dueMs, dropped);
     if (endedLoop) this.endPass(frame, entry.seq);
+  }
+
+  /**
+   * A one-bit switch's lock, in the settings in play. With `lock` absent it is a press: a held
+   * switch is handed back, a released one is locked. `lock: true` locks a released switch and leaves
+   * a held one as it is; `lock: false` hands it back. A lock puts the switch at the opposite of what
+   * the tune has it at, which on a command landing on stream frame F is what the tune wrote in the
+   * last frame rendered before F (F−1's play call, before any shaping: `written`, never `sent`). A
+   * re-render restores the engine to F−1 first, so reading again gives the same answer and no first
+   * answer is kept.
+   */
+  private flipLock(setting: number, lock: boolean | undefined): void {
+    const state = this.state;
+    const list = state.ownInPlay ? state.loopSettings : state.mainSettings;
+    const held = list[setting] !== HOLD_RELEASED;
+    if (lock === false || (lock === undefined && held)) {
+      this.loops.setSetting(setting, HOLD_RELEASED);
+      return;
+    }
+    if (held) return;
+    this.player.readRegisters(this.lockWritten, this.lockSent);
+    const locked = oppositeOfTune(setting, this.lockWritten);
+    if (locked !== null) this.loops.setSetting(setting, locked);
   }
 
   /**
@@ -890,14 +983,14 @@ export class Deck {
   private startsFirst(entry: LogEntry): boolean {
     const command = entry.command;
     if (command === null || entry.started) return false;
-    if (command.kind !== 'jump' && command.kind !== 'key') return false;
+    if (command.kind !== 'jump' && command.kind !== 'hot-cue') return false;
     if (this.player.getSnapshot().transport === 'playing') return false;
     if (command.kind === 'jump') return true;
     const resolved = this.loops.resolve(command.target);
     return resolved === RESOLVED_START || resolved === RESOLVED_QUEUE;
   }
 
-  private queueLanded(entry: LogEntry, frame: number, dueMs: number): void {
+  private queueLanded(entry: LogEntry, frame: number, dueMs: number, dropped: boolean): void {
     if (entry.eventState !== EVENT_NONE) return;
     const event = this.events.push(KIND_LANDED, frame);
     if (event === null) {
@@ -907,8 +1000,9 @@ export class Deck {
     event.entry = entry.index;
     event.seq = entry.seq;
     event.dueMs = dueMs;
-    event.a = entry.command?.kind === 'key' ? this.loops.resolved : RESOLVED_NONE;
+    event.a = entry.command?.kind === 'hot-cue' ? this.loops.resolved : RESOLVED_NONE;
     event.b = this.state.ownInPlay ? 2 : 1;
+    event.c = dropped ? 1 : 0;
     entry.eventState = EVENT_QUEUED;
   }
 
@@ -926,6 +1020,86 @@ export class Deck {
     event.entry = entry.index;
     event.seq = entry.seq;
     event.a = position;
+  }
+
+  /**
+   * A tap on `frame`: marks where the playhead was at host time `atMs`, adds the mark to the run
+   * and, from the fourth mark of it, fits a grid to the tune's note starts. A fit that is not the
+   * grid the deck plays on replaces it at once, and the crossing lines follow it (the restore ring
+   * is made again only when the lines changed, after the tap's own state changes, so the point it
+   * is seeded with holds them). Every fit is reported. A tap on a deck that is not playing, or
+   * before the register record has arrived, does nothing and says so the first time.
+   *
+   * The mark is a first answer: the history behind it is rewritten by re-renders, so a
+   * re-application reuses it. It looks only at frames before `frame`, never at the held ones a flush
+   * is about to re-render, so a replay at `frame` marks the same one. The fit is made again on every
+   * application, because the run in force can differ on a replay: a tap landing ahead of this one
+   * adds a mark before it. Fitting allocates, between ticks, never on the frame path.
+   */
+  private applyTap(entry: LogEntry, frame: number, atMs: number): void {
+    const state = this.state;
+    const snapshot = this.player.getSnapshot();
+    if (snapshot.transport !== 'playing') {
+      this.tapIgnored(entry, 'tap on a deck that is not playing');
+      return;
+    }
+    const known = this.noteStartsOf;
+    if (known === null || (snapshot.tune?.recordedFrames ?? null) === null) {
+      this.tapIgnored(entry, 'tap before the register record has arrived');
+      return;
+    }
+    if (Number.isNaN(entry.mark)) entry.mark = this.markAt(state.stream - 1, atMs);
+    state.addTapMark(entry.mark);
+    const taps = state.tapCount;
+    if (taps < FIT_FROM_TAPS) return;
+    const fit = fitBeatGrid(state.tapRun(), known.starts);
+    if (fit === null) return;
+    const grid = state.grid;
+    if (
+      grid === null ||
+      grid.beatFrames !== fit.beatFrames ||
+      grid.beatOneFrame !== fit.beatOneFrame
+    ) {
+      state.grid = fit;
+      this.live.declareCaptures();
+    }
+    this.queueGridFitted(entry, frame, fit, taps);
+  }
+
+  private tapIgnored(entry: LogEntry, why: string): void {
+    if (entry.warned) return;
+    entry.warned = true;
+    this.plugs.log?.warn(`dj: deck ${this.id}: ${why}`);
+  }
+
+  /**
+   * The position the playhead had at host time `atMs`, from the frames delivered up to `last`: the
+   * latest frame due at or before it, the newest when `atMs` is after them all and the oldest kept
+   * when it is before them all. With no frame delivered since the load, where the playhead is now.
+   */
+  private markAt(last: number, atMs: number): number {
+    const oldest = Math.max(this.historyFrom, this.historyTop - HISTORY_FRAMES + 1);
+    if (this.historyFrom < 0 || last < oldest) return this.player.getPosition();
+    for (let frame = last; frame > oldest; frame--) {
+      const slot = frame % HISTORY_FRAMES;
+      if (this.sentDueMs[slot] <= atMs) return this.sentPosition[slot];
+    }
+    return this.sentPosition[oldest % HISTORY_FRAMES];
+  }
+
+  /** Queues a `grid-fitted` beside the `landed` of the tap that fitted it; a rewind keeps or discards both. */
+  private queueGridFitted(entry: LogEntry, frame: number, grid: Grid, taps: number): void {
+    if (entry.eventState !== EVENT_NONE) return;
+    const event = this.events.push(KIND_GRID_FITTED, frame);
+    if (event === null) {
+      this.plugs.log?.warn(`dj: deck ${this.id} dropped an event: its queue is full`);
+      return;
+    }
+    event.entry = entry.index;
+    event.seq = entry.seq;
+    event.a = grid.beatFrames;
+    event.b = grid.beatOneFrame;
+    event.c = taps;
   }
 
   /** Changes one tempo layer, and the engine's tempo when the effective tempo moved. */
@@ -980,19 +1154,20 @@ export class Deck {
     return false;
   }
 
-  private seekPrepared(target: ReturnType<typeof frames>): void {
+  /** Seeks to `target` when its image is held, and says whether it did; otherwise warns and seeks nothing. */
+  private seekPrepared(target: ReturnType<typeof frames>): boolean {
     if (this.player.getSnapshot().tune?.preparedFrames.includes(target)) {
       void this.player.seek(target);
-    } else {
-      this.plugs.log?.warn(
-        `dj: deck ${this.id} ignored a seek to ${target}: its image is not held`,
-      );
+      return true;
     }
+    this.plugs.log?.warn(`dj: deck ${this.id} ignored a seek to ${target}: its image is not held`);
+    return false;
   }
 
   /**
-   * Lands a waiting seek or jump on the frame its readiness fixed. A jump that replaced a running
-   * loop ends that loop's pass. A seek that a live loop's fold-in waited for sets the loop it left
+   * Lands a waiting seek or jump on the frame its readiness fixed, and reports `jump-landed` only
+   * when it landed: one whose image was withdrawn since is ignored with a warning. A jump that
+   * replaced a running loop ends that loop's pass. A seek that a live loop's fold-in waited for sets the loop it left
    * underneath again first.
    */
   private landReady(index: number, frame: number): void {
@@ -1002,21 +1177,26 @@ export class Deck {
     const seq = state.waitingSeq;
     state.stopWaiting();
     let endedLoop = false;
+    let landed: boolean;
     if (target === null) {
       // A fold-in's landing: the loop it left underneath comes back, set before the seek as a jump's is.
       if (state.underneath !== null) {
         this.loops.resumeUnderneath(null);
         state.underneath = null;
       }
-      this.seekPrepared(frames(this.landingTune[index]));
+      landed = this.seekPrepared(frames(this.landingTune[index]));
     } else {
-      endedLoop = this.loops.land(target, settings);
+      const outcome = this.loops.land(target, settings);
+      landed = outcome !== LAND_IGNORED;
+      endedLoop = outcome === LAND_OVER_LOOP;
     }
-    const event = this.events.push(KIND_JUMP_LANDED, frame);
-    if (event !== null) {
-      event.a = target === null ? this.landingTune[index] : target.startFrame;
-      event.b = target === null || target.endFrame === null ? -1 : target.endFrame;
-      event.c = 1;
+    if (landed) {
+      const event = this.events.push(KIND_JUMP_LANDED, frame);
+      if (event !== null) {
+        event.a = target === null ? this.landingTune[index] : target.startFrame;
+        event.b = target === null || target.endFrame === null ? -1 : target.endFrame;
+        event.c = 1;
+      }
     }
     if (endedLoop) this.endPass(frame, seq);
   }
@@ -1050,7 +1230,7 @@ export class Deck {
   /** What the part that holds the live loop asks of this deck. Made once, so a call allocates no closure. */
   private liveLoopHost(): LiveLoopHost {
     return {
-      grid: () => this.grid,
+      grid: () => this.state.grid,
       rebuildRing: () => this.rebuildRing(),
       awaitFold: (tuneFrame, seq) => {
         this.clearWaiting();
@@ -1364,6 +1544,10 @@ export class Deck {
     this.generation++;
     this.clearWaiting();
     this.landingCount = 0;
+    this.historyFrom = -1;
+    this.historyTop = -1;
+    this.noteStartsOf = null;
+    this.state.endTapRun();
     this.hostTargets = [];
     this.recentSeeks = [];
     this.ring = null;
@@ -1377,10 +1561,9 @@ export class Deck {
       state.cells[NUDGE] = 0;
       state.cells[JUMP] = 0;
       player.setTempo(1);
-      player.clearVoiceMutes();
-      state.mutes.fill(0);
       player.setJumpTargets([]);
     }
+    this.resetSettings();
     this.phase = 'loading';
     this.error = null;
     this.framesDelivered = 0;
@@ -1394,6 +1577,22 @@ export class Deck {
       command.ends ??
       (transportBefore === 'playing' || transportBefore === 'paused' ? transportBefore : 'stopped');
     void this.runLoad(command, this.generation, ends);
+  }
+
+  /**
+   * Everything the settings hold goes home, with or without a tune (a `settings` can land on a deck
+   * that has none): both lists, the loop's own out of play, and the engine's offsets, holds, pitches,
+   * mutes and voice holds.
+   */
+  private resetSettings(): void {
+    const state = this.state;
+    const player = this.player;
+    homeList(state.mainSettings);
+    homeList(state.loopSettings);
+    state.ownInPlay = false;
+    applyList(player, state.mainSettings);
+    player.clearVoiceMutes();
+    for (let voice = 0; voice < VOICE_COUNT; voice++) player.setVoiceHeld(voice, false);
   }
 
   private async runLoad(command: LoadCommand, generation: number, ends: Ends): Promise<void> {
@@ -1454,7 +1653,7 @@ export class Deck {
     this.bytes = bytes;
     this.tuneRef = command.tune;
     this.chipModel = file.model;
-    this.grid = command.grid ?? null;
+    state.grid = command.grid ?? null;
     player.loadTune(file);
     this.hasTune = true;
     this.live.declareCaptures(false);
@@ -1476,10 +1675,10 @@ export class Deck {
 
     state.cells[SPEED] = command.speed ?? 1;
     player.setTempo(effectiveTempo(state.speed, state.nudge, state.jump));
-    readMutes(command.settings, state.mutes);
-    for (let voice = 0; voice < VOICE_COUNT; voice++) {
-      player.setVoiceMuted(voice, state.muted(voice));
-    }
+    // The engine carries holds and offsets across a load, so the whole list is written: what the
+    // load does not name goes home, and a `settings` that landed while the load waited is overwritten.
+    readList(command.settings, state.mainSettings);
+    applyList(player, state.mainSettings);
     state.snapshot = null;
     state.lastHandOffs = 0;
     state.cells[LAST_POSITION] = player.getPosition();
@@ -1594,8 +1793,15 @@ export class Deck {
           frame: event.frame,
           waitMs: Number.isNaN(entry.pressedAtMs) ? null : event.dueMs - entry.pressedAtMs,
         };
-        if (command.kind === 'setting') landed.settingsIn = event.b === 2 ? 'loop' : 'main';
-        if (command.kind === 'key') landed.resolved = RESOLUTIONS[event.a];
+        if (
+          command.kind === 'setting' ||
+          command.kind === 'settings' ||
+          command.kind === 'flip-lock'
+        ) {
+          if (event.c === 1) landed.dropped = true;
+          else landed.settingsIn = event.b === 2 ? 'loop' : 'main';
+        }
+        if (command.kind === 'hot-cue') landed.resolved = RESOLUTIONS[event.a];
         return landed;
       }
       case KIND_LOADED:
@@ -1620,12 +1826,23 @@ export class Deck {
         };
       case KIND_CAPTURED:
         return { kind: 'captured', deck: this.id, frame: event.frame, position: event.a };
+      case KIND_GRID_FITTED:
+        return {
+          kind: 'grid-fitted',
+          deck: this.id,
+          frame: event.frame,
+          grid: { beatFrames: event.a, beatOneFrame: event.b },
+          taps: event.c,
+        };
       default:
         return null;
     }
   }
 
-  /** Fills the one reused update for the frame just delivered and hands it to the host. */
+  /**
+   * Fills the one reused update for the frame just delivered, keeps its due time and position for a
+   * tap's mark to read, and hands it to the host.
+   */
   private reportUpdate(frame: number, dueMs: number): void {
     const update = this.update;
     const position = this.player.getPosition();
@@ -1633,6 +1850,11 @@ export class Deck {
     update.dueAtMs = dueMs;
     update.intervalUs = this.clock.lastStepUs;
     update.position = position;
+    const slot = frame % HISTORY_FRAMES;
+    this.sentDueMs[slot] = dueMs;
+    this.sentPosition[slot] = position;
+    if (this.historyFrom < 0 || frame < this.historyFrom) this.historyFrom = frame;
+    if (frame > this.historyTop) this.historyTop = frame;
     update.lapProgress = this.lapProgress(position);
     update.slipPosition = this.slip.position();
     this.plugs.report(update);
@@ -1656,13 +1878,7 @@ export class Deck {
     const state = this.state;
     const snapshot = this.player.getSnapshot();
     const key = this.pictureKey;
-    const mutes = (state.muted(0) ? 1 : 0) | (state.muted(1) ? 2 : 0) | (state.muted(2) ? 4 : 0);
-    const own = state.ownInPlay
-      ? 8 |
-        (state.loopMuted(0) ? 1 : 0) |
-        (state.loopMuted(1) ? 2 : 0) |
-        (state.loopMuted(2) ? 4 : 0)
-      : 0;
+    const own = state.ownInPlay ? 1 : 0;
     const phase =
       this.phase === 'empty' ? 0 : this.phase === 'loading' ? 1 : this.phase === 'failed' ? 2 : 3;
     const slots = this.ring === null ? 0 : this.ring.capacity;
@@ -1674,22 +1890,23 @@ export class Deck {
       key[1] === state.nudge &&
       key[2] === state.jump &&
       key[3] === state.waitingFrame &&
-      key[4] === mutes &&
-      key[5] === phase &&
-      key[6] === slots &&
-      key[7] === this.lookaheadMs &&
-      key[8] === own &&
-      key[9] === slip &&
-      key[10] === state.handState &&
-      key[11] === live &&
-      key[12] === (state.liveOn ? state.liveStart : -1) &&
-      key[13] === (state.liveOn ? state.liveEnd : -1) &&
-      key[14] === (Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd) &&
-      key[15] === (Number.isNaN(state.liveSize) ? -1 : state.liveSize) &&
+      key[4] === phase &&
+      key[5] === slots &&
+      key[6] === this.lookaheadMs &&
+      key[7] === own &&
+      key[8] === slip &&
+      key[9] === state.handState &&
+      key[10] === live &&
+      key[11] === (state.liveOn ? state.liveStart : -1) &&
+      key[12] === (state.liveOn ? state.liveEnd : -1) &&
+      key[13] === (Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd) &&
+      key[14] === (Number.isNaN(state.liveSize) ? -1 : state.liveSize) &&
       this.pictureError === this.error &&
       this.pictureQueued === state.queued &&
       this.pictureWaiting === state.waiting &&
-      this.picturePending === state.pending
+      this.pictureGrid === state.grid &&
+      this.picturePending === state.pending &&
+      !this.settingsChanged()
     ) {
       return;
     }
@@ -1698,23 +1915,37 @@ export class Deck {
     key[1] = state.nudge;
     key[2] = state.jump;
     key[3] = state.waitingFrame;
-    key[4] = mutes;
-    key[5] = phase;
-    key[6] = slots;
-    key[7] = this.lookaheadMs;
-    key[8] = own;
-    key[9] = slip;
-    key[10] = state.handState;
-    key[11] = live;
-    key[12] = state.liveOn ? state.liveStart : -1;
-    key[13] = state.liveOn ? state.liveEnd : -1;
-    key[14] = Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd;
-    key[15] = Number.isNaN(state.liveSize) ? -1 : state.liveSize;
+    key[4] = phase;
+    key[5] = slots;
+    key[6] = this.lookaheadMs;
+    key[7] = own;
+    key[8] = slip;
+    key[9] = state.handState;
+    key[10] = live;
+    key[11] = state.liveOn ? state.liveStart : -1;
+    key[12] = state.liveOn ? state.liveEnd : -1;
+    key[13] = Number.isNaN(state.livePendingEnd) ? -1 : state.livePendingEnd;
+    key[14] = Number.isNaN(state.liveSize) ? -1 : state.liveSize;
+    this.pictureMain.set(state.mainSettings);
+    if (state.ownInPlay) this.pictureLoop.set(state.loopSettings);
     this.pictureError = this.error;
     this.pictureQueued = state.queued;
     this.pictureWaiting = state.waiting;
+    this.pictureGrid = state.grid;
     this.picturePending = state.pending;
     this.plugs.report(this.buildPicture());
+  }
+
+  /**
+   * Whether a list the picture shows differs from what the last picture showed, compared in place
+   * and allocating nothing. The loop's own list counts only while it plays.
+   */
+  private settingsChanged(): boolean {
+    const state = this.state;
+    return (
+      differs(state.mainSettings, this.pictureMain) ||
+      (state.ownInPlay && differs(state.loopSettings, this.pictureLoop))
+    );
   }
 
   private buildPicture(): DeckPicture {
@@ -1784,11 +2015,11 @@ export class Deck {
         state.handState === HAND_DOWN ? 'down' : state.handState === HAND_THROWN ? 'thrown' : 'up',
       settingsInPlay: state.ownInPlay ? 'loop' : 'main',
       settings: {
-        main: mutesAsSettings(state.mutes),
-        loop: state.ownInPlay ? mutesAsSettings(state.loopMutes) : null,
+        main: offHome(state.mainSettings),
+        loop: state.ownInPlay ? offHome(state.loopSettings) : null,
       },
       readyFrames: [...(tuneSnapshot?.preparedFrames ?? [])],
-      grid: this.grid,
+      grid: state.grid,
       rate:
         stats === null
           ? null

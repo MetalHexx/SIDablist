@@ -268,11 +268,8 @@ describe('loading', () => {
     await rig.load('a', 'still-time', { ends: 'paused', settings: [{ setting: 3, value: 1 }] });
     const picture = rig.picture();
     expect(picture.tempo).toEqual({ speed: 1, nudge: 0, jump: 0, effective: 1 });
-    expect(picture.settings.main).toEqual([
-      { setting: 1, value: 0 },
-      { setting: 2, value: 0 },
-      { setting: 3, value: 1 },
-    ]);
+    expect(picture.settings.main.find((s) => s.setting === 3)).toEqual({ setting: 3, value: 1 });
+    expect(picture.settings.main.find((s) => s.setting === 1)).toBeUndefined();
     expect(picture.readyFrames).toEqual([]);
     rig.dispose();
   });
@@ -426,6 +423,39 @@ describe('seeking', () => {
     const jump = rig.ofKind('jump-landed')[0];
     expect(jump.frame).toBeGreaterThan(seekFrame);
     expect(sent[jump.frame].frameNumber).toBe(2000);
+    rig.dispose();
+  });
+
+  it('reports no jump-landed for a waiting jump whose image was withdrawn after its landing was fixed', async () => {
+    const TARGET = 2000;
+    const rig = new Rig();
+    const { deck } = rig.openDeck('a', 10);
+    press(deck, { kind: 'load', deck: 'a', tune: 'still-time', subtune: 1, ends: 'playing' });
+    await rig.settle();
+    for (let i = 0; i < 20; i++) rig.advance(1, 1);
+    press(deck, { kind: 'jump', deck: 'a', target: { startFrame: TARGET, endFrame: null } });
+
+    // The tick that finds the image ready fixes the landing for the next frame, and its update is
+    // reported before that frame renders: withdraw the image there.
+    const report = rig.plugs.report;
+    let withdrawn = false;
+    const spy = vi.spyOn(rig.plugs, 'report').mockImplementation((message) => {
+      report(message);
+      const ready = deck.player.getSnapshot().tune?.preparedFrames.includes(frames(TARGET));
+      if (message.kind === 'update' && ready === true && !withdrawn) {
+        withdrawn = true;
+        deck.player.setJumpTargets([]);
+      }
+    });
+    await rig.settle();
+    rig.advance(100, 1);
+    spy.mockRestore();
+
+    expect(withdrawn).toBe(true);
+    expect(rig.ofKind('jump-landed')).toEqual([]);
+    expect(rig.warnings).toContain(
+      `dj: deck a: ignored a jump to ${TARGET}: its image is not held`,
+    );
     rig.dispose();
   });
 
@@ -1037,7 +1067,7 @@ describe('the end of a pass', () => {
 describe('frames past the end of the tune', () => {
   const FAR = 5_000_000;
 
-  it('refuses a seek, a jump, a key and a loop edit to one, and the deck keeps rendering', async () => {
+  it('refuses a seek, a jump, a hot cue and a loop edit to one, and the deck keeps rendering', async () => {
     const rig = new Rig();
     rig.addDeck('a', { lookaheadMs: 120 });
     await rig.load('a', 'still-time', { ends: 'playing' });
@@ -1045,12 +1075,12 @@ describe('frames past the end of the tune', () => {
 
     rig.send({ kind: 'seek', deck: 'a', frame: FAR });
     rig.send({ kind: 'jump', deck: 'a', target: { startFrame: FAR, endFrame: null } });
-    rig.send({ kind: 'key', deck: 'a', target: { startFrame: FAR, endFrame: FAR + 100 } });
+    rig.send({ kind: 'hot-cue', deck: 'a', target: { startFrame: FAR, endFrame: FAR + 100 } });
     rig.send({ kind: 'loop-bounds', deck: 'a', startFrame: FAR, endFrame: FAR + 100 });
     await rig.microtasks();
 
     expect(rig.warnings).toHaveLength(4);
-    for (const kind of ['seek', 'jump', 'key', 'loop-bounds']) {
+    for (const kind of ['seek', 'jump', 'hot-cue', 'loop-bounds']) {
       expect(rig.warnings.some((w) => w.startsWith(`dj: refused ${kind}: frame ${FAR}`))).toBe(
         true,
       );
